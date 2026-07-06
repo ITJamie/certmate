@@ -118,8 +118,9 @@ curl http://localhost:8000/api/client-certs/USER_ID/download/key \
 ### Main Documentation
 
 - **[Installation Guide](./installation.md)** — Setup, dependencies, deployment
-- **[DNS Providers](./dns-providers.md)** — 22 providers, multi-account, domain alias
-- **[CA Providers](./ca-providers.md)** — Let's Encrypt, DigiCert, Private CA
+- **[Kubernetes Notes](./kubernetes.md)** — Production pod sizing and OOM troubleshooting
+- **[DNS Providers](./dns-providers.md)** — supported providers, multi-account, domain alias
+- **[CA Providers](./ca-providers.md)** — Let's Encrypt, Actalis, DigiCert, Private CA
 - **[Docker Guide](./docker.md)** — Docker builds, multi-platform, Compose
 - **[Testing Guide](./testing.md)** — Test framework, CI/CD, coverage
 - **[API Reference](./api.md)** - Complete REST API documentation with examples

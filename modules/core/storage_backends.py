@@ -10,6 +10,7 @@ import logging
 import re
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
 from abc import ABC, abstractmethod
@@ -79,6 +80,15 @@ def _with_retry(max_attempts=3, delay=1.0, exceptions=(Exception,)):
     return decorator
 
 
+def _retry_call(fn, *args, **kwargs):
+    """Invoke ``fn`` under the standard transient-error retry policy.
+
+    For call sites where a whole-method ``@_with_retry()`` would be wrong
+    (e.g. Azure's surface-independent store path, where one surface must
+    not re-run because the other failed)."""
+    return _with_retry()(fn)(*args, **kwargs)
+
+
 def _validate_storage_domain(domain: str) -> str:
     """Validate domain name for use in storage backend paths/keys.
     Raises ValueError if domain contains path traversal or invalid chars."""
@@ -87,6 +97,53 @@ def _validate_storage_domain(domain: str) -> str:
     if not _SAFE_DOMAIN_RE.match(domain):
         raise ValueError(f"Invalid domain for storage: does not match domain pattern")
     return domain
+
+
+# Azure Key Vault storage modes. Default 'secrets' preserves the legacy
+# behaviour. 'certificate' uses the native Certificate object (consumable
+# directly by App Service / App Gateway / Front Door / API Management /
+# AKS Ingress); 'both' writes to both surfaces during transitions or when
+# the same vault is consumed by mixed clients.
+AZURE_KV_MODE_SECRETS = 'secrets'
+AZURE_KV_MODE_CERTIFICATE = 'certificate'
+AZURE_KV_MODE_BOTH = 'both'
+AZURE_KV_VALID_MODES = frozenset({AZURE_KV_MODE_SECRETS, AZURE_KV_MODE_CERTIFICATE, AZURE_KV_MODE_BOTH})
+
+# Azure tag values cap at 256 chars; oversize SAN lists are truncated with
+# a trailing '...' marker so operators can spot the truncation in the portal.
+_AZURE_TAG_VALUE_MAX = 256
+
+
+def _build_pfx(cert_pem: bytes, chain_pem: Optional[bytes], privkey_pem: bytes,
+               password: Optional[bytes] = None) -> bytes:
+    """Bundle cert + chain + private key into a PKCS12 blob.
+
+    With ``password=None`` the PFX is unencrypted (Key Vault re-encrypts it
+    at rest on import). Pass a non-empty ``password`` (bytes) to encrypt the
+    bundle with ``BestAvailableEncryption`` — required for the on-disk
+    Windows ``.pfx`` export (issue #230). If the leaf or key bytes are
+    missing or malformed, ``cryptography`` raises ``ValueError`` directly; we
+    let that propagate so the caller sees a descriptive message.
+    """
+    from cryptography.hazmat.primitives.serialization import (
+        pkcs12,
+        load_pem_private_key,
+        BestAvailableEncryption,
+        NoEncryption,
+    )
+    from cryptography.x509 import load_pem_x509_certificates
+
+    leaf = load_pem_x509_certificates(cert_pem)[0]
+    chain = load_pem_x509_certificates(chain_pem) if chain_pem else []
+    key = load_pem_private_key(privkey_pem, password=None)
+    encryption = BestAvailableEncryption(password) if password else NoEncryption()
+    return pkcs12.serialize_key_and_certificates(
+        name=None,
+        key=key,
+        cert=leaf,
+        cas=chain or None,
+        encryption_algorithm=encryption,
+    )
 
 
 class CertificateStorageBackend(ABC):
@@ -101,6 +158,22 @@ class CertificateStorageBackend(ABC):
     def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
         """Retrieve certificate files and metadata for a domain"""
         pass
+
+    def retrieve_certificate_info(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        """Retrieve only the certificate material needed by list/info views.
+
+        Backends can override this to avoid fetching private keys or full
+        bundles. The default preserves compatibility by falling back to the
+        full retrieve path.
+        """
+        result = self.retrieve_certificate(domain)
+        if not result:
+            return None
+        cert_files, metadata = result
+        cert_pem = cert_files.get('cert.pem')
+        if not cert_pem:
+            return None
+        return {'cert.pem': cert_pem}, metadata
     
     @abstractmethod
     def list_certificates(self) -> List[str]:
@@ -131,32 +204,57 @@ class LocalFileSystemBackend(CertificateStorageBackend):
         self.cert_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"LocalFileSystemBackend initialized with cert_dir: {self.cert_dir}")
     
+    @staticmethod
+    def _atomic_write_bytes(path: Path, content: bytes, mode: int) -> None:
+        """Write bytes atomically at the given mode: create a temp sibling,
+        set its mode, fsync, then rename over the destination.
+
+        The previous open()-write-then-chmod pattern had two defects on the
+        DEFAULT backend: a crash / SIGKILL (OOM) / disk-full mid-write left a
+        truncated, unrecoverable privkey.pem or cert.pem in place; and the file
+        existed under the umask (often 0644) for the window between create and
+        chmod, briefly exposing the private key. mkstemp creates at 0600; the
+        rename is atomic so readers see either the old file or the whole new
+        one, never a partial write."""
+        import tempfile
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix='.tmp-', suffix=path.name)
+        try:
+            os.chmod(tmp_name, mode)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
     def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
         """Store certificate files and metadata to local filesystem"""
         try:
             domain_dir = self.cert_dir / domain
             domain_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Store certificate files
+
+            # Store certificate files atomically. Private keys are 0600 from
+            # the first byte; the rest 0644.
             for filename, content in cert_files.items():
-                file_path = domain_dir / filename
-                with open(file_path, 'wb') as f:
-                    f.write(content)
-                # Set secure permissions for private keys
-                if 'key' in filename.lower() or filename == 'privkey.pem':
-                    os.chmod(file_path, 0o600)
-                else:
-                    os.chmod(file_path, 0o644)
-            
-            # Store metadata
-            metadata_file = domain_dir / 'metadata.json'
-            with open(metadata_file, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            os.chmod(metadata_file, 0o600)
+                is_key = 'key' in filename.lower() or filename == 'privkey.pem'
+                self._atomic_write_bytes(domain_dir / filename, content,
+                                         0o600 if is_key else 0o644)
+
+            # Store metadata atomically too.
+            self._atomic_write_bytes(
+                domain_dir / 'metadata.json',
+                json.dumps(metadata, indent=2).encode('utf-8'),
+                0o600,
+            )
 
             logger.info(f"Certificate stored successfully for {domain}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to store certificate for {domain}: {e}")
             return False
@@ -225,43 +323,374 @@ class LocalFileSystemBackend(CertificateStorageBackend):
         return "local_filesystem"
 
 
+class _AzureKeyVaultCertificateImporter:
+    """Encapsulates Azure Key Vault Certificate-object operations.
+
+    Kept as a private helper (composition) so AzureKeyVaultBackend remains
+    a single class that handles auth/naming/retry while delegating the
+    Certificate-API specifics here. Both clients are created lazily so that
+    the helper can be instantiated even when the optional
+    ``azure-keyvault-certificates`` package is missing — the import error
+    is surfaced only when a Certificate-mode call is actually made.
+    """
+
+    def __init__(self, vault_url: str, credential, sanitize_name):
+        self._vault_url = vault_url
+        self._credential = credential
+        self._sanitize_name = sanitize_name
+        self._cert_client = None
+        self._secret_client = None
+
+    def _get_cert_client(self):
+        if self._cert_client is None:
+            try:
+                from azure.keyvault.certificates import CertificateClient
+            except ImportError:
+                raise ImportError(
+                    "Azure Key Vault Certificate mode requires the "
+                    "'azure-keyvault-certificates' package"
+                )
+            self._cert_client = CertificateClient(vault_url=self._vault_url, credential=self._credential)
+        return self._cert_client
+
+    def _get_secret_client(self):
+        if self._secret_client is None:
+            from azure.keyvault.secrets import SecretClient
+            self._secret_client = SecretClient(vault_url=self._vault_url, credential=self._credential)
+        return self._secret_client
+
+    def _certificate_name(self, domain: str) -> str:
+        return self._sanitize_name(f"cert-{domain}")
+
+    # Metadata keys we explicitly project to/from Azure tags. Any key outside
+    # this set is ignored on rehydrate so that vault-level tags added by
+    # Azure Policy or operators (Environment=prod, CostCenter=42, …) do not
+    # contaminate the metadata returned to the rest of CertMate.
+    _STRING_METADATA_KEYS = (
+        'domain', 'dns_provider', 'challenge_type', 'email', 'account_id', 'created_at',
+        'ca_provider', 'ca_account_id',
+    )
+    _CSV_TRUNCATION_MARKER = '...'
+
+    @classmethod
+    def _build_tags(cls, metadata: Dict[str, Any]) -> Dict[str, str]:
+        """Project metadata onto Azure tags (string keys/values, ≤256 chars).
+
+        ``san_domains`` is serialised as CSV; if the result exceeds the tag
+        value cap it is truncated with a trailing ``...`` marker that the
+        rehydration path strips back off cleanly.
+        """
+        tags: Dict[str, str] = {}
+        for key in cls._STRING_METADATA_KEYS:
+            value = metadata.get(key)
+            if value is None or value == '':
+                continue
+            tags[key] = str(value)[:_AZURE_TAG_VALUE_MAX]
+        # Treat staging=None the same as staging-not-present, to match how
+        # other keys handle missing values and keep _build_tags + _tags_to_metadata
+        # symmetric (None → no tag → no key on rehydrate).
+        staging = metadata.get('staging')
+        if staging is not None:
+            tags['staging'] = 'true' if staging else 'false'
+        san_domains = metadata.get('san_domains') or []
+        if san_domains:
+            csv = ','.join(str(d) for d in san_domains)
+            if len(csv) > _AZURE_TAG_VALUE_MAX:
+                logger.warning(
+                    "san_domains for %s exceeds %d chars; truncating in tag (full list still in metadata secret if present)",
+                    metadata.get('domain', '<unknown>'), _AZURE_TAG_VALUE_MAX,
+                )
+                csv = csv[:_AZURE_TAG_VALUE_MAX - len(cls._CSV_TRUNCATION_MARKER)] + cls._CSV_TRUNCATION_MARKER
+            tags['san_domains'] = csv
+        return tags
+
+    @classmethod
+    def _tags_to_metadata(cls, tags: Dict[str, str]) -> Dict[str, Any]:
+        """Inverse of :meth:`_build_tags` with a strict allow-list."""
+        if not tags:
+            return {}
+        metadata: Dict[str, Any] = {
+            k: tags[k] for k in cls._STRING_METADATA_KEYS if k in tags
+        }
+        if 'staging' in tags:
+            metadata['staging'] = tags['staging'] == 'true'
+        san_csv = tags.get('san_domains')
+        if san_csv:
+            was_truncated = san_csv.endswith(cls._CSV_TRUNCATION_MARKER)
+            if was_truncated:
+                san_csv = san_csv[:-len(cls._CSV_TRUNCATION_MARKER)]
+            entries = [d for d in san_csv.split(',') if d]
+            # When the CSV was truncated, the last entry is, by construction,
+            # an incomplete domain fragment (the truncation cut mid-string).
+            # Drop it rather than expose a malformed FQDN to renew loops or
+            # the dashboard.
+            if was_truncated and entries:
+                entries = entries[:-1]
+            if entries:
+                metadata['san_domains'] = entries
+        return metadata
+
+    def get_metadata_tags(self, domain: str) -> Dict[str, Any]:
+        """Read metadata-from-tags for a Certificate object without exporting the PFX."""
+        cert_name = self._certificate_name(domain)
+        try:
+            cert = self._get_cert_client().get_certificate(cert_name)
+        except Exception as e:
+            logger.debug("Could not read tags for Certificate %s: %s", cert_name, e)
+            return {}
+        return self._tags_to_metadata(dict(getattr(cert.properties, 'tags', None) or {}))
+
+    def get_certificate_summary(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any], Optional['datetime']]]:
+        """Read public cert + metadata from the Certificate API without PFX export."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+
+        cert_name = self._certificate_name(domain)
+        try:
+            cert = self._get_cert_client().get_certificate(cert_name)
+        except Exception as e:
+            logger.debug("Could not read Certificate summary %s: %s", cert_name, e)
+            return None
+
+        cert_bytes = getattr(cert, 'cer', None)
+        if not cert_bytes:
+            return None
+        try:
+            cert_pem = x509.load_der_x509_certificate(cert_bytes).public_bytes(Encoding.PEM)
+        except Exception as e:
+            logger.debug("Could not parse Certificate API public cert for %s: %s", domain, e)
+            return None
+
+        props = getattr(cert, 'properties', None)
+        metadata = self._tags_to_metadata(dict(getattr(props, 'tags', None) or {}))
+        updated_on = getattr(props, 'updated_on', None)
+        return {'cert.pem': cert_pem}, metadata, updated_on
+
+    def import_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        """Import the cert+chain+key bundle as a Key Vault Certificate object."""
+        from azure.keyvault.certificates import CertificatePolicy
+
+        cert_pem = cert_files.get('cert.pem')
+        privkey_pem = cert_files.get('privkey.pem')
+        if not cert_pem or not privkey_pem:
+            logger.error(
+                "Cannot import Certificate object for %s: cert.pem and privkey.pem are required",
+                domain,
+            )
+            return False
+
+        pfx = _build_pfx(cert_pem, cert_files.get('chain.pem'), privkey_pem)
+        # Externally issued certs (Let's Encrypt, ZeroSSL, etc.) are flagged
+        # with issuer "Unknown" so Key Vault does not try to renew them via
+        # its built-in Certificate Manager — CertMate stays the source of
+        # truth for renewals.
+        policy = CertificatePolicy(issuer_name="Unknown", content_type="application/x-pkcs12")
+        client = self._get_cert_client()
+        cert_name = self._certificate_name(domain)
+        client.import_certificate(
+            certificate_name=cert_name,
+            certificate_bytes=pfx,
+            policy=policy,
+            tags=self._build_tags(metadata),
+            password=None,
+        )
+        logger.info("Certificate object imported into Azure Key Vault for %s as %s", domain, cert_name)
+        return True
+
+    def get_certificate_update_time(self, domain: str) -> Optional['datetime']:
+        """Return the ``updated_on`` timestamp of a Certificate object, or None."""
+        cert_name = self._certificate_name(domain)
+        try:
+            cert = self._get_cert_client().get_certificate(cert_name)
+            return getattr(cert.properties, 'updated_on', None)
+        except Exception:
+            return None
+
+    def export_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        """Reconstruct the four PEM files (and metadata from tags) from a Certificate object.
+
+        Azure exposes the full PFX (cert+key+chain) of an imported
+        certificate via the Secret with the same name — that is the only
+        way to retrieve the private key, since the Certificate API itself
+        only returns the public certificate.
+        """
+        from cryptography.hazmat.primitives.serialization import (
+            pkcs12,
+            Encoding,
+            PrivateFormat,
+            NoEncryption,
+        )
+        import base64
+
+        cert_name = self._certificate_name(domain)
+        try:
+            secret = self._get_secret_client().get_secret(cert_name)
+        except Exception as e:
+            logger.debug("Certificate object %s not found for %s: %s", cert_name, domain, e)
+            return None
+
+        secret_value = secret.value
+        # Key Vault returns the PFX as base64 when content_type is PKCS12.
+        # PEM-formatted certificates would be returned as-is; we only support
+        # PKCS12 imports here, so decode accordingly.
+        try:
+            pfx_bytes = base64.b64decode(secret_value)
+        except Exception as e:
+            logger.error("Could not base64-decode Certificate secret for %s: %s", domain, e)
+            return None
+
+        try:
+            key, leaf, additional = pkcs12.load_key_and_certificates(pfx_bytes, password=None)
+        except Exception as e:
+            logger.error("Could not parse PFX for %s: %s", domain, e)
+            return None
+
+        if leaf is None or key is None:
+            logger.error("PFX for %s is missing leaf cert or private key", domain)
+            return None
+
+        cert_pem = leaf.public_bytes(Encoding.PEM)
+        chain_pem = b''.join(c.public_bytes(Encoding.PEM) for c in (additional or []))
+        privkey_pem = key.private_bytes(
+            encoding=Encoding.PEM,
+            format=PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=NoEncryption(),
+        )
+        cert_files = {
+            'cert.pem': cert_pem,
+            'chain.pem': chain_pem,
+            'fullchain.pem': cert_pem + chain_pem,
+            'privkey.pem': privkey_pem,
+        }
+
+        metadata = self._tags_to_metadata(dict(secret.properties.tags or {}))
+        return cert_files, metadata
+
+    def list_domains(self) -> List[str]:
+        """List domains stored as Certificate objects (read from the 'domain' tag)."""
+        client = self._get_cert_client()
+        domains = set()
+        for props in client.list_properties_of_certificates():
+            tags = getattr(props, 'tags', None) or {}
+            domain = tags.get('domain')
+            if domain:
+                domains.add(domain)
+        return sorted(domains)
+
+    def delete(self, domain: str) -> bool:
+        """Delete the Certificate object for a domain (best-effort)."""
+        cert_name = self._certificate_name(domain)
+        try:
+            self._get_cert_client().begin_delete_certificate(cert_name)
+            return True
+        except Exception as e:
+            logger.debug("Could not delete certificate object %s for %s: %s", cert_name, domain, e)
+            return False
+
+    def exists(self, domain: str) -> bool:
+        """Return True if a Certificate object exists for the domain."""
+        cert_name = self._certificate_name(domain)
+        try:
+            self._get_cert_client().get_certificate(cert_name)
+            return True
+        except Exception:
+            return False
+
+    def verify_api_access(self) -> None:
+        """Probe Certificate API access; propagates SDK exceptions to the caller.
+
+        ``next(iter(...))`` consumes only the first page so the probe stays
+        cheap without depending on SDK kwargs that aren't part of the
+        documented signature.
+        """
+        next(iter(self._get_cert_client().list_properties_of_certificates()), None)
+
+
 class AzureKeyVaultBackend(CertificateStorageBackend):
-    """Azure Key Vault storage backend"""
-    
+    """Azure Key Vault storage backend.
+
+    Supports three storage modes via ``config['storage_mode']``:
+
+    * ``secrets`` (default): persist each PEM and the metadata as individual
+      Key Vault Secrets. Backwards-compatible with the original layout.
+    * ``certificate``: persist the cert+chain+key as a native Key Vault
+      Certificate object (PKCS12), enabling direct binding from App Service,
+      Application Gateway, Front Door, API Management or AKS Ingress.
+    * ``both``: write to both surfaces. Reads still prefer the Secrets path
+      (cheaper, no PFX parse).
+    """
+
     def __init__(self, config: Dict[str, str]):
         self.vault_url = config.get('vault_url')
         self.client_id = config.get('client_id')
         self.client_secret = config.get('client_secret')
         self.tenant_id = config.get('tenant_id')
-        
+
         self.vault_url = (self.vault_url or '').strip()
         self.client_id = (self.client_id or '').strip()
         self.client_secret = (self.client_secret or '').strip()
         self.tenant_id = (self.tenant_id or '').strip()
         if not all([self.vault_url, self.client_id, self.client_secret, self.tenant_id]):
             raise ValueError("Azure Key Vault backend requires vault_url, client_id, client_secret, and tenant_id")
-        
+
+        storage_mode = (config.get('storage_mode') or AZURE_KV_MODE_SECRETS).strip().lower()
+        if storage_mode not in AZURE_KV_VALID_MODES:
+            raise ValueError(
+                f"Invalid storage_mode '{storage_mode}' for Azure Key Vault backend. "
+                f"Expected one of: {sorted(AZURE_KV_VALID_MODES)}"
+            )
+        self.storage_mode = storage_mode
+
         self._client = None
-        logger.info(f"AzureKeyVaultBackend initialized for vault: {self.vault_url}")
-    
+        self._credential = None
+        self._cert_importer: Optional[_AzureKeyVaultCertificateImporter] = None
+        logger.info(
+            "AzureKeyVaultBackend initialized for vault: %s (storage_mode=%s)",
+            self.vault_url, self.storage_mode,
+        )
+
+    @property
+    def writes_secrets(self) -> bool:
+        return self.storage_mode in (AZURE_KV_MODE_SECRETS, AZURE_KV_MODE_BOTH)
+
+    @property
+    def writes_certificate(self) -> bool:
+        return self.storage_mode in (AZURE_KV_MODE_CERTIFICATE, AZURE_KV_MODE_BOTH)
+
+    def _get_credential(self):
+        if self._credential is None:
+            try:
+                from azure.identity import ClientSecretCredential
+            except ImportError:
+                raise ImportError("Azure Key Vault backend requires the 'azure-identity' package")
+            self._credential = ClientSecretCredential(
+                tenant_id=self.tenant_id,
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+            )
+        return self._credential
+
     def _get_client(self):
-        """Get Azure Key Vault client with lazy initialization"""
+        """Get Azure Key Vault SecretClient with lazy initialization"""
         if self._client is None:
             try:
                 from azure.keyvault.secrets import SecretClient
-                from azure.identity import ClientSecretCredential
-                
-                credential = ClientSecretCredential(
-                    tenant_id=self.tenant_id,
-                    client_id=self.client_id,
-                    client_secret=self.client_secret
-                )
-                self._client = SecretClient(vault_url=self.vault_url, credential=credential)
             except ImportError:
                 raise ImportError("Azure Key Vault backend requires 'azure-keyvault-secrets' and 'azure-identity' packages")
+            self._client = SecretClient(vault_url=self.vault_url, credential=self._get_credential())
         return self._client
-    
-    def _sanitize_secret_name(self, name: str) -> str:
+
+    def _get_cert_importer(self) -> _AzureKeyVaultCertificateImporter:
+        if self._cert_importer is None:
+            self._cert_importer = _AzureKeyVaultCertificateImporter(
+                vault_url=self.vault_url,
+                credential=self._get_credential(),
+                sanitize_name=self._sanitize_secret_name,
+            )
+        return self._cert_importer
+
+    @staticmethod
+    def _sanitize_secret_name(name: str) -> str:
         """Sanitize name for Azure Key Vault secret naming requirements.
 
         Azure secret names support only alphanumerics and hyphens (max 127 chars).
@@ -276,136 +705,378 @@ class AzureKeyVaultBackend(CertificateStorageBackend):
         # Azure allows max 127 chars
         max_base = 127 - len(suffix)
         return sanitized[:max_base] + suffix
-    
-    @_with_retry()
+
+    def _store_as_secrets(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        client = self._get_client()
+        for filename, content in cert_files.items():
+            secret_name = self._sanitize_secret_name(f"cert-{domain}-{filename.replace('.', '-')}")
+            client.set_secret(secret_name, content.decode('utf-8', errors='replace'))
+        metadata_name = self._sanitize_secret_name(f"cert-{domain}-metadata")
+        client.set_secret(metadata_name, json.dumps(metadata))
+        return True
+
     def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
-        """Store certificate files and metadata to Azure Key Vault"""
+        """Store certificate files and metadata to Azure Key Vault.
+
+        In ``both`` mode the two writes are independent: a failure on the
+        Secrets surface must not prevent the Certificate-object import (and
+        vice versa). The method returns True only when every active surface
+        succeeded; partial failures are logged per surface and the overall
+        result is False so the caller can surface the issue.
+
+        Transient errors are retried per surface (``_retry_call``) rather
+        than per method, so a flaky Secrets write does not re-run an
+        already-successful Certificate import.
+        """
         try:
             _validate_storage_domain(domain)
-            client = self._get_client()
-
-            # Store certificate files as individual secrets
-            for filename, content in cert_files.items():
-                secret_name = self._sanitize_secret_name(f"cert-{domain}-{filename.replace('.', '-')}")
-                client.set_secret(secret_name, content.decode('utf-8', errors='replace'))
-            
-            # Store metadata
-            metadata_name = self._sanitize_secret_name(f"cert-{domain}-metadata")
-            client.set_secret(metadata_name, json.dumps(metadata))
-            
-            logger.info(f"Certificate stored successfully in Azure Key Vault for {domain}")
-            return True
-            
         except Exception as e:
             logger.error(f"Failed to store certificate in Azure Key Vault for {domain}: {e}")
             return False
-    
-    @_with_retry()
-    def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
-        """Retrieve certificate files and metadata from Azure Key Vault"""
-        try:
-            client = self._get_client()
-            
-            cert_files = {}
-            standard_files = list(CERTIFICATE_FILES)
-            
-            for filename in standard_files:
-                try:
-                    secret_name = self._sanitize_secret_name(f"cert-{domain}-{filename.replace('.', '-')}")
-                    secret = client.get_secret(secret_name)
-                    cert_files[filename] = secret.value.encode('utf-8')
-                except Exception as e:
-                    logger.debug(f"Secret {secret_name} not found for {domain}: {e}")
-                    continue
 
-            if not cert_files:
-                return None
+        ok_secrets = True
+        ok_certificate = True
 
-            # Load metadata
-            metadata = {}
+        if self.writes_secrets:
             try:
-                metadata_name = self._sanitize_secret_name(f"cert-{domain}-metadata")
-                secret = client.get_secret(metadata_name)
-                metadata = json.loads(secret.value)
+                ok_secrets = _retry_call(self._store_as_secrets, domain, cert_files, metadata)
+            except Exception as inner:
+                logger.error("Secrets-surface write failed for %s: %s", domain, inner)
+                ok_secrets = False
+
+        if self.writes_certificate:
+            try:
+                ok_certificate = _retry_call(self._get_cert_importer().import_certificate, domain, cert_files, metadata)
+            except Exception as inner:
+                logger.error("Certificate-object import failed for %s: %s", domain, inner)
+                ok_certificate = False
+
+        if ok_secrets and ok_certificate:
+            logger.info(
+                "Certificate stored successfully in Azure Key Vault for %s (mode=%s)",
+                domain, self.storage_mode,
+            )
+            return True
+        return False
+
+    def _retrieve_from_secrets(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any], 'Optional[datetime]']]:
+        client = self._get_client()
+        cert_files: Dict[str, bytes] = {}
+        latest_update: Optional['datetime'] = None
+        for filename in CERTIFICATE_FILES:
+            secret_name = self._sanitize_secret_name(f"cert-{domain}-{filename.replace('.', '-')}")
+            try:
+                secret = client.get_secret(secret_name)
+                cert_files[filename] = secret.value.encode('utf-8')
+                updated = getattr(secret.properties, 'updated_on', None)
+                if updated and (latest_update is None or updated > latest_update):
+                    latest_update = updated
             except Exception as e:
-                logger.debug(f"Metadata not found in Azure Key Vault for {domain}: {e}")
-            
+                logger.debug(f"Secret {secret_name} not found for {domain}: {e}")
+                continue
+
+        if not cert_files:
+            return None
+
+        metadata: Dict[str, Any] = {}
+        try:
+            metadata_name = self._sanitize_secret_name(f"cert-{domain}-metadata")
+            secret = client.get_secret(metadata_name)
+            metadata = json.loads(secret.value)
+        except Exception as e:
+            logger.debug(f"Metadata not found in Azure Key Vault for {domain}: {e}")
+
+        return cert_files, metadata, latest_update
+
+    def _retrieve_info_from_secrets(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any], 'Optional[datetime]']]:
+        """Read only cert.pem plus metadata from the Secrets surface."""
+        client = self._get_client()
+        secret_name = self._sanitize_secret_name(f"cert-{domain}-cert-pem")
+        try:
+            secret = client.get_secret(secret_name)
+        except Exception as e:
+            logger.debug(f"cert.pem secret not found for {domain}: {e}")
+            return None
+
+        cert_pem = secret.value.encode('utf-8')
+        cert_pem_update = getattr(secret.properties, 'updated_on', None)
+
+        metadata: Dict[str, Any] = {}
+        try:
+            metadata_name = self._sanitize_secret_name(f"cert-{domain}-metadata")
+            metadata_secret = client.get_secret(metadata_name)
+            metadata = json.loads(metadata_secret.value)
+        except Exception as e:
+            logger.debug(f"Metadata not found in Azure Key Vault for {domain}: {e}")
+
+        return {'cert.pem': cert_pem}, metadata, cert_pem_update
+
+    def retrieve_certificate_info(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        """Retrieve only cert.pem and metadata for dashboard/listing paths."""
+        # The catch lives OUTSIDE the retry boundary: a decorated method that
+        # swallows its own exceptions never gives _with_retry anything to
+        # retry (that was the pre-fix state of every cloud backend here).
+        try:
+            return self._retrieve_certificate_info_attempt(domain)
+        except Exception as e:
+            logger.error(f"Failed to retrieve certificate info from Azure Key Vault for {domain}: {e}")
+            return None
+
+    @_with_retry()
+    def _retrieve_certificate_info_attempt(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        if self.storage_mode == AZURE_KV_MODE_SECRETS:
+            result = self._retrieve_info_from_secrets(domain)
+            if result is None:
+                return None
+            cert_files, metadata, _ = result
             return cert_files, metadata
-            
+
+        if self.storage_mode == AZURE_KV_MODE_CERTIFICATE:
+            summary = self._get_cert_importer().get_certificate_summary(domain)
+            if summary is None:
+                return None
+            cert_files, metadata, _ = summary
+            return cert_files, metadata
+
+        secrets_result = self._retrieve_info_from_secrets(domain)
+        cert_update = self._get_cert_importer().get_certificate_update_time(domain)
+
+        if secrets_result is not None and cert_update is None:
+            cert_files, metadata, _ = secrets_result
+            if not metadata:
+                metadata = self._get_cert_importer().get_metadata_tags(domain)
+            return cert_files, metadata
+
+        if secrets_result is None and cert_update is not None:
+            summary = self._get_cert_importer().get_certificate_summary(domain)
+            if summary is None:
+                return None
+            cert_files, metadata, _ = summary
+            return cert_files, metadata
+
+        if secrets_result is not None and cert_update is not None:
+            cert_files, metadata, secrets_update = secrets_result
+            if secrets_update is not None and cert_update > secrets_update:
+                summary = self._get_cert_importer().get_certificate_summary(domain)
+                if summary is not None:
+                    summary_files, summary_metadata, _ = summary
+                    return summary_files, summary_metadata
+                logger.warning(
+                    "Azure KV both-mode: Certificate API claims a fresher "
+                    "public cert for %s but summary read failed; falling "
+                    "back to Secrets cert.pem snapshot.",
+                    domain,
+                )
+            if not metadata:
+                metadata = self._get_cert_importer().get_metadata_tags(domain)
+            return cert_files, metadata
+
+        return None
+
+    def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        """Retrieve certificate files and metadata from Azure Key Vault.
+
+        Lookup order depends on the active ``storage_mode``:
+
+        * ``secrets``: read each PEM and the metadata-secret. Returns
+          ``None`` if no PEM secret is found.
+        * ``certificate``: export the PFX from the Certificate's companion
+          Secret (Azure mirrors the Certificate object's tags onto that
+          Secret, which is also the only surface that exposes the private
+          key) and split it back into the four PEM files; metadata is
+          rehydrated from those mirrored tags.
+        * ``both``: the two surfaces may diverge when a renewal's
+          Certificate-object import succeeds but the Secrets write fails
+          (or vice versa). To avoid returning stale data we compare the
+          ``updated_on`` timestamps of both surfaces and return the
+          freshest one. When Secrets carry no metadata (manual deletion,
+          legacy state) we fall back to the Certificate object's tags.
+        """
+        try:
+            return self._retrieve_certificate_attempt(domain)
         except Exception as e:
             logger.error(f"Failed to retrieve certificate from Azure Key Vault for {domain}: {e}")
             return None
-    
+
     @_with_retry()
+    def _retrieve_certificate_attempt(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        if self.storage_mode == AZURE_KV_MODE_SECRETS:
+            result = self._retrieve_from_secrets(domain)
+            if result is not None:
+                cert_files, metadata, _ = result
+                return cert_files, metadata
+            return None
+
+        if self.storage_mode == AZURE_KV_MODE_CERTIFICATE:
+            return self._get_cert_importer().export_certificate(domain)
+
+        # storage_mode == 'both' — compare timestamps to avoid stale reads
+        secrets_result = self._retrieve_from_secrets(domain)
+        cert_update = self._get_cert_importer().get_certificate_update_time(domain)
+
+        if secrets_result is not None and cert_update is None:
+            cert_files, metadata, secrets_update = secrets_result
+            if not metadata:
+                metadata = self._get_cert_importer().get_metadata_tags(domain)
+            return cert_files, metadata
+
+        if secrets_result is None and cert_update is not None:
+            return self._get_cert_importer().export_certificate(domain)
+
+        if secrets_result is not None and cert_update is not None:
+            cert_files, metadata, secrets_update = secrets_result
+            if secrets_update is not None and cert_update > secrets_update:
+                # Cert API claims a fresher copy than Secrets. Try to
+                # serve it, but if the export fails for any reason
+                # (companion Secret deleted manually, base64 garbage,
+                # PFX parse error — all paths return None from
+                # export_certificate), fall back to the older Secrets
+                # snapshot we already loaded. Returning None here would
+                # force callers to refetch from ACME unnecessarily.
+                exported = self._get_cert_importer().export_certificate(domain)
+                if exported is not None:
+                    return exported
+                logger.warning(
+                    f"Azure KV both-mode: Certificate API claims a fresher "
+                    f"copy of {domain} but export_certificate returned "
+                    f"None; falling back to older Secrets snapshot."
+                )
+            if not metadata:
+                metadata = self._get_cert_importer().get_metadata_tags(domain)
+            return cert_files, metadata
+
+        return None
+
+    # Anchored at end of name so we match the metadata secret regardless of
+    # the 8-char CRC32 suffix that `_sanitize_secret_name` always appends.
+    # The previous filter (``endswith('-metadata')``) silently matched zero
+    # secrets in production because every real secret ends in ``-<crc>``.
+    _METADATA_SECRET_RE = re.compile(r'^cert-.+-metadata-[0-9a-f]{8}$')
+
+    def _list_secret_domains(self) -> List[str]:
+        client = self._get_client()
+        domains = set()
+        for secret_properties in client.list_properties_of_secrets():
+            if not self._METADATA_SECRET_RE.match(secret_properties.name):
+                continue
+            try:
+                secret = client.get_secret(secret_properties.name)
+                meta = json.loads(secret.value)
+                domain = meta.get('domain')
+                if domain:
+                    domains.add(domain)
+            except Exception as inner_e:
+                logger.warning(f"Could not read metadata secret {secret_properties.name}: {inner_e}")
+        return sorted(domains)
+
     def list_certificates(self) -> List[str]:
-        """List all certificate domains in Azure Key Vault"""
+        """List all certificate domains in Azure Key Vault."""
         try:
-            client = self._get_client()
-            domains = set()
-
-            for secret_properties in client.list_properties_of_secrets():
-                if not (secret_properties.name.startswith('cert-') and secret_properties.name.endswith('-metadata')):
-                    continue
-                # Read the metadata secret to get the authoritative domain name.
-                # Simple name-reversal (replacing '-' with '.') is lossy for domains
-                # that contain hyphens (e.g. my-app.example.com), so we always read
-                # the stored metadata JSON which contains the original domain string.
-                try:
-                    secret = client.get_secret(secret_properties.name)
-                    meta = json.loads(secret.value)
-                    domain = meta.get('domain')
-                    if domain:
-                        domains.add(domain)
-                except Exception as inner_e:
-                    logger.warning(f"Could not read metadata secret {secret_properties.name}: {inner_e}")
-
-            return sorted(list(domains))
-
+            return self._list_certificates_attempt()
         except Exception as e:
             logger.error(f"Failed to list certificates from Azure Key Vault: {e}")
             return []
-    
-    def delete_certificate(self, domain: str) -> bool:
-        """Delete certificate from Azure Key Vault"""
-        try:
-            client = self._get_client()
-            
-            standard_files = list(CERTIFICATE_FILES)
-            
-            for filename in standard_files:
-                try:
-                    secret_name = self._sanitize_secret_name(f"cert-{domain}-{filename.replace('.', '-')}")
-                    client.begin_delete_secret(secret_name)
-                except Exception as e:
-                    logger.debug(f"Could not delete secret {secret_name} for {domain}: {e}")
-                    continue
 
-            # Delete metadata
+    @_with_retry()
+    def _list_certificates_attempt(self) -> List[str]:
+        domains: set = set()
+        if self.writes_secrets:
+            domains.update(self._list_secret_domains())
+        if self.writes_certificate:
+            domains.update(self._get_cert_importer().list_domains())
+        return sorted(domains)
+
+    def _delete_secrets(self, domain: str) -> bool:
+        client = self._get_client()
+        ok = True
+        for filename in CERTIFICATE_FILES:
+            secret_name = self._sanitize_secret_name(f"cert-{domain}-{filename.replace('.', '-')}")
             try:
-                metadata_name = self._sanitize_secret_name(f"cert-{domain}-metadata")
-                client.begin_delete_secret(metadata_name)
+                client.begin_delete_secret(secret_name)
             except Exception as e:
-                logger.debug(f"Could not delete metadata for {domain} from Azure Key Vault: {e}")
-            
-            logger.info(f"Certificate deleted from Azure Key Vault for {domain}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to delete certificate from Azure Key Vault for {domain}: {e}")
-            return False
-    
-    def certificate_exists(self, domain: str) -> bool:
-        """Check if certificate exists in Azure Key Vault"""
+                logger.debug(f"Could not delete secret {secret_name} for {domain}: {e}")
+                ok = False
         try:
-            client = self._get_client()
-            secret_name = self._sanitize_secret_name(f"cert-{domain}-cert-pem")
-            client.get_secret(secret_name)
+            metadata_name = self._sanitize_secret_name(f"cert-{domain}-metadata")
+            client.begin_delete_secret(metadata_name)
+        except Exception as e:
+            # Same surface-independence contract as the per-PEM secrets
+            # above: a metadata-delete failure must flag the surface as
+            # not-cleanly-deleted so callers can react. Without this, the
+            # outer delete_certificate could return True even though the
+            # metadata secret is still around and would mislead a later
+            # list_certificates / backfill pass.
+            logger.warning(
+                f"Could not delete metadata for {domain} from Azure Key Vault: {e}"
+            )
+            ok = False
+        return ok
+
+    def delete_certificate(self, domain: str) -> bool:
+        """Delete certificate from Azure Key Vault across active modes.
+
+        Mirrors the surface-independence contract of :meth:`store_certificate`:
+        a failure on one surface must not skip the other. Returns True only
+        when every active surface deleted cleanly so callers can react to
+        partial failures (e.g. a Certificate object left orphaned in the
+        vault when the Secrets API was unreachable).
+        """
+        ok_secrets = True
+        ok_certificate = True
+
+        if self.writes_secrets:
+            try:
+                ok_secrets = self._delete_secrets(domain)
+            except Exception as inner:
+                logger.error("Secrets-surface delete failed for %s: %s", domain, inner)
+                ok_secrets = False
+
+        if self.writes_certificate:
+            try:
+                ok_certificate = self._get_cert_importer().delete(domain)
+            except Exception as inner:
+                logger.error("Certificate-object delete failed for %s: %s", domain, inner)
+                ok_certificate = False
+
+        if ok_secrets and ok_certificate:
+            logger.info(
+                "Certificate deleted from Azure Key Vault for %s (mode=%s)",
+                domain, self.storage_mode,
+            )
             return True
-        except Exception:
-            return False
-    
+        return False
+
+    def certificate_exists(self, domain: str) -> bool:
+        """Check if certificate exists in Azure Key Vault (in any active mode)."""
+        if self.writes_secrets:
+            try:
+                client = self._get_client()
+                secret_name = self._sanitize_secret_name(f"cert-{domain}-cert-pem")
+                client.get_secret(secret_name)
+                return True
+            except Exception:
+                pass
+        if self.writes_certificate:
+            try:
+                return self._get_cert_importer().exists(domain)
+            except Exception:
+                return False
+        return False
+
     def get_backend_name(self) -> str:
         return "azure_keyvault"
+
+    # Public hooks used by the backfill endpoint to drive the helper without
+    # exposing the importer to the rest of the codebase.
+    def has_certificate_object(self, domain: str) -> bool:
+        return self._get_cert_importer().exists(domain)
+
+    def import_certificate_object(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        return self._get_cert_importer().import_certificate(domain, cert_files, metadata)
+
+    def verify_certificate_api_access(self) -> None:
+        """Probe Certificate API access (used by the storage test endpoint)."""
+        self._get_cert_importer().verify_api_access()
 
 
 class AWSSecretsManagerBackend(CertificateStorageBackend):
@@ -440,81 +1111,87 @@ class AWSSecretsManagerBackend(CertificateStorageBackend):
                 raise ImportError("AWS Secrets Manager backend requires 'boto3' package")
         return self._client
     
-    @_with_retry()
     def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
         """Store certificate files and metadata to AWS Secrets Manager"""
         try:
-            _validate_storage_domain(domain)
-            client = self._get_client()
-
-            # Combine all certificate data into a single secret
-            secret_data = {
-                'files': {k: v.decode('utf-8', errors='replace') for k, v in cert_files.items()},
-                'metadata': metadata
-            }
-            
-            secret_name = f"certmate/certificates/{domain}"
-            
-            try:
-                # Try to update existing secret
-                client.update_secret(
-                    SecretId=secret_name,
-                    SecretString=json.dumps(secret_data)
-                )
-            except client.exceptions.ResourceNotFoundException:
-                # Create new secret
-                client.create_secret(
-                    Name=secret_name,
-                    SecretString=json.dumps(secret_data),
-                    Description=f"SSL certificate for {domain} managed by CertMate"
-                )
-            
-            logger.info(f"Certificate stored successfully in AWS Secrets Manager for {domain}")
-            return True
-            
+            return self._store_certificate_attempt(domain, cert_files, metadata)
         except Exception as e:
             logger.error(f"Failed to store certificate in AWS Secrets Manager for {domain}: {e}")
             return False
-    
+
     @_with_retry()
+    def _store_certificate_attempt(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        _validate_storage_domain(domain)
+        client = self._get_client()
+
+        # Combine all certificate data into a single secret
+        secret_data = {
+            'files': {k: v.decode('utf-8', errors='replace') for k, v in cert_files.items()},
+            'metadata': metadata
+        }
+
+        secret_name = f"certmate/certificates/{domain}"
+
+        try:
+            # Try to update existing secret
+            client.update_secret(
+                SecretId=secret_name,
+                SecretString=json.dumps(secret_data)
+            )
+        except client.exceptions.ResourceNotFoundException:
+            # Create new secret
+            client.create_secret(
+                Name=secret_name,
+                SecretString=json.dumps(secret_data),
+                Description=f"SSL certificate for {domain} managed by CertMate"
+            )
+
+        logger.info(f"Certificate stored successfully in AWS Secrets Manager for {domain}")
+        return True
+
     def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
         """Retrieve certificate files and metadata from AWS Secrets Manager"""
         try:
-            client = self._get_client()
-            secret_name = f"certmate/certificates/{domain}"
-            
-            response = client.get_secret_value(SecretId=secret_name)
-            secret_data = json.loads(response['SecretString'])
-            
-            cert_files = {k: v.encode('utf-8') for k, v in secret_data.get('files', {}).items()}
-            metadata = secret_data.get('metadata', {})
-            
-            return cert_files, metadata
-            
+            return self._retrieve_certificate_attempt(domain)
         except Exception as e:
             logger.error(f"Failed to retrieve certificate from AWS Secrets Manager for {domain}: {e}")
             return None
-    
+
     @_with_retry()
+    def _retrieve_certificate_attempt(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        client = self._get_client()
+        secret_name = f"certmate/certificates/{domain}"
+
+        response = client.get_secret_value(SecretId=secret_name)
+        secret_data = json.loads(response['SecretString'])
+
+        cert_files = {k: v.encode('utf-8') for k, v in secret_data.get('files', {}).items()}
+        metadata = secret_data.get('metadata', {})
+
+        return cert_files, metadata
+
     def list_certificates(self) -> List[str]:
         """List all certificate domains in AWS Secrets Manager"""
         try:
-            client = self._get_client()
-            domains = []
-            
-            paginator = client.get_paginator('list_secrets')
-            for page in paginator.paginate():
-                for secret in page['SecretList']:
-                    name = secret['Name']
-                    if name.startswith('certmate/certificates/'):
-                        domain = name.replace('certmate/certificates/', '')
-                        domains.append(domain)
-            
-            return sorted(domains)
-            
+            return self._list_certificates_attempt()
         except Exception as e:
             logger.error(f"Failed to list certificates from AWS Secrets Manager: {e}")
             return []
+
+    @_with_retry()
+    def _list_certificates_attempt(self) -> List[str]:
+        client = self._get_client()
+        domains = []
+
+        paginator = client.get_paginator('list_secrets')
+        for page in paginator.paginate():
+            for secret in page['SecretList']:
+                name = secret['Name']
+                if name.startswith('certmate/certificates/'):
+                    domain = name.replace('certmate/certificates/', '')
+                    domains.append(domain)
+
+        return sorted(domains)
     
     def delete_certificate(self, domain: str) -> bool:
         """Delete certificate from AWS Secrets Manager"""
@@ -590,92 +1267,98 @@ class HashiCorpVaultBackend(CertificateStorageBackend):
                     return self._get_client()
         return self._client
     
-    @_with_retry()
     def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
         """Store certificate files and metadata to HashiCorp Vault"""
         try:
-            _validate_storage_domain(domain)
-            client = self._get_client()
-
-            # Prepare secret data
-            secret_data = {
-                'files': {k: v.decode('utf-8', errors='replace') for k, v in cert_files.items()},
-                'metadata': metadata
-            }
-            
-            secret_path = f"certmate/certificates/{domain}"
-            
-            if self.engine_version == 'v2':
-                client.secrets.kv.v2.create_or_update_secret(
-                    path=secret_path,
-                    secret=secret_data,
-                    mount_point=self.mount_point
-                )
-            else:
-                client.secrets.kv.v1.create_or_update_secret(
-                    path=secret_path,
-                    secret=secret_data,
-                    mount_point=self.mount_point
-                )
-            
-            logger.info(f"Certificate stored successfully in HashiCorp Vault for {domain}")
-            return True
-            
+            return self._store_certificate_attempt(domain, cert_files, metadata)
         except Exception as e:
             logger.error(f"Failed to store certificate in HashiCorp Vault for {domain}: {e}")
             return False
-    
+
     @_with_retry()
+    def _store_certificate_attempt(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        _validate_storage_domain(domain)
+        client = self._get_client()
+
+        # Prepare secret data
+        secret_data = {
+            'files': {k: v.decode('utf-8', errors='replace') for k, v in cert_files.items()},
+            'metadata': metadata
+        }
+
+        secret_path = f"certmate/certificates/{domain}"
+
+        if self.engine_version == 'v2':
+            client.secrets.kv.v2.create_or_update_secret(
+                path=secret_path,
+                secret=secret_data,
+                mount_point=self.mount_point
+            )
+        else:
+            client.secrets.kv.v1.create_or_update_secret(
+                path=secret_path,
+                secret=secret_data,
+                mount_point=self.mount_point
+            )
+
+        logger.info(f"Certificate stored successfully in HashiCorp Vault for {domain}")
+        return True
+
     def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
         """Retrieve certificate files and metadata from HashiCorp Vault"""
         try:
-            client = self._get_client()
-            secret_path = f"certmate/certificates/{domain}"
-            
-            if self.engine_version == 'v2':
-                response = client.secrets.kv.v2.read_secret_version(
-                    path=secret_path,
-                    mount_point=self.mount_point
-                )
-                secret_data = response['data']['data']
-            else:
-                response = client.secrets.kv.v1.read_secret(
-                    path=secret_path,
-                    mount_point=self.mount_point
-                )
-                secret_data = response['data']
-            
-            cert_files = {k: v.encode('utf-8') for k, v in secret_data.get('files', {}).items()}
-            metadata = secret_data.get('metadata', {})
-            
-            return cert_files, metadata
-            
+            return self._retrieve_certificate_attempt(domain)
         except Exception as e:
             logger.error(f"Failed to retrieve certificate from HashiCorp Vault for {domain}: {e}")
             return None
-    
+
     @_with_retry()
+    def _retrieve_certificate_attempt(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        client = self._get_client()
+        secret_path = f"certmate/certificates/{domain}"
+
+        if self.engine_version == 'v2':
+            response = client.secrets.kv.v2.read_secret_version(
+                path=secret_path,
+                mount_point=self.mount_point
+            )
+            secret_data = response['data']['data']
+        else:
+            response = client.secrets.kv.v1.read_secret(
+                path=secret_path,
+                mount_point=self.mount_point
+            )
+            secret_data = response['data']
+
+        cert_files = {k: v.encode('utf-8') for k, v in secret_data.get('files', {}).items()}
+        metadata = secret_data.get('metadata', {})
+
+        return cert_files, metadata
+
     def list_certificates(self) -> List[str]:
         """List all certificate domains in HashiCorp Vault"""
         try:
-            client = self._get_client()
-            
-            if self.engine_version == 'v2':
-                response = client.secrets.kv.v2.list_secrets(
-                    path="certmate/certificates",
-                    mount_point=self.mount_point
-                )
-            else:
-                response = client.secrets.kv.v1.list_secrets(
-                    path="certmate/certificates",
-                    mount_point=self.mount_point
-                )
-            
-            return sorted(response.get('data', {}).get('keys', []))
-            
+            return self._list_certificates_attempt()
         except Exception as e:
             logger.error(f"Failed to list certificates from HashiCorp Vault: {e}")
             return []
+
+    @_with_retry()
+    def _list_certificates_attempt(self) -> List[str]:
+        client = self._get_client()
+
+        if self.engine_version == 'v2':
+            response = client.secrets.kv.v2.list_secrets(
+                path="certmate/certificates",
+                mount_point=self.mount_point
+            )
+        else:
+            response = client.secrets.kv.v1.list_secrets(
+                path="certmate/certificates",
+                mount_point=self.mount_point
+            )
+
+        return sorted(response.get('data', {}).get('keys', []))
     
     def delete_certificate(self, domain: str) -> bool:
         """Delete certificate from HashiCorp Vault"""
@@ -763,130 +1446,142 @@ class InfisicalBackend(CertificateStorageBackend):
     def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
         """Store certificate files and metadata to Infisical"""
         try:
-            _validate_storage_domain(domain)
-            client = self._get_client()
+            return self._store_certificate_attempt(domain, cert_files, metadata)
+        except Exception as e:
+            logger.error(f"Failed to store certificate in Infisical for {domain}: {e}")
+            return False
 
-            # Store certificate files as individual secrets (upsert: update if exists, create otherwise)
-            for filename, content in cert_files.items():
-                secret_key = f"certmate-{domain}-{filename.replace('.', '-')}"
-                secret_value = content.decode('utf-8', errors='replace')
-                try:
-                    client.update_secret(
-                        secret_name=secret_key,
-                        secret_value=secret_value,
-                        project_id=self.project_id,
-                        environment=self.environment
-                    )
-                except Exception:
-                    client.create_secret(
-                        secret_name=secret_key,
-                        secret_value=secret_value,
-                        project_id=self.project_id,
-                        environment=self.environment
-                    )
+    @_with_retry()
+    def _store_certificate_attempt(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        _validate_storage_domain(domain)
+        client = self._get_client()
 
-            # Store metadata (upsert)
-            metadata_key = f"certmate-{domain}-metadata"
-            metadata_value = json.dumps(metadata)
+        # Store certificate files as individual secrets (upsert: update if exists, create otherwise)
+        for filename, content in cert_files.items():
+            secret_key = f"certmate-{domain}-{filename.replace('.', '-')}"
+            secret_value = content.decode('utf-8', errors='replace')
             try:
                 client.update_secret(
-                    secret_name=metadata_key,
-                    secret_value=metadata_value,
+                    secret_name=secret_key,
+                    secret_value=secret_value,
                     project_id=self.project_id,
                     environment=self.environment
                 )
             except Exception:
                 client.create_secret(
-                    secret_name=metadata_key,
-                    secret_value=metadata_value,
+                    secret_name=secret_key,
+                    secret_value=secret_value,
                     project_id=self.project_id,
                     environment=self.environment
                 )
-            
-            logger.info(f"Certificate stored successfully in Infisical for {domain}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to store certificate in Infisical for {domain}: {e}")
-            return False
-    
-    def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
-        """Retrieve certificate files and metadata from Infisical"""
-        try:
-            client = self._get_client()
-            
-            cert_files = {}
-            standard_files = list(CERTIFICATE_FILES)
-            
-            for filename in standard_files:
-                try:
-                    secret_key = f"certmate-{domain}-{filename.replace('.', '-')}"
-                    secret = client.get_secret(
-                        secret_name=secret_key,
-                        project_id=self.project_id,
-                        environment=self.environment
-                    )
-                    cert_files[filename] = secret.secret_value.encode('utf-8')
-                except Exception as e:
-                    logger.debug(f"Secret {secret_key} not found for {domain}: {e}")
-                    continue
 
-            if not cert_files:
-                return None
-
-            # Load metadata
-            metadata = {}
-            try:
-                metadata_key = f"certmate-{domain}-metadata"
-                secret = client.get_secret(
-                    secret_name=metadata_key,
-                    project_id=self.project_id,
-                    environment=self.environment
-                )
-                metadata = json.loads(secret.secret_value)
-            except Exception as e:
-                logger.debug(f"Metadata not found in Infisical for {domain}: {e}")
-            
-            return cert_files, metadata
-            
-        except Exception as e:
-            logger.error(f"Failed to retrieve certificate from Infisical for {domain}: {e}")
-            return None
-    
-    def list_certificates(self) -> List[str]:
-        """List all certificate domains in Infisical"""
+        # Store metadata (upsert)
+        metadata_key = f"certmate-{domain}-metadata"
+        metadata_value = json.dumps(metadata)
         try:
-            client = self._get_client()
-            domains = set()
-            
-            secrets = client.list_secrets(
+            client.update_secret(
+                secret_name=metadata_key,
+                secret_value=metadata_value,
                 project_id=self.project_id,
                 environment=self.environment
             )
-            
-            for secret in secrets:
-                if not (secret.secret_name.startswith('certmate-') and secret.secret_name.endswith('-metadata')):
-                    continue
-                # Read each metadata secret to get the authoritative domain name instead
-                # of reversing the sanitized key (which is lossy for hyphenated domains).
-                try:
-                    meta_secret = client.get_secret(
-                        secret_name=secret.secret_name,
-                        project_id=self.project_id,
-                        environment=self.environment
-                    )
-                    meta = json.loads(meta_secret.secret_value)
-                    domain = meta.get('domain')
-                    if domain:
-                        domains.add(domain)
-                except Exception as inner_e:
-                    logger.warning(f"Could not read metadata secret {secret.secret_name}: {inner_e}")
-            
-            return sorted(list(domains))
-            
+        except Exception:
+            client.create_secret(
+                secret_name=metadata_key,
+                secret_value=metadata_value,
+                project_id=self.project_id,
+                environment=self.environment
+            )
+
+        logger.info(f"Certificate stored successfully in Infisical for {domain}")
+        return True
+
+    def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        """Retrieve certificate files and metadata from Infisical"""
+        try:
+            return self._retrieve_certificate_attempt(domain)
+        except Exception as e:
+            logger.error(f"Failed to retrieve certificate from Infisical for {domain}: {e}")
+            return None
+
+    @_with_retry()
+    def _retrieve_certificate_attempt(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        client = self._get_client()
+
+        cert_files = {}
+        standard_files = list(CERTIFICATE_FILES)
+
+        for filename in standard_files:
+            try:
+                secret_key = f"certmate-{domain}-{filename.replace('.', '-')}"
+                secret = client.get_secret(
+                    secret_name=secret_key,
+                    project_id=self.project_id,
+                    environment=self.environment
+                )
+                cert_files[filename] = secret.secret_value.encode('utf-8')
+            except Exception as e:
+                # Log the PEM filename, not the storage key or the SDK error
+                # (CodeQL: anything name-tainted as a secret must stay out of
+                # logs; the key is reconstructible from domain + filename).
+                logger.debug(f"Infisical entry for {domain}/{filename} not readable: {e}")
+                continue
+
+        if not cert_files:
+            return None
+
+        # Load metadata
+        metadata = {}
+        try:
+            metadata_key = f"certmate-{domain}-metadata"
+            secret = client.get_secret(
+                secret_name=metadata_key,
+                project_id=self.project_id,
+                environment=self.environment
+            )
+            metadata = json.loads(secret.secret_value)
+        except Exception as e:
+            logger.debug(f"Metadata not found in Infisical for {domain}: {e}")
+
+        return cert_files, metadata
+
+    def list_certificates(self) -> List[str]:
+        """List all certificate domains in Infisical"""
+        try:
+            return self._list_certificates_attempt()
         except Exception as e:
             logger.error(f"Failed to list certificates from Infisical: {e}")
             return []
+
+    @_with_retry()
+    def _list_certificates_attempt(self) -> List[str]:
+        client = self._get_client()
+        domains = set()
+
+        secrets = client.list_secrets(
+            project_id=self.project_id,
+            environment=self.environment
+        )
+
+        for secret in secrets:
+            if not (secret.secret_name.startswith('certmate-') and secret.secret_name.endswith('-metadata')):
+                continue
+            # Read each metadata secret to get the authoritative domain name instead
+            # of reversing the sanitized key (which is lossy for hyphenated domains).
+            try:
+                meta_secret = client.get_secret(
+                    secret_name=secret.secret_name,
+                    project_id=self.project_id,
+                    environment=self.environment
+                )
+                meta = json.loads(meta_secret.secret_value)
+                domain = meta.get('domain')
+                if domain:
+                    domains.add(domain)
+            except Exception as inner_e:
+                logger.warning(f"Could not read an Infisical metadata entry: {inner_e}")
+
+        return sorted(list(domains))
     
     def delete_certificate(self, domain: str) -> bool:
         """Delete certificate from Infisical"""
@@ -943,24 +1638,205 @@ class InfisicalBackend(CertificateStorageBackend):
         return "infisical"
 
 
+class S3CompatibleBackend(CertificateStorageBackend):
+    """S3-compatible object-storage backend.
+
+    One backend for every S3-compatible provider via a configurable
+    ``endpoint_url`` — covers EU-sovereign object storage (Hetzner, Contabo,
+    OVHcloud, Scaleway, Exoscale, Wasabi) and self-hosted MinIO/Ceph, with no
+    new dependency (boto3 is already core). Each domain is stored as a single
+    JSON object ``<prefix>/<domain>.json`` holding the cert files + metadata,
+    mirroring the AWS Secrets Manager blob shape.
+    """
+
+    def __init__(self, config: Dict[str, str]):
+        self.endpoint_url = (config.get('endpoint_url') or '').strip()
+        self.bucket = (config.get('bucket') or '').strip()
+        self.access_key_id = (config.get('access_key_id') or '').strip()
+        self.secret_access_key = (config.get('secret_access_key') or '').strip()
+        self.region = (config.get('region') or 'us-east-1').strip()
+        # Key namespace inside the bucket; trailing slashes normalised away.
+        self.prefix = (config.get('prefix') or 'certmate/certificates').strip().strip('/')
+        if not all([self.endpoint_url, self.bucket, self.access_key_id, self.secret_access_key]):
+            raise ValueError(
+                "S3-compatible backend requires endpoint_url, bucket, "
+                "access_key_id and secret_access_key")
+        self._client = None
+        logger.info("S3CompatibleBackend initialized for endpoint %s bucket %s",
+                    self.endpoint_url, self.bucket)
+
+    def _get_client(self):
+        if self._client is None:
+            try:
+                import boto3
+                self._client = boto3.client(
+                    's3',
+                    endpoint_url=self.endpoint_url,
+                    aws_access_key_id=self.access_key_id,
+                    aws_secret_access_key=self.secret_access_key,
+                    region_name=self.region,
+                )
+            except ImportError:
+                raise ImportError("S3-compatible backend requires 'boto3' package")
+        return self._client
+
+    def _key(self, domain: str) -> str:
+        return f"{self.prefix}/{domain}.json"
+
+    def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        try:
+            return self._store_certificate_attempt(domain, cert_files, metadata)
+        except Exception as e:
+            logger.error(f"Failed to store certificate in S3 for {domain}: {e}")
+            return False
+
+    @_with_retry()
+    def _store_certificate_attempt(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
+        _validate_storage_domain(domain)
+        client = self._get_client()
+        secret_data = {
+            'files': {k: v.decode('utf-8', errors='replace') for k, v in cert_files.items()},
+            'metadata': metadata,
+        }
+        client.put_object(
+            Bucket=self.bucket,
+            Key=self._key(domain),
+            Body=json.dumps(secret_data).encode('utf-8'),
+            ContentType='application/json',
+        )
+        logger.info(f"Certificate stored successfully in S3 for {domain}")
+        return True
+
+    def retrieve_certificate(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        try:
+            return self._retrieve_certificate_attempt(domain)
+        except Exception as e:
+            logger.error(f"Failed to retrieve certificate from S3 for {domain}: {e}")
+            return None
+
+    @_with_retry()
+    def _retrieve_certificate_attempt(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        client = self._get_client()
+        try:
+            response = client.get_object(Bucket=self.bucket, Key=self._key(domain))
+        except client.exceptions.NoSuchKey:
+            return None
+        secret_data = json.loads(response['Body'].read().decode('utf-8'))
+        cert_files = {k: v.encode('utf-8') for k, v in secret_data.get('files', {}).items()}
+        metadata = secret_data.get('metadata', {})
+        return cert_files, metadata
+
+    def list_certificates(self) -> List[str]:
+        try:
+            return self._list_certificates_attempt()
+        except Exception as e:
+            logger.error(f"Failed to list certificates from S3: {e}")
+            return []
+
+    @_with_retry()
+    def _list_certificates_attempt(self) -> List[str]:
+        client = self._get_client()
+        domains = []
+        prefix = f"{self.prefix}/"
+        paginator = client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get('Contents', []) or []:
+                key = obj['Key']
+                if key.startswith(prefix) and key.endswith('.json'):
+                    domains.append(key[len(prefix):-len('.json')])
+        return sorted(domains)
+
+    def delete_certificate(self, domain: str) -> bool:
+        try:
+            client = self._get_client()
+            client.delete_object(Bucket=self.bucket, Key=self._key(domain))
+            logger.info(f"Certificate deleted from S3 for {domain}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete certificate from S3 for {domain}: {e}")
+            return False
+
+    def certificate_exists(self, domain: str) -> bool:
+        try:
+            client = self._get_client()
+            client.head_object(Bucket=self.bucket, Key=self._key(domain))
+            return True
+        except Exception:
+            return False
+
+    def get_backend_name(self) -> str:
+        return "s3_compatible"
+
+
 class StorageManager:
     """Manager class for certificate storage backends"""
-    
+
     def __init__(self, settings_manager):
         self.settings_manager = settings_manager
         self._backend = None
         self._initialized = False
-    
+        # Snapshot of the certificate_storage subtree that was used to build
+        # the currently-cached backend. We compare the live settings against
+        # this on every get_backend() so a settings update that changes the
+        # backend (or its config) is picked up without a process restart.
+        self._config_signature = None
+        self._lock = threading.RLock()
+        # Set to the configured backend name when init failed and we fell back
+        # to local disk, so /health can surface the split-brain (operator
+        # believes certs are in Azure/Vault/S3; they are on local disk, often
+        # ephemeral). None = the intended backend is active.
+        self._fallback_from = None
+
+    def reload(self):
+        """Force the next get_backend() to re-read settings and rebuild the
+        backend. Call this after persisting a settings change that mutates
+        ``certificate_storage`` so the running process picks up the new
+        backend without a restart."""
+        with self._lock:
+            self._backend = None
+            self._initialized = False
+            self._config_signature = None
+
+    @staticmethod
+    def _signature_for(storage_config):
+        """Stable signature of the storage config subtree. Used to detect
+        out-of-band changes so the backend can be rebuilt lazily."""
+        try:
+            return json.dumps(storage_config or {}, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            # Last-resort fallback: repr is stable enough for change-detection.
+            return repr(storage_config)
+
     def _initialize_backend(self):
-        """Initialize storage backend based on settings"""
-        if self._initialized:
-            return
-        
+        """Initialize storage backend based on settings.
+
+        Lazy + change-aware: rebuilds the backend when the certificate_storage
+        subtree differs from the snapshot used last time. This is what makes a
+        backend swap from the UI take effect immediately instead of waiting
+        for an app restart."""
         try:
             settings = self.settings_manager.load_settings()
-            storage_config = settings.get('certificate_storage', {})
+        except Exception as e:
+            # If we can't read settings, keep whatever backend we have so
+            # in-flight operations don't crash. The original error already
+            # logged by load_settings carries the context.
+            logger.error("StorageManager could not read settings: %s", e)
+            if self._initialized:
+                return
+            self._backend = LocalFileSystemBackend(Path('certificates'))
+            self._initialized = True
+            self._config_signature = None
+            return
+
+        storage_config = settings.get('certificate_storage', {}) or {}
+        signature = self._signature_for(storage_config)
+        if self._initialized and signature == self._config_signature:
+            return
+
+        try:
             backend_type = storage_config.get('backend', 'local_filesystem')
-            
+            self._fallback_from = None  # reset; set below only if we fall back
+
             if backend_type == 'local_filesystem':
                 # Default local filesystem backend
                 cert_dir = Path(storage_config.get('cert_dir', 'certificates'))
@@ -981,15 +1857,21 @@ class StorageManager:
             elif backend_type == 'infisical':
                 config = storage_config.get('infisical', {})
                 self._backend = InfisicalBackend(config)
-                
+
+            elif backend_type == 's3_compatible':
+                config = storage_config.get('s3_compatible', {})
+                self._backend = S3CompatibleBackend(config)
+
             else:
                 logger.warning(f"Unknown storage backend: {backend_type}, falling back to local filesystem")
                 cert_dir = Path('certificates')
                 self._backend = LocalFileSystemBackend(cert_dir)
-            
+                self._fallback_from = backend_type
+
             self._initialized = True
+            self._config_signature = signature
             logger.info(f"Storage backend initialized: {self._backend.get_backend_name()}")
-            
+
         except Exception as e:
             logger.error(
                 "Failed to initialize storage backend '%s': %s. "
@@ -999,11 +1881,26 @@ class StorageManager:
             )
             self._backend = LocalFileSystemBackend(Path('certificates'))
             self._initialized = True
-    
+            # Cache the signature even on the fallback path so a subsequent
+            # call doesn't keep retrying the broken backend on every get.
+            self._config_signature = signature
+            # Persist the split-brain so /health surfaces it (not just a log
+            # line the operator may never read).
+            self._fallback_from = storage_config.get('backend', 'unknown')
+
+    def get_fallback_backend(self) -> Optional[str]:
+        """Return the configured backend name if init failed and CertMate fell
+        back to local disk (so callers/monitoring can detect the split-brain),
+        else None. /health surfaces this as 'degraded'."""
+        with self._lock:
+            self._initialize_backend()
+            return self._fallback_from
+
     def get_backend(self) -> CertificateStorageBackend:
         """Get the current storage backend"""
-        self._initialize_backend()
-        return self._backend
+        with self._lock:
+            self._initialize_backend()
+            return self._backend
     
     def store_certificate(self, domain: str, cert_files: Dict[str, bytes], metadata: Dict[str, Any]) -> bool:
         """Store certificate using the configured backend"""
@@ -1014,6 +1911,11 @@ class StorageManager:
         """Retrieve certificate using the configured backend"""
         backend = self.get_backend()
         return backend.retrieve_certificate(domain)
+
+    def retrieve_certificate_info(self, domain: str) -> Optional[Tuple[Dict[str, bytes], Dict[str, Any]]]:
+        """Retrieve lightweight certificate info using the configured backend."""
+        backend = self.get_backend()
+        return backend.retrieve_certificate_info(domain)
     
     def list_certificates(self) -> List[str]:
         """List certificates using the configured backend"""

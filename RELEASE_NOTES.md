@@ -1,3 +1,1170 @@
+## v2.21.0 (Feature — terminal SDK + CLI, and an audit-verify semantics fix)
+
+Adds first-class terminal clients for the CertMate API and fixes a monitoring false-alarm in the audit-verify endpoint.
+
+### Terminal clients (new)
+
+- **`certmate-sdk`** and **`certmate-cli`**, in-repo under `clients/`, layered so the CLI is built on the SDK (never the reverse) and packaged so `pip install certmate-sdk` stays light (httpx only — no server, no certbot). The SDK (`from certmate import Client`) wraps the same `/api/...` surface the MCP server drives; the CLI (`certmate cert create/ls/info/renew/reissue/rm`, `dns`, `backup`, `deploy run`, `audit verify`, `health`) renders tables and adds two things the terminal lacked: `--wait` on create (polls the async job with a spinner) and a client-side `--dry-run` (validate the domain and preflight the DNS provider, issue nothing). A Swagger contract test keeps the SDK's endpoints in lockstep with the API.
+
+### Audit trail
+
+- **`GET /api/audit/verify` no longer reports a brand-new instance as broken.** An instance that has audited nothing yet has no chain file; that returned `409` (identical to a tamper), so a monitoring probe false-alarmed on a fresh deploy. It now returns `200` with `state='absent'` when nothing has ever been audited, and keeps `409` for a genuine break — including a chain file that was deleted after a signed checkpoint attested it existed.
+
+---
+
+## v2.20.0 (Security and reliability hardening — audit sweep across renewal, keys, storage, auth, and the audit trail)
+
+A focused hardening pass from an adversarial audit of the certificate engine, deploy hooks, storage/backup, auth/RBAC, and the audit trail. Every change ships with regression tests. Two operator-visible behaviour changes are called out first — read them before upgrading.
+
+### Operator-visible behaviour changes
+
+- **A configured API bearer token is now enforced.** Previously the API served every request as admin until *local auth* was explicitly enabled, so an API-only operator who set `API_BEARER_TOKEN` (documented as required) was left unauthenticated. Now, once `API_BEARER_TOKEN` / `API_BEARER_TOKEN_FILE` is set, the token is required on every gated endpoint even with local auth off. A fresh install with no token is unchanged (open for onboarding); a bearer-token-only deployment locks the web UI, so bootstrap a user via the API. A loud startup warning is logged whenever the instance is running unauthenticated.
+- **Off-site backups now require encryption.** If S3 off-site backup is enabled but `CERTMATE_BACKUP_PASSPHRASE` is not set, the upload is refused instead of shipping every private key in cleartext to third-party object storage.
+
+### Certificate renewal and issuance
+
+- **Renewal certbot calls are bounded (30-minute timeout).** A wedged renewal no longer hangs the serial renewal job forever (which had silently stopped every future automatic renewal) or pins a gunicorn worker.
+- **Batch-created certificates are registered for automatic renewal.** The batch endpoint bypassed the only path that tracks a domain for renewal, so batch certs silently expired about 90 days later; they are now tracked.
+- **Issuance verifies the certificate materialised before reporting success.** certbot exiting 0 without producing files no longer returns success or pushes an empty file set to the disaster-recovery backend.
+- **The renewal scheduler tolerates a missed fire** (`misfire_grace_time` plus `coalesce`), and a **host-local cross-process lock** ensures only one process renews when several share a data directory — no more duplicate ACME orders under multiple workers/containers.
+- **No more false "renewed" telemetry.** When certbot reports "not yet due", the run is recorded as not-due instead of stamping a renewal.
+
+### Keys and secrets
+
+- **Renewed private keys keep mode 0600** (they were left world-readable under a cloud storage backend).
+- **The default local storage backend writes atomically** (temp file, fsync, rename): no truncated key or cert on a crash, and no world-readable window.
+- **DNS credential files are created 0600 atomically** (`O_EXCL`); the **Google service-account key** now gets a per-operation random name (it was a fixed, never-deleted path) and orphaned key files are swept.
+- **API keys cannot escalate.** A key can no longer be minted with a higher role or broader domain scope than its creator, and admin keys can no longer be domain-scoped (a false containment).
+- **`GET /api/settings` no longer exposes the user roster or API-key inventory to non-admins.**
+
+### Audit trail
+
+- **Signed checkpoints are now verified.** `GET /api/audit/verify` cross-checks the chain against the latest signed checkpoint, so a truncation, rewind, or rewrite at or below it fails verification — the checkpoints were previously written but never read back. `docs/compliance.md` states the exact guarantee and its limits.
+
+### Storage and operations
+
+- **A storage-backend fallback is surfaced.** If the configured cloud/remote backend fails to initialise, `/health` reports `degraded` instead of silently using local disk.
+- **Kubernetes and compose docs corrected.** The production example no longer suggests `replicas: 2` or multiple workers; CertMate runs a single in-process renewal writer.
+
+---
+
+## v2.19.5 (Patch — create-certificate form presents as a centered modal on desktop)
+
+A presentation refinement to the certificate-creation surface introduced in v2.19.4. No change to the creation flow, fields, focus handling, or issuance protocol.
+
+### Certificate creation
+
+- **Centered modal on desktop.** Creating a certificate is the primary action, so on wider viewports (>= 768px) the creation form now presents as a centered modal — fading and scaling in over the dimmed dashboard — instead of the right-side drawer. On phones and narrow viewports it stays a full-height drawer for one-handed reachability. The change is CSS-only and scoped to the creation container (`#createCertFormContainer`): the open/close state class, fields, Tab focus-trap, and submit handler are unchanged, so behaviour and accessibility carry over untouched.
+
+---
+
+## v2.19.4 (Patch — unified certificate-creation flow, MCP lifecycle tools, dashboard and topbar refinements)
+
+A redesign of the certificate-creation and list surfaces into one consistent flow, driven by hands-on review, plus three new MCP tools toward REST parity and the refinements that followed. No change to the issuance protocol; gated through the full real-cert E2E suite (Let's Encrypt staging via Cloudflare DNS-01).
+
+### MCP server
+
+- **Three certificate-lifecycle tools toward REST parity** ([#358](https://github.com/fabriziosalmi/certmate/issues/358)): `certmate_delete_certificate` (delete a certificate by domain), `certmate_update_certificate` (reissue in place to replace the SAN set and/or change the DNS-01 alias, without delete-and-recreate — omit `sans` to keep the current set), and `certmate_get_certificate_file` (download a single bundle file such as `fullchain.pem` or `privkey.pem` as raw PEM text, for direct use by servers like HAProxy and nginx). The MCP server now exposes 16 tools, covered by an offline behavioural test that pins each tool's HTTP method, path and body. A versions/rollback tool from the same issue was deferred: it needs a backend endpoint for certificate revision history that does not exist yet.
+
+### Certificate creation
+
+- **One creation flow for server and client certificates.** The asymmetric layout (server form behind an inline toggle that pushed the page down; client form always inline) is replaced by a single right-side overlay drawer that holds both types, switched by a `[ Server | Client ]` segment and opened from a `[ Server | Client | + New ]` cluster in the page header. No layout jump, and `+ New` is available from either view.
+- **Async issuance feedback in the list.** A fresh create now posts asynchronously: the drawer closes immediately and an optimistic "Issuing" row appears at the top of the table, polling the job to resolution — it becomes the real certificate on success, or a "Failed" row carrying the reason and a one-click Retry. Falls back to the synchronous path transparently when the async executor is absent.
+
+### Search, filtering, and navigation
+
+- **The Cmd-K command palette is the single search surface.** It now searches both server and client certificates and adds open-the-drawer actions and jump-and-flash (selecting a certificate scrolls to and highlights its row). The redundant per-page search boxes were removed, the topbar search became a plain lens icon, and the stale topbar "Certificates" link was dropped (the logo links home and the Server/Client toggle handles cert navigation). Logout is now icon-only.
+- **Status filter chips** replace the All-Status select on the server list, each with a live count and its status colour; the client list header now matches, with status and usage chips and a Refresh action.
+
+### Detail modal and tables
+
+- **Certificate-detail modal regrouped.** Auto-Renew moved into the status banner; Deployment and Actions became two columns of consistent quick-action buttons on a single row each; the two deployment indicators are now squares matching those buttons; the delete action is danger-red (and still confirms first).
+- **Client certificates table aligned to the server table** — same header chrome and column styling, a status-coloured left border per row (active / expiring / revoked), and the monospace identifier treatment.
+- **List actions are a quick-action icon group** (Check all deployments, Export ZIP, Refresh) in place of the single Check All button.
+
+### Polish
+
+- A compact single-row stat strip (server and client), monospace machine-values (domains and common names), a Tab focus-trap on the creation drawer with focus restore, and a responsive pass down to phone widths.
+
+### Broader UI fixes and polish
+
+A sweep across the rest of the app that landed alongside the creation-flow work:
+
+- **Dashboard**: the certificate table is readable on mobile and tablet, the secondary row actions collapse into an overflow menu, and the stat cards and dark-mode action contrast are clearer.
+- **Settings**: Save stays reachable behind a sticky footer on form tabs, the overflowing tab strip shows a scroll affordance, the active theme segment is visible in dark mode, the General tab gained section hierarchy, and the API-token Generate button reads as a secondary action.
+- **Activity**: corrected the operation filter, labels and empty-state copy; coherent glyph and colour semantics per operation; a compact inline absolute time for touch.
+- **Notifications**: success toasts for snooze/unsnooze, a Snooze disclosure caret, a neutral summary so each row carries its own severity colour, and a tidier empty/error state.
+- **Help**: the endpoint list scrolls instead of clipping, prose is capped to a readable measure, the redundant "What's new" section is removed, and the page gets mobile padding.
+- **Accessibility and setup**: a keyboard focus ring on bare chrome buttons, a clearer non-colour active accent in the nav, and the first-run wizard no longer overlays the setup form.
+
+### Fixes
+
+- **Batch certificate download returned 500.** `POST /api/web/certificates/download/batch` called `certificate_manager.get_certificate_path()`, a method that does not exist, so every batch export raised `AttributeError`. It now bundles each domain's `fullchain.pem` as `<domain>.crt` (cert-only by design — a bulk export must never leak private keys), which is what the new Export ZIP action drives.
+
+## v2.19.2 (Patch — heavy-use UI/UX, renewal robustness, security hardening, adoption fixes)
+
+A broad pass driven by hands-on review of the most-used surfaces plus an adversarial multi-agent sweep of the backend, API, security posture, and docs. No change to the core issuance protocol; gated through the full real-cert E2E suite (Let's Encrypt via Cloudflare DNS-01).
+
+### Security
+
+- **OIDC account-takeover via a custom `email_claim` is closed.** The verified-email gate read the standard `email_verified` claim, which only attests the standard `email` claim — so an IdP that let a user self-set a custom claim (e.g. `mail`) could present a verified throwaway address while matching an admin's address via the custom claim and inherit that row's role. Linking now only trusts verification when the matched address is the verified standard email.
+- **Flask session cookie hardened.** It carries the OIDC PKCE transients (state / nonce / code_verifier); it is now `SameSite=Lax` and marked `Secure` when an HTTPS deployment is signalled, so those values no longer transit in cleartext.
+- **`.secret_key` is written 0600 race-free** (no brief world-readable window between write and chmod).
+- **Webhook SSRF guard.** Webhook delivery, including the interactive Test button, refuses targets that resolve to loopback / private / link-local / reserved addresses (e.g. the cloud metadata endpoint). Opt out with `CERTMATE_ALLOW_INTERNAL_WEBHOOKS=true` for legitimate internal targets.
+
+### Certificate renewal and reissue
+
+- **Renewal is now CWD-independent.** It passes the DNS credentials explicitly instead of trusting the (often relative) credentials path certbot baked into the renewal config at issue time, which silently broke renewal for file-based DNS providers whenever the process working directory differed between issuance and renewal.
+- **Per-operation credentials file.** The shared `letsencrypt/config/<provider>.ini` is now uniquely named per operation, removing a race where two concurrent same-provider operations clobbered/deleted each other's credentials mid-run.
+- **"Edit and Reissue" repairs a broken lineage.** A reissue now quarantines a parsefail certbot lineage (stale absolute paths or a non-symlink live cert, e.g. after a data-dir move or a backup restore) before issuing, so the remediation the UI recommends actually works.
+- **Clear failures instead of an opaque 500.** Renewal fails fast with a clear message when the cert's DNS account is no longer configured, and a broken renewal config returns a 422 with an actionable `RENEWAL_CONFIG_BROKEN` code rather than a generic 500.
+
+### UI and UX
+
+- **Certificate detail modal redesigned** (one of the most-used surfaces): integrated status banner (status, days, and date as one datum at equal weight), a monospace single-line copyable domain, an inline auto-renew toggle, a separated Deployment section with a view/edit deploy-hook link, and consistent icon quick-actions matching the table row.
+- **Dashboard stat cards redesigned** with hero numbers and a reactive state accent; the previously-invisible "expired" count is now surfaced.
+- **Top bar restructured**: Search first, icon-only navigation with grouping dividers, theme toggle moved to Settings (auto by default), and a full Notifications page (with client-side snooze) replacing the dropdown.
+- **Activity** entries open a detail modal (full metadata, command output, copy-as-JSON, filter actions).
+- **Client Certificates table**: sortable columns, whole-row click to open details, and a redesigned modal consistent with the server one.
+- **Advanced Options toggle fixed**: the button's `id` collided with its handler's name inside the form, so the form's named-element access shadowed the global function (DOM clobbering); renamed the id.
+- Settings: General tab first; an Appearance theme override (Auto / Light / Dark); modal background scroll-lock; provider brand logos in the DNS selector, table, and detail modal; a clearer backup section.
+
+### API and robustness
+
+- Empty JSON request bodies no longer 500 (six web endpoints now tolerate a missing body).
+- A changed `cache_ttl` takes effect without a restart.
+- "Manager not available" conditions return 503 instead of 500 across the storage / CA / backup endpoints.
+- Raw exception strings are no longer echoed to clients in the CA / storage-migrate / batch-create paths.
+- `/health` reports the real application version (it previously always returned "unknown").
+
+### Adoption and docs
+
+- The bundled nginx compose profile pointed at a flat `cert.pem` / `key.pem` that CertMate never produces; corrected to the per-domain `fullchain.pem` / `privkey.pem` with a note.
+- The README quick-start `docker run` used a placeholder image and bound `0.0.0.0`; it now uses the real image and binds `127.0.0.1`.
+- Added five DNS providers missing from the README table (Hetzner Cloud, Scaleway, deSEC, DuckDNS, Custom Script).
+- Fixed the contributor setup (the referenced `requirements-dev.txt` and pre-commit config do not exist), added an Upgrading section to the Docker docs, and refreshed the SECURITY.md supported-version line.
+
+### Dependencies
+
+- Alpine.js 3.15.8 to 3.15.12 (patch-level).
+
+## v2.19.1 (Patch — UI defect sweep, accessibility, design-token consistency)
+
+A focused frontend pass from an internal UI/UX audit: objective interaction bugs, a broad accessibility upgrade, and design-token consistency. No change to certificate issuance; gated through the full real-cert E2E suite (Let's Encrypt staging via Cloudflare DNS-01).
+
+### Fixes
+
+- **In-page confirm dialogs rendered "[object Object]" titles**: `runDeployHooks` and `toggleAutoRenew` passed an options object where `CertMate.confirm(message, title, options)` expects the title, so the modal heading showed `[object Object]` and the custom button label was dropped. Corrected the argument order; both are non-destructive (blue) confirmations.
+- **Dead duplicate detail-panel button**: the certificate detail panel rendered two byte-identical "Check Deployment" / "Check Probe" buttons wired to the same handler. Removed the dead duplicate.
+- **`Check all` deployment button relied on implicit `window.event`**: `checkAllDeploymentStatuses()` read `event.target` with no parameter, which is undefined in Firefox/Safari under the strict-mode module, so the button never disabled and rapid clicks fanned out parallel batches. The event is now passed explicitly.
+- **Toast notifications clipped off-screen on mobile and were invisible to screen readers**: the container used `right-4 w-full` (pushing its left edge off-screen below ~410px) with no live region. It now spans the viewport with margins and announces via `aria-live` (errors as `role="alert"`).
+- **Core pages had no mobile horizontal padding**: the dashboard, settings and activity wrappers sat flush to the screen edge below 640px. Added `px-4`.
+- **Certificate-created toast shown as info (blue)** instead of success (green); the deploy-hook loading overlay could stick if the error handler threw (now cleared via `finally`); a deployment-status badge `id` was emitted up to three times per row (invalid HTML) — the deployed-counter now reads the cache directly and the duplicate `id` is gone.
+
+### Accessibility
+
+- **Modal dialog semantics and focus management**: the shared `CertMate.confirm` / `CertMate.prompt` dialogs gained `role="alertdialog"`/`"dialog"`, `aria-modal`, labelled headings, a Tab focus-trap and focus restore on close; destructive confirms now focus Cancel so an inadvertent Enter cannot confirm before the message is read.
+- **WAI-ARIA tab pattern completed**: the 11 settings tabs, the client-certificate single/bulk tabs and the server/client view toggle now expose proper `tabpanel`/`aria-controls`/`aria-selected` (or `aria-pressed`) relationships, a roving tabindex and arrow-key navigation.
+- **Labels and names**: search box, detail-panel close, debug-console controls, breadcrumb home links, the add-user and SMTP/webhook fields and 25 storage fields are now programmatically labelled; collapsible sections expose `aria-expanded`; certificate table rows are keyboard-operable (Enter/Space).
+- **Command palette**: added the five settings tabs it was missing (Notifications, Deploy, Probe, API Keys, SSO), `role="dialog"`, and focus restore on close.
+
+### Consistency
+
+- **Form inputs migrated to semantic tokens**: 113 inputs using `dark:bg-gray-700 dark:text-white` (a dark-only override) now use `bg-input text-foreground`, so a future theme change reaches every field. The theme codemod gained a dark-only ratchet so the pattern cannot silently return.
+- **Dark-mode and token clean-ups**: the activity deploy-error popup no longer inverts the theme; both toggle switches use `peer-checked:bg-primary`; two hardcoded modal backdrops now use `bg-black/50`.
+- **Public emoji removed** from the DNS provider selector, the CA quick-start hint and the issue-report body, per the project's plain-text convention.
+- **Responsive/touch**: API Docs is now reachable from the mobile bottom navigation; dense icon buttons (table actions, form close, deploy-hook remove) have larger touch targets.
+
+## v2.19.0 (Feature — configurable rate limits + rfc2136 CNAME delegation)
+
+Two backlog features: operator-tunable API rate limits and DNS-alias (CNAME delegation) support for rfc2136.
+
+### Features
+
+- **Configurable API rate limits** ([#319](https://github.com/fabriziosalmi/certmate/issues/319)): the per-endpoint limits were hardcoded, so a trusted automation fleet (e.g. a cron deploy fanning out across VMs behind one egress IP) tripped the shared bucket with no way to raise it. Settings → API Keys → **API Rate Limits** now exposes a value-per-endpoint form and an on/off toggle, mirrored by `GET`/`PUT /api/settings/rate-limits` (admin). Changes apply live, with no restart; the values are read and sanitised on each request so a malformed entry can never disable a limit. The login endpoint keeps its own separate limiter.
+- **rfc2136 domain_alias (CNAME delegation)** ([#330](https://github.com/fabriziosalmi/certmate/issues/330)): `domain_alias` mode previously rejected rfc2136. It now writes the `_acme-challenge.<alias>` TXT into the alias zone with a TSIG-signed dynamic update, discovering the owning zone from the server's SOA — so one rfc2136 TSIG key can serve several zones, including externally-managed domains whose owners only add the delegating CNAME. Reuses the existing `nameserver` / `tsig_key` / `tsig_secret` credentials (plus an optional `tsig_algorithm`, default HMAC-SHA512); no new dependency. Verified against a Technitium-style HMAC-SHA512 setup.
+
+## v2.18.1 (Patch — dashboard polish + documentation translations)
+
+Objective UI-audit fixes and the first wave of translated documentation. No behaviour change to certificate issuance.
+
+### Fixes
+
+- **Dashboard dates rendered in the browser's locale** ([#337](https://github.com/fabriziosalmi/certmate/pull/337)): `toLocaleDateString(undefined, …)` meant an Italian-locale browser showed Italian month names ("17 apr 2026") inside the otherwise English UI. Pinned to `en-US` on the certificate table and the detail panel.
+- **"Valid" stat card was green even at zero** ([#337](https://github.com/fabriziosalmi/certmate/pull/337)): 0 valid certificates is not a success state; the value is now shown in a neutral colour when the count is 0.
+- **Expired certificates showed a closed padlock** ([#337](https://github.com/fabriziosalmi/certmate/pull/337)): the closed-padlock "secure connection" glyph on an expired cert was a visual paradox; expired rows now use an open padlock.
+- **"Backend: …" deployment badge was ambiguous** ([#337](https://github.com/fabriziosalmi/certmate/pull/337)): easily misread as "the CertMate app is down". Relabelled to "Server" (the probe ran from the server) vs "Browser"; the badge role id and the deployed-counter logic are unchanged.
+- **Client-certificate stat cards used a single mobile column** ([#337](https://github.com/fabriziosalmi/certmate/pull/337)): they now use a two-column mobile grid like the server-certificate stats, halving the vertical space.
+
+### Documentation
+
+- **Translated documentation trees** for French ([#327](https://github.com/fabriziosalmi/certmate/pull/327)), Italian ([#338](https://github.com/fabriziosalmi/certmate/pull/338)), German and Spanish ([#339](https://github.com/fabriziosalmi/certmate/pull/339)) under `docs/fr/`, `docs/it/`, `docs/de/`, `docs/es/`. Each mirrors the English docs structure verbatim (code, commands, links and section layout preserved); only prose is translated. The Italian set is native-reviewed; the German and Spanish sets are awaiting native-speaker review.
+
+## v2.18.0 (Feature — multi-protocol deployment probes + deploy-hook reliability)
+
+Deployment verification grows beyond HTTPS-on-443, and the deploy-hook pipeline closes two gaps that left scheduled renewals undeployed and a dashboard counter stuck at zero.
+
+### Features
+
+- **Multi-protocol deployment probes with per-certificate port** ([#328](https://github.com/fabriziosalmi/certmate/pull/328)): the "is this cert actually deployed?" probe now supports `https-tls`, plain `tls`, and `smtp-starttls`, with the port and protocol configurable per certificate from a new Probe tab in Settings. The backend probes the real service (including the SMTP STARTTLS upgrade) and the browser fallback is skipped for the non-HTTPS protocols. The probe's TLS minimum version is pinned to 1.2. Thanks to Christophe Kyvrakidis.
+- **Tunnel the deployment probe through an outbound HTTP proxy** ([#326](https://github.com/fabriziosalmi/certmate/pull/326)): on a host that can only reach the internet via an HTTP proxy, the raw-socket probe always reported "Unreachable" even when the target was up. It now honours `HTTPS_PROXY`/`NO_PROXY`, tunnelling the TCP leg with HTTP CONNECT (basic proxy auth supported) and running the TLS handshake over the tunnel to the configured per-cert port, so the real peer certificate is still compared. Pure stdlib, no new dependency. Thanks to Hiep Ho Minh.
+
+### Fixes
+
+- **Scheduled auto-renewals now fire deploy hooks** ([#329](https://github.com/fabriziosalmi/certmate/issues/329)): the manual/API path published `certificate_renewed` via the issuance executor, but the scheduler called the certificate manager directly with no event bus, so a background renewal updated the cert on disk yet never notified the deployer — the hook never ran and the live endpoint kept serving the old certificate. The scheduler now publishes the same event after a successful renewal; publishing stays out of the renewal routine to avoid double-firing the manual path, and a notification failure never demotes a successful renewal to a failure. Reported by SpeeDFireCZE.
+- **"Deployed" dashboard counter stuck at zero** ([#324](https://github.com/fabriziosalmi/certmate/issues/324)): the counter looked up `deployment-status-<domain>` but the badges render as `deployment-status-<domainId>-<role>`, so the lookup never matched and the stat card stayed at 0. It now mirrors the badge id and reads the authoritative backend badge. Reported by SpeeDFireCZE.
+- **Deploy-hook errors are now visible from the Activity page** ([#332](https://github.com/fabriziosalmi/certmate/pull/332)): a failing hook (e.g. exit code 127) showed only "exit code N" and clicking the entry bounced to the certificate page. The error now carries an stderr snippet, the full stdout/stderr is stored in the audit detail, and the entry opens a popup with the full output; deploy entries no longer link to the certificate page. Thanks to Christophe Kyvrakidis.
+- **Renewal timestamp now reaches the storage backend** ([#282](https://github.com/fabriziosalmi/certmate/pull/282)): `renewed_at` was written to metadata after the certificate had already been uploaded, so the storage backend persisted metadata without it. The metadata update now happens before the upload. Thanks to luksiol.
+
+## v2.17.1 (Patch — security hardening)
+
+Five must-fix findings from a draconian security/logic review of the existing code (no new features), each verified against source and pinned by a regression test.
+
+### Security
+
+- **Path traversal via client-certificate Common Name.** `create_client_certificate` built the on-disk identifier straight from the caller-supplied Common Name (only spaces replaced) and ran `mkdir(parents=True)` before any other check, so a CN such as `../../../../tmp/evil` created — and wrote a CA-signed key, certificate and metadata into — a directory outside the managed cert tree (single and batch issuance, operator role). The pre-existing `_validate_identifier` guard was only ever applied on retrieval, never to the value that constructs the identifier. The Common Name is now slugified at the construction site (covering every caller) to a filesystem-safe token, with a containment assertion before `mkdir`. Benign Common Names slugify to themselves so existing identifiers and paths are unchanged, and the full Common Name is still preserved verbatim in the certificate subject and metadata.
+- **Backup restore downgraded private keys to world-readable.** `restore_unified_backup` set `0600` only for the exact filename `privkey.pem` and `0644` for everything else, but certbot keeps the real key bytes in `archive/<domain>/privkeyN.pem` (the `live/privkey.pem` symlink points at them) and the ACME account key in `accounts/.../private_key.json` — both retained in the unified backup — so a restore actively rewrote served key material and the account key to `0644`. Restore now mirrors certbot's own permissions: every private-key filename is locked to `0600` and public material (cert/chain/fullchain plus metadata json) stays `0644`.
+- **`GET /api/metrics` was reachable unauthenticated.** The endpoint carried no auth decorator while its sibling info endpoints (`/api/cache`, `/api/backups`) require the `viewer` role. It now requires a viewer credential to match its peers; the Prometheus scrape target remains the separate, intentionally public `/metrics` route.
+- **A disabled, demoted, or deleted user kept their live session.** The role was snapshotted into the session at login and session validation only checked expiry, so disabling, demoting, or deleting a user left an already-issued session valid — with the old role — for up to the session lifetime (default 8h), with no kill switch for a compromised or just-removed account. Those transitions now invalidate the user's in-memory sessions, forcing re-authentication under the new state; an unrelated edit (e.g. email) does not log the user out.
+
+### Fixes
+
+- **Webhook secrets clobbered on a *generic* settings save.** v2.15.0 restored masked webhook secrets on the dedicated `/api/notifications/config` route, but the generic `POST /api/settings` path (the full-settings round-trip used by the UI and integration tests) still merged the `notifications` subtree without restoring secrets nested in the `channels.webhooks` list — `_deep_merge_dict` replaces lists wholesale and `_strip_masked_values` only walks dicts — writing the mask sentinel over the real HMAC secret / bot token. The corruption was silent: deliveries then signed with `********`. `atomic_update` now restores masked list secrets generically for every deep-merge key, so both paths behave identically.
+
+## v2.17.0 (Feature — third-party-verifiable audit trail)
+
+Completes the agentic audit trail (v2.16.0 added attribution + the tamper-evident hash chain): the record can now be verified by a third party, off the box, without running or trusting CertMate.
+
+### Features
+
+- **Ed25519-signed, independently verifiable export.** The instance holds an Ed25519 signing key (persisted at `data/.audit_signing_key` like the Flask secret key — generated on first run, `0600`, off-box via `AUDIT_SIGNING_KEY_FILE`). `GET /api/audit/export` (admin, optional `?from_seq`/`?to_seq`) returns a signed, self-verifying bundle — `{manifest, entries, bundle_signature}` — whose manifest pins the instance fingerprint, public key, seq range and `head_hash`, with the signature over the canonical manifest transitively committing to every entry. `GET /api/audit/public-key` exposes the signing identity to pin out of band. The chain head is also signed into periodic checkpoints.
+- **Verifier upgrade.** `python -m modules.core.audit_verify --bundle bundle.json [--pubkey instance.pem]` checks the chain structure, manifest consistency, the Ed25519 signature, and the public-key fingerprint, with optional out-of-band key pinning — proving both that the record was not edited and which instance produced it. No new dependencies (`cryptography` is already required).
+- **Honest scope.** A local signing key detects tampering by anyone who does not hold it and attributes the export to an instance, but does not bind the operator (who holds the key); fully constraining the operator needs opt-in external anchoring of the signed checkpoints, a planned follow-up. `docs/compliance.md` and `docs/api.md` document this precisely.
+
+## v2.16.1 (Patch — remove the discontinued BuyPass CA)
+
+BuyPass Go SSL has been discontinued — BuyPass stopped accepting new ACME accounts on 2025-09-15, issued its last certificate on 2025-10-31, and terminated the service with all certificates expired by 2026-04-15. Selecting it could only fail, so it is removed as a CA option.
+
+### Changed
+
+- **Removed BuyPass Go as a selectable CA provider** ([#316](https://github.com/fabriziosalmi/certmate/pull/316)): dropped from the CA registry, the API `ca_provider` enum, the test-CA-provider endpoint, the dashboard and Settings UI, the documented CA list, and its unit test. The other CAs (Let's Encrypt, ZeroSSL, Google Trust Services, Actalis, DigiCert ACME, SSL.com, Private CA) are unaffected. A certificate whose stored metadata still names BuyPass degrades gracefully — `certbot renew` runs against the on-disk config without re-resolving the CA, a reissue surfaces a clear error that is audited as a failure, and the dashboard shows a "this certificate authority is no longer available; reissue with a supported CA" note instead of a blank line.
+
+Thanks to Joni for flagging the BuyPass discontinuation on LinkedIn.
+
+## v2.16.0 (Feature — agentic cert-lifecycle audit trail)
+
+When an AI/MCP agent renews or replaces certificates on a schedule, "it ran" is not an audit trail. This release records what changed, when, and on whose authority, in a form a third party can verify.
+
+### Features
+
+- **Attribution on every certificate-lifecycle action** ([#313](https://github.com/fabriziosalmi/certmate/pull/313)): create, renew, reissue, deploy, the auto-renew toggle, and unattended scheduled renewals are now recorded with a structured `actor` (human vs API token vs AI agent, down to the API key id) and `trigger` (manual, API, agent, or the scheduler job). The previously-silent success paths and scheduled renewals emitted no audit record at all; they do now. `actor.kind` is derived only from the authenticated identity — the client-supplied `X-CertMate-Agent-Session` header is an informational claim and never promotes a caller to `agent`.
+- **AI agent keys** ([#313](https://github.com/fabriziosalmi/certmate/pull/313)): Settings > API Keys gains an "AI agent key" toggle (`is_agent`, also on `POST /api/keys`); point the MCP server at a dedicated agent key and its actions are attributed as `actor.kind="agent"`.
+- **Tamper-evident hash chain + verifier** ([#313](https://github.com/fabriziosalmi/certmate/pull/313)): entries are appended to a SHA-256 hash chain (`data/audit/certificate_audit.chain.jsonl`) so any interior modification, deletion, or reorder is detectable. `GET /api/audit/verify` (admin) and a standalone, standard-library-only verifier (`python -m modules.core.audit_verify`) check integrity — the latter without running or trusting CertMate. No new dependencies; disable with `CERTMATE_AUDIT_CHAIN=0`.
+- **Compliance documentation** ([#313](https://github.com/fabriziosalmi/certmate/pull/313)): `docs/compliance.md` maps the trail honestly to NIS2, EU AI Act Art. 50 (transparency spirit), and ISO 42001, with explicit non-claims; the audit and MCP docs are corrected and expanded. The hash chain attests authenticity and ordering of the recorded entries; it does not detect tail truncation without an external head anchor and does not bind the operator — off-box anchoring of signed checkpoints is a planned follow-up.
+
+## v2.15.0 (Feature — notification channels, Grafana monitoring, MCP agent tooling)
+
+Three independent additions toward operating CertMate from where you already are: more notification targets, a ready observability bundle, and an MCP server an AI agent can drive on a schedule.
+
+### Features
+
+- **Notification channels — Telegram, ntfy, Gotify** ([#307](https://github.com/fabriziosalmi/certmate/pull/307)): three first-class webhook types alongside Slack/Discord/generic. Telegram via the Bot API (token + chat_id), ntfy as a topic POST with `Title`/`Priority` headers and optional Bearer token, Gotify to `<server>/message` with the app key and numeric priority. Per-event filtering from Settings > Notifications and testable from the UI. Microsoft Teams needs no adapter — point the SMTP channel at a Teams channel email address.
+- **Grafana dashboard + Prometheus alerts** ([#308](https://github.com/fabriziosalmi/certmate/pull/308)): an importable bundle under `monitoring/` — an 11-panel dashboard (certificate inventory, days-until-expiry, status and provider breakdowns, cache, uptime, version), 4 alert rules (expiring soon/critical, expired, scrape-down), and an authenticated scrape example. All PromQL validated with `promtool`; the dashboard imports into Grafana 10+.
+- **MCP agent tools + AI scheduling guide** ([#309](https://github.com/fabriziosalmi/certmate/pull/309)): the built-in MCP server grows from 6 to 13 tools — per-domain detail, async job polling, certificate download, auto-renew toggle, DNS provider/account listing, activity log. `docs/mcp.md` adds an "Operating CertMate with an AI agent" guide: the list -> decide (`days_left < N`) -> renew -> poll -> notify loop, with example scheduled prompts for Claude, Gemini, or any MCP client.
+
+### Fixes
+
+- **`/metrics` emitted only `application_uptime`** ([#308](https://github.com/fabriziosalmi/certmate/pull/308)): the endpoint was called without a collection context, so every labelled certificate/DNS/cache metric was absent for any scraper. It now builds the context from the managers and populates the inventory gauges. Operations counters (renewals, ACME errors, durations) remain defined but uninstrumented, so the dashboard and alerts are deliberately scoped to what populates today; the operations row returns once `record_*` is wired.
+- **Webhook secrets clobbered on a settings round-trip** ([#307](https://github.com/fabriziosalmi/certmate/pull/307)): the masked-secret machinery protected dict subtrees but not the `webhooks` list, so re-saving notification settings without re-typing a webhook token wrote the mask sentinel over the real secret. Secrets are now restored per webhook, matched by identity and consumed once so duplicate-identity channels keep distinct secrets.
+- **Telegram alerts silently dropped on failure events** ([#307](https://github.com/fabriziosalmi/certmate/pull/307)): `parse_mode=Markdown` over certbot error strings and wildcard domains (`*`, `_acme-challenge`) made the Bot API reject the message with HTTP 400 — precisely on the `certificate_failed` events that matter most. Messages are now sent as plain text.
+
+## v2.13.0 (Feature — edit & reissue certificates)
+
+Closes [#267](https://github.com/fabriziosalmi/certmate/issues/267): extend or drop a certificate's SAN entries — and change its DNS/alias/CA configuration — without delete + recreate.
+
+### Features
+
+- **`POST /api/certificates/<domain>/reissue`** — edits a certificate's configuration and reissues it in place over the existing certbot lineage (`--cert-name` + `--renew-with-new-domains`: the new domain set replaces the old, expand and shrink in one step, reusing the ACME account). Omitted fields keep the values the certificate was issued with, read from its metadata — DNS provider, account, alias (including a distinct alias DNS provider, issue #129), CA and challenge type never need re-entering. Explicit semantics: `san_domains` omitted keeps the current set, `[]` drops every SAN; `domain_alias: ""` clears the alias. Sync and async (202 + job poll), operator role, scope enforced on the final SAN set including inherited entries.
+- **Edit & Reissue in the dashboard** — new action in the certificate detail panel opens the create form prefilled from the certificate's data (wildcard checkbox reverse-mapped out of the SAN list, primary domain readonly — it is the certificate's identity). Dropping SANs raises a danger confirmation listing the removed names.
+- Certificate listings now surface `ca_provider`, `challenge_type` and `account_id` from metadata (null for certificates issued before these were recorded).
+
+### Safety properties
+
+- **A reissue always issues** — `--force-renewal` is part of the reissue invocation: without it, a config-only edit (CA switch, provider change, same-type re-key) with an unchanged domain set would hit certbot's identical-certificate prompt outside the renewal window and silently no-op while reporting success. Found by adversarial review against the pinned certbot source.
+- **The old certificate keeps being served until certbot succeeds** — a failed reissue leaves files, metadata and storage untouched (all three pinned by test).
+- **Key shape is preserved** — metadata does not record the key shape, so the reissue path sends no key flags and certbot keeps the lineage key; passing an explicit key option is a deliberate re-key. Without this rule a reissue would silently re-key certificates to the global defaults.
+- Renewals after a reissue pick up the new domain set automatically (certbot replays its updated renewal conf).
+
+### Fixes
+
+- The create endpoint's "certificate already exists" error now answers HTTP 409 with a pointer to the reissue endpoint instead of falling through to a generic 500.
+- `PATCH /api/certificates/<domain>` now validates `alias_dns_provider` instead of accepting it blind (an unconfigured value used to surface only at renew time).
+
+### Notes
+
+- Changing the **primary** domain remains delete + recreate: the primary is the certificate's identity (certbot lineage name, directory, settings key, API path). Promoting a SAN to primary is a rename, not an edit.
+
+## v2.12.1 (Feature — custom-script DNS provider)
+
+Closes [#286](https://github.com/fabriziosalmi/certmate/issues/286): a Cert Warden-style `custom-script` DNS provider that drives admin-supplied hook scripts through certbot's core `--manual` mode. Any DNS provider without a certbot plugin — Oracle Cloud ([#285](https://github.com/fabriziosalmi/certmate/issues/285)), in-house DNS, appliance APIs — becomes usable with two shell scripts and zero plugin installs.
+
+### Features
+
+- **`custom-script` DNS provider** — configure an auth hook (required) and a cleanup hook (optional); certbot invokes them with the standard `CERTBOT_DOMAIN`/`CERTBOT_VALIDATION` environment. The auth hook creates the `_acme-challenge` TXT record and waits for propagation (an optional per-account `propagation_seconds` is exported as `CERTMATE_DNS_PROPAGATION_SECONDS`). Multi-account support, settings UI panel and per-certificate selection included; renewals replay the hook paths from certbot's renewal conf. The per-provider `dns_propagation_seconds` setting reaches the hooks via the same env variable.
+- **Trust model = deploy hooks** — scripts are admin-configured and validated at issuance and by the test-provider API endpoint: absolute path, existing, executable, not world-writable (group-writable logs a warning), no whitespace or shell metacharacters (certbot executes hooks through the shell). A broken path fails loudly before certbot ever runs.
+- `POST /api/web/certificates/test-provider` performs a real filesystem validation for this provider (scripts are not executed).
+
+### Notes
+
+- `--manual` is certbot core: the plugin-installed preflight is skipped and no entry is added to requirements-extended.
+- docs/dns-providers.md gains a worked OCI example.
+
+## v2.12.0 (Feature — staging as a Certificate Authority)
+
+Closes [#279](https://github.com/fabriziosalmi/certmate/issues/279): the "use staging environment" option is gone; Let's Encrypt staging is now a first-class CA entry, consistent with how every other authority is selected.
+
+### Features
+
+- **"Let's Encrypt (Staging)" CA entry** — selectable per-certificate and as the default CA, pinned to the staging directory, with its own settings panel. The account email falls back to the Let's Encrypt one when left empty (same aliasing applies at issuance time). Certificate metadata now records `ca_provider`/`ca_account_id` (projected through Azure Key Vault tags), with the legacy `staging` boolean kept alongside for backward compatibility.
+
+### Behavior changes
+
+- **The per-certificate "Use staging environment" checkbox is removed** — it had no wiring: no web or API create path ever carried it, so nothing that worked before stops working.
+- **The letsencrypt "Environment" settings field is removed and migrated away** — this field was never consulted at issuance time: users who selected "Staging (Testing)" were issued PRODUCTION certificates all along. The migration drops the field without flipping the default CA, so effective issuance behavior is preserved; anyone who wants staging selects the new entry explicitly. The migration is idempotent and permanent (a stale settings tab or pre-2.12.0 backup restore reintroducing the field gets cleaned on next load).
+- **A staging request can no longer be silently downgraded to production** — the CA-config failure path used to reset any provider to production Let's Encrypt; for the Let's Encrypt family it now falls through to plain certbot, which handles staging via `--staging`.
+- The legacy `staging=true` parameter on the internal create path still works and maps onto the staging CA entry.
+
+### Renewals
+
+Renewals are CA-stable by construction — certbot replays the ACME endpoint from its own renewal conf and CertMate never recomputes it (now pinned by test). Existing staging certificates keep renewing against staging; converting one to production requires a reissue.
+
+### Testing
+
+- New suites: staging-as-CA invariant pins (directory pin, boolean mapping, no-silent-production-flip, renewal endpoint invariant) and settings-migration coverage. The CA wiring-consistency suite pins the new entry across every selection surface.
+
+## v2.11.4 (Feature — Actalis CA provider)
+
+Adds Actalis as a first-class Certificate Authority — a European (Italian) alternative to Let's Encrypt ([#287](https://github.com/fabriziosalmi/certmate/issues/287)) — and fixes the EAB credential wiring that silently broke every EAB CA configured from the web UI.
+
+### Features
+
+- **Actalis CA provider** — free 90-day DV certificates over standard ACME with External Account Binding. Wired across CAManager (official directory `https://acme-api.actalis.com/acme/directory`), the create-certificate API enum, the settings UI (config panel + connection test), the per-certificate CA dropdown and the docs. The free plan is single-domain only (no wildcard, no SAN); EAB credentials come from the Actalis customer area under Manage with ACME, ACME Credentials.
+
+### Fixes
+
+- **EAB credentials saved from the settings UI never reached certbot** — the UI stores `eab_kid`/`eab_hmac` while CAManager read only `eab_key_id`/`eab_hmac_key`, so issuance with ZeroSSL, Google Trust Services, DigiCert or SSL.com configured via the web UI failed with "EAB credentials not configured". Both spellings are now accepted everywhere EAB is read.
+- **EAB HMAC keys were returned unmasked and clobbered on save** — `eab_hmac` did not match the secret-name pattern, so `GET /api/web/settings` returned it in cleartext and any settings save that didn't re-type it overwrote the stored value with `''`. `hmac` joined the secret-name pattern (`_SECRET_KEY_RE` in `modules/core/settings.py`, the single source for masking and blank-on-save preservation); a dead duplicate of that regex in `modules/web/settings_routes.py` was removed.
+- **Test CA Connection worked for only 3 of 7 CAs** — `POST /api/settings/test-ca-provider` answered "Invalid CA provider type" for ZeroSSL, Google Trust Services, BuyPass Go and SSL.com. Fixed-directory EAB CAs now share one validation branch (accepting both EAB field spellings) and BuyPass validates email-only.
+- **Create-certificate API enum listed 3 of 8 providers** — `ca_provider` now documents the full supported set.
+- **Private CA EAB credentials were collected but never passed to certbot** — the optional EAB fields in the Private CA panel were saved and validated, but the issuance command only emitted `--eab-kid`/`--eab-hmac-key` for providers with `requires_eab: true`, which `private_ca` is not. EAB now reaches certbot whenever configured, so any EAB-enforcing ACME CA (Actalis included) also works through the generic Private CA entry. Public CAs that don't use EAB (Let's Encrypt, BuyPass) still never emit stray EAB fields.
+
+### Testing
+
+- New suites: CAManager EAB regression tests, e2e coverage of the test-ca-provider endpoint, and a CA provider wiring-consistency pin (sibling of the v2.11.3 DNS one) that breaks whenever a new CA misses any selection surface.
+
+## v2.11.3 (Patch — reliability audit fixes)
+
+Fixes from a findings-verification pass over DNS provider wiring, storage retry behaviour, notification delivery and backup security.
+
+### Fixes
+
+- **Unified backup restore silently skipped every certificate file** — an off-by-one in the `certificates/` prefix strip (`[12:]` instead of 13 chars) left a leading `/` on every entry path, which the ZIP-slip guard then rejected. Restores have been settings-only since v2.7.0; certificates now actually restore. Found by the new backup roundtrip tests.
+- **Phantom `desec` DNS provider removed; provider list unified** — `desec` was advertised by `GET /api/web/certificates/dns-providers` but had no issuance strategy, no credential schema and was rejected by settings validation. `DNSManager.SUPPORTED_PROVIDERS` now matches the canonical 25-provider set used by the strategy factory and settings validation (previously it listed only 13), and the sync is pinned by a wiring-consistency test.
+- **`POST /api/web/certificates/test-provider` always returned HTTP 500** — it called a `DNSManager.test_provider` method that was never implemented (`AttributeError`). Now performs an offline credential-shape validation against the provider's required fields.
+- **Storage backend retries never actually retried** — `@_with_retry()` decorated methods that swallowed their own exceptions, so the decorator never saw a transient error (Azure Key Vault, AWS Secrets Manager, HashiCorp Vault), and Infisical had no retry wiring at all. The catch now lives outside the retry boundary; transient errors (429/5xx/timeouts) get up to 3 attempts on all four cloud backends, with Azure retrying per surface in `both` mode.
+- **SMTP notifications now retry and are logged** — email sends get the same 3-attempt exponential backoff as webhooks (static config errors are not retried) and land in the delivery log (`/api/webhooks/deliveries`) alongside webhook deliveries.
+
+### Security
+
+- **Backup encryption at rest (opt-in)** — set `CERTMATE_BACKUP_PASSPHRASE` and unified backups are written as `.zip.enc` (PBKDF2-SHA256, 600k iterations → Fernet) instead of cleartext zips that embed every certificate private key. Listing reads metadata from a cleartext header (no KDF cost); restore — including the corrupt-settings auto-recovery path — transparently handles both formats. Without the variable, behaviour is unchanged.
+
+### Testing
+
+- New suites: storage retry contract, backup encryption roundtrip, DNSManager↔factory wiring pin, SMTP retry/delivery-log coverage.
+- `tests/conftest.py` accepts `CERTMATE_E2E_BASE_URL` to run the e2e suite against an already-running instance when Docker isn't available.
+
+## v2.8.4 (Patch — Azure DNS sub-delegated alias zones, follow-up)
+
+Follow-up hotfix for [#243](https://github.com/fabriziosalmi/certmate/issues/243). The v2.8.3 fix could not take effect.
+
+### Fixes
+
+- **Azure DNS-01 alias mode still failed against sub-delegated validation zones** — v2.8.3 set Lexicon's `resolve_zone_name` in the flat config dict passed to `Client()`, but Lexicon's legacy dict resolver routes any key outside its fixed generic-parameter list into the provider namespace. `resolve_zone_name` landed at `lexicon:azure:resolve_zone_name`, while Lexicon reads it at `lexicon:resolve_zone_name`, so it resolved to `None`, the dnspython SOA lookup never ran, and issuance kept failing with *"does not contain the DNS zone"*. CertMate now builds a Lexicon `ConfigResolver` explicitly — lexicon-level keys at the top level, provider credentials nested under the provider name — so `resolve_zone_name` reaches Lexicon where it is read. This applies to every Lexicon alias provider, not just Azure. Thanks to @jensaops for the precise diagnosis and proof-of-concept.
+
+## v2.8.3 (Patch — Azure DNS sub-delegated alias zones)
+
+Hotfix for [#243](https://github.com/fabriziosalmi/certmate/issues/243).
+
+### Fixes
+
+- **Azure DNS-01 alias mode against sub-delegated validation zones** — issuance failed with *"Resource group … does not contain the DNS zone"* when the validation zone was a delegated subdomain (e.g. `acme-validation.example.com` under `example.com`). Lexicon resolves the hosted zone with tldextract by default, which collapses any name back to the registered domain, so the delegated zone was never matched. The v2.8.1/v2.8.2 attempt at this could not work for the same reason. CertMate now sets Lexicon's `resolve_zone_name` for Azure, so the real zone is resolved via a dnspython SOA lookup from the full alias FQDN. Thanks to @jensaops for the diagnosis and POC.
+
+## v2.8.2 (Security + UX hardening)
+
+A security and UX audit release, bringing rigorous logical hardening and comprehensive audit logging coverage to the backend, along with 60+ UI/UX fixes spanning dark mode, accessibility, and form logic.
+
+### Security & Hardening
+
+- **Enhanced Audit Log Coverage** — Added audit logging to crucial backend operations including DNS account mutations (across both Flask/RESTX routes), storage configuration updates, migrations, and Azure Key Vault backfills.
+- **Path Traversal Protection** — Hardened unified backup downloads with explicit checks denying potential path traversal attempts in request payloads.
+- **UTC Alignment** — Standardized backup pruning and timestamping logic to consistently use UTC timezone across calculations.
+
+### UI & UX Auditing (60+ improvements)
+
+- **Alpine.js Render & Layout Fixes** — Fixed several unclosed HTML tags in Settings templates causing Alpine.js parsing failures; updated obsolete FontAwesome icons (e.g., DNS layout).
+- **Accessibility & ARIA Standards** — Wired focus traps, ARIA landmarks, dialog roles, and focus-restore handlers for all settings and migration modals.
+- **Dark Mode Support** — Cleaned up invisible fields in dark mode across all DNS provider form inputs and improved SMTP text contrast.
+- **Enhanced Form Safeguards** — Added disabled states and loading spinners to diagnostic, test, and notification actions to prevent duplicate clicks and double submissions.
+
+---
+
+## v2.8.1 (Features + integrations)
+
+A patch release bringing advanced capabilities ported from certmate-ng to the core Python stack, including enhanced log sanitization, zombie certificate scanning, a Model Context Protocol (MCP) server, and simplified one-click diagnostics.
+
+### Features
+
+- **Log Sanitizer** — Automatically redacts API tokens, private keys, PEM blocks, and sensitive credentials from CertMate logs, preventing accidental leaks in support threads.
+- **Zombie Certificate Scanner** — A new multi-threaded diagnostic scanner that scans the filesystem for orphan certificates ("zombies") that are no longer tracked in the active Certbot configuration, available via the `POST /api/certificates/zombies/scan` admin endpoint.
+- **Diagnostics Snapshot with UI Copy** — Consolidates system info, redacted logs, storage status, and certificate metrics into a single secure snapshot (under admin-only role constraint). Includes a new "Copy Diagnostic Snapshot" button in both the Settings and Help tabs with fallback clipboard writing mechanisms.
+- **CertMate MCP Server** — Standardized Model Context Protocol (MCP) server written in Node.js, allowing agentic AI assistants to securely inspect certificate statuses, renewals, system health, and logs when provided with a valid `CERTMATE_TOKEN`.
+
+---
+
+## v2.8.0 (Features + performance + fixes)
+
+First minor after the v2.7.0 OIDC/SSO release. Bundles the certificate-format
+work requested by operators, an SSO user-management hardening pass, a large
+listing/backup performance fix from the community, and the CA/DNS settings
+panel fixes.
+
+### Features
+
+- **SSO/OIDC user management** ([#229](https://github.com/fabriziosalmi/certmate/issues/229), PR [#234](https://github.com/fabriziosalmi/certmate/pull/234)) — the Users list now badges SSO-managed accounts, hides the password-reset action for them, and refuses a local-password set on an IdP-linked row at the backend. The sole remaining admin can no longer be deleted **or** disabled (the disable guard mirrors the existing delete guard), and the UI hides those actions for that account. Also fixes a pre-existing bug where `PUT /api/users/<username>` dropped `password`/`enabled` (so disable and reset silently failed).
+- **Encrypted Windows `.pfx` export** ([#230](https://github.com/fabriziosalmi/certmate/issues/230), PR [#238](https://github.com/fabriziosalmi/certmate/pull/238)) — set a **PFX Export Password** in *Settings → General* and each certificate is also written as an encrypted `cert.pfx` (PKCS#12) on issuance and renewal. The fingerprint tracks the live cert so Windows automation can poll it; download via `?file=cert.pfx` (operator role) and it is included in backups. Empty password disables the export.
+- **PKCS#1 private-key download** ([#233](https://github.com/fabriziosalmi/certmate/issues/233), PR [#237](https://github.com/fabriziosalmi/certmate/pull/237)) — `GET /api/certificates/<domain>/download?file=privkey.pem&key_format=pkcs1` serves the key in legacy PKCS#1/SEC1 form for stacks that reject certbot's PKCS#8. Converted in-process; no second copy of key material is kept on disk.
+- **Intermediate chain in deploy hooks** ([#232](https://github.com/fabriziosalmi/certmate/issues/232), PR [#236](https://github.com/fabriziosalmi/certmate/pull/236)) — deploy commands now receive `CERTMATE_CHAIN_PATH` (intermediates only) alongside the existing cert/key/fullchain paths, for targets that reject a chained cert.
+
+### Performance
+
+- **Faster certificate listing + lighter backups** (PR [#231](https://github.com/fabriziosalmi/certmate/pull/231), thanks @rocogamer) — per-row certificate parsing moves from an `openssl x509` subprocess + temp file to in-process `cryptography`, with a short-lived cert-info cache; Azure Key Vault gains a lightweight info read that skips the PFX export; routine backups exclude certbot's `logs/`/`work/` scratch while keeping renewal lineage; adds Kubernetes resource guidance.
+
+### Fixes
+
+- **CA/DNS settings panels** ([#226](https://github.com/fabriziosalmi/certmate/issues/226), PR [#235](https://github.com/fabriziosalmi/certmate/pull/235), diagnosis by @balkk1) — the CA "Google Trust Services" panel had a duplicate `id` with the DNS tab, so it never appeared; and choosing HTTP-01 now hides the DNS provider config panels instead of leaving a stale one visible.
+- **OIDC callback log hygiene** (PR [#234](https://github.com/fabriziosalmi/certmate/pull/234)) — the attacker-controlled IdP `error` query param is constrained to a known OAuth/OIDC code set before it reaches any log or audit sink (CodeQL `py/log-injection`).
+
+### Internal
+
+- Storage-migrate endpoint tests seed a valid API token via `generate_secure_token()` so the fixture survives the tightened `validate_api_token` rules (PR [#239](https://github.com/fabriziosalmi/certmate/pull/239)).
+
+## v2.6.11 (Feature — close #207 enhancement 1: drill-down modal on Recent Executions)
+
+Surfaces every field the backend already records per deploy-hook run. Clicking a row in the **Settings → Deployment → Recent Executions** table now opens a modal showing the full execution: timestamp, hook name + id, domain, event, dry-run flag, success / exit code, duration, error (when present), and the captured `command`, `stdout` and `stderr` streams. Backend was already storing all of these in `data/deploy_history.jsonl` ([`modules/core/deployer.py:165-179`](https://github.com/fabriziosalmi/certmate/blob/main/modules/core/deployer.py#L165-L179)); the UI just wasn't surfacing them. Closes enhancement 1 of issue [#207](https://github.com/fabriziosalmi/certmate/issues/207) raised by @tuxpowered.
+
+### What landed
+
+- **`templates/partials/settings_deploy.html`** — each `<tr>` in the Recent Executions table is now `role="button" tabindex="0"` and binds `@click` / `@keydown.enter|space` to `showExecutionDetail(entry)`. Hover affordance + `aria-label` per row carrying the hook name and domain. A new modal block at the end of the deploy panel renders the detail via the standard `_modal.html` macro (`size="lg"`). Body is gated by `<template x-if="selectedExecution">` so bindings are skipped until a row is clicked.
+- **`static/js/settings-deploy.js`** — adds `selectedExecution: null` data and a `showExecutionDetail(entry)` method that stashes the entry and calls `CertMate.modal.open('executionDetailModal')`. Read-only; no extra fetch (the entry came from the existing `/api/deploy/history` payload).
+- **No backend change.** The `/api/deploy/history` endpoint ([`modules/web/settings_routes.py:482-504`](https://github.com/fabriziosalmi/certmate/blob/main/modules/web/settings_routes.py#L482-L504)) was already returning the full 13-field execution dict.
+
+### Security
+
+All modal fields render via `x-text` (DOM `textContent`), never `x-html`. Operator-controlled `command` / `stdout` / `stderr` / `error` / `hook_name` strings cannot inject HTML or script tags. The route serving the data is `@require_role('admin')`-gated as before. Captured streams are truncated to 4096 chars at write time in the deployer; a footer line in the modal calls this out so a viewer is not surprised by clipped output.
+
+### Out of scope
+
+The other two enhancements in #207 — relabeling the "Hook name" field and a dedicated webhook delivery flow distinct from shell scripts — remain open and will be tracked separately.
+
+## v2.6.10 (Patch — close #207 bug: install bash in the image so `#!/bin/bash` deploy hooks resolve)
+
+Closes the bug part of issue [#207](https://github.com/fabriziosalmi/certmate/issues/207) raised by @tuxpowered.
+
+### Root cause
+
+The base image (`python:3.12-slim-trixie`) ships with `/bin/sh` (dash) but no `/bin/bash`. The deployer invokes hook scripts via `['sh', '-c', command]` (see [`modules/core/deployer.py:187`](https://github.com/fabriziosalmi/certmate/blob/main/modules/core/deployer.py#L187)); dash then `exec`s the script path and the kernel reads the shebang. A script starting with `#!/bin/bash` causes `execve('/bin/bash', ...)` to return `ENOENT`, which surfaces as exit code **127** in the deploy history.
+
+There was also a latent inconsistency: the Dockerfile already declared `useradd --create-home --shell /bin/bash certmate`, so the certmate user's login shell was bash — but bash itself was never installed.
+
+### Fix
+
+One-line change in the Dockerfile: add `bash` to the `apt-get install -y` line so `/bin/bash` resolves and shebang-bash deploy scripts run. Python deployer code is untouched — operator-provided hooks remain executed via `sh -c`, the shebang still controls which interpreter runs the script body.
+
+### Operator impact
+
+- Existing deploy hooks with `#!/bin/sh` keep working (no change).
+- Hooks with `#!/bin/bash` (the common default for ops scripts) now run instead of failing with 127.
+- Image size delta: roughly +6 MB compressed for bash + its read-only data files.
+
+### Verification
+
+- Docker build smoke: `docker run --rm certmate:v2.6.10-test which bash` returns `/usr/bin/bash`, and a `#!/bin/bash` script invoked via `sh -c '/path/to/script.sh'` returns its real exit code instead of 127.
+- Full unit + integration suite (Python 3.12.12): **871 passed, 14 skipped, 2 xfailed, 0 failed** — no source-code changes, baseline unchanged.
+
+### Out of scope (separate follow-ups)
+
+Issue #207 also requested three enhancements that are not in this patch:
+- Click-through drill-down on Recent Executions to inspect stdout / stderr / payload / response (backend already stores these in `data/deploy_history.jsonl`; the UI just doesn't surface them).
+- Relabel "Hook name" → "path to script or cmd" + "Description" prefix on the example field.
+- A dedicated webhook configuration flow (URL + method + auth + freeform JSON payload + variable selector), distinct from the shell-script hook flow.
+
+These will land as separate atomic PRs.
+
+## v2.6.9 (Patch — close #204: Azure DNS sp_* keys + zoneN mapping)
+
+Closes issue [#204](https://github.com/fabriziosalmi/certmate/issues/204) via [PR #205](https://github.com/fabriziosalmi/certmate/pull/205) from @rocogamer.
+
+`certbot-dns-azure` (terrycain) >= 2.x reads service-principal credentials from `sp_`-prefixed keys (`dns_azure_sp_client_id` / `dns_azure_sp_client_secret`) and parses subscription + resource group out of a per-zone resource id on `dns_azure_zoneN` lines. certmate was emitting the older, plugin-ignored key names — the plugin reached its first auth check, found nothing populated and aborted with `"No authentication methods have been configured for Azure DNS"` before any DNS challenge could run.
+
+### What landed
+
+- **`modules/core/utils.py::create_azure_config`** — writes `dns_azure_sp_client_id`, `dns_azure_sp_client_secret`, `dns_azure_tenant_id`, `dns_azure_environment` and `dns_azure_zone1 = <zone>:/subscriptions/<sub>/resourceGroups/<rg>`. Subscription + resource group are no longer top-level keys; they live inside the zone-line resource id, which is the only shape the plugin parses.
+
+- **`modules/core/dns_strategies.py::AzureStrategy.create_config_file`** — reads a `_zone_domain` injected by the caller and raises an explicit `ValueError` when missing. Defense in depth so a future regression fails loudly rather than producing a config the plugin rejects with a less actionable error.
+
+- **`modules/core/certificates.py`** — new `_dns_config_for_strategy` helper injects the (wildcard-stripped) primary domain into `dns_config` for Azure only, in both `create_certificate` and `renew_certificate`. Keeps provider-specific knowledge out of the shared certbot flow; non-Azure providers are untouched.
+
+### Tests
+
+- **`tests/test_azure_dns_credentials_format.py`** (new, 6 tests) pins the contract `_validate_credentials` enforces: `sp_*` keys present, legacy keys absent, `zone1` line shape with subscription + resource group, environment line, missing `_zone_domain` raises, wildcard prefix never leaks.
+- **`tests/test_issue113_azure_dns_ambiguous.py`** updated to pass the new `_zone_domain` field. Original ambiguous-flag contract from #113 unchanged.
+
+### Maintainer validation
+
+Full local suite (Python 3.12.12): **871 passed, 14 skipped, 2 xfailed, 0 failed** (73s). Runtime smoke test against `certbot-dns-azure==2.5.0` inside the built docker image confirmed the new INI format is accepted by the plugin's `_validate_credentials`; the previous format reproduces the `"No authentication methods have been configured"` error verbatim.
+
+Credit: @rocogamer for the root-cause analysis and the regression tests pinning the plugin's actual contract.
+
+## v2.6.8 (Patch — coverage push on security-critical modules: dns_providers + auth + notifier)
+
+Three new unit-test files, **+135 tests**, lifting overall project coverage from 51% to **56%** with the biggest gains on the modules an operator's threat model cares about.
+
+### What landed
+
+- **`tests/test_dns_manager_coverage.py`** — 44 tests. `modules/core/dns_providers.py` from **8% → 91%**. Covers `get_available_providers`, `get_dns_provider_account_config` (every branch: multi-account / default-account / first-credentialed / legacy single-account / missing / exception), `list_dns_provider_accounts`, `list_accounts` (cross-provider aggregation), `suggest_dns_provider_for_domain` (every confidence tier + the pattern matchers), `create_dns_account` + `add_account` alias (first-account-default contract, audit label), `delete_dns_account` + `delete_account` alias (default promotion + last-account default removal), `set_default_account`.
+- **`tests/test_auth_manager_coverage.py`** — 59 tests. `modules/core/auth.py` security boundary covered: role normalisation (legacy `user` -> `operator`, unknown -> `viewer` so no silent privilege escalation), password hashing round-trip (bcrypt + legacy SHA-256), `_normalize_allowed_domains`, `domain_matches_scope` (the multi-tenant boundary — every cell of the truth table pinned), `user_can_access_domain`, API token HMAC + plain-SHA-256 verification including legacy-tokens-after-HMAC-key-set, user lifecycle (create / authenticate / list / update / delete + the "cannot delete the last admin" guard), session lifecycle (create / validate / invalidate / uniqueness / expiry), local-auth toggle.
+- **`tests/test_notifier_coverage.py`** — 31 tests. `modules/core/notifier.py` from **14% → 91%**. Covers `notify()` dispatch + every gating branch, webhook payload shapes (Slack, Discord, generic + custom headers + HMAC-SHA256 signature), URL scheme defence (`file://` / `ftp://` / `javascript:` refused), retry-with-backoff (success / fail-then-success / exhaustion), delivery log JSONL write + read + cap + malformed-line tolerance, SMTP send path with strict args assertion, `test_channel()` dispatch.
+
+### Overall
+
+`pytest -m "not e2e and not ui"`: **767 passed** (was 632), 2 skipped, 115 deselected. Coverage 51% -> 56%. No source-code changes — all uplift is from test files.
+
+The picks are deliberate: a tool that handles TLS private keys, DNS provider credentials, and multi-tenant API scoping should be honest about test coverage on those exact surfaces. The remaining low-coverage modules (`modules/api/resources.py` 32%, `modules/web/cert_routes.py` 16%, `modules/core/client_certificates.py` 15%) are next-session candidates; they need Flask app context and a richer fixture story.
+
+## v2.6.7 (Patch — close #194: Azure Key Vault both-mode robustness + delete contract)
+
+Closes the follow-up issue [#194](https://github.com/fabriziosalmi/certmate/issues/194) raised against PR #139 / v2.6.0. Three commits: two narrow fixes on the Azure Key Vault storage backend plus a coupled test, both addressing surface-skew handling.
+
+### What landed
+
+- **`fix(azure-kv)`: both-mode retrieve falls back to Secrets when cert export fails** (the MAJOR finding). When the Certificate API claims a fresher copy than Secrets but `export_certificate` returns None (companion Secret deleted manually, base64 garbage, PFX parse error), the older Secrets snapshot was silently discarded and the caller saw None. Now the fallback fires and a `WARNING`-level log surfaces the skew so the operator can investigate. No data loss either way — renewal would refetch from ACME — but a needless ACME round trip for a recoverable skew is inferior to serving the slightly older copy.
+
+- **`fix(azure-kv)`: `_delete_secrets` metadata failure flags the surface as failed** (the MINOR finding). The per-PEM secrets loop set `ok = False` on per-file failure, but the metadata-secret delete used a separate try/except that only debug-logged exceptions. `ok` stayed True even when the metadata secret was potentially still in the vault — which violates the surface-independence contract the rest of `delete_certificate` already enforces and would mislead the next `list_certificates` / backfill pass. Metadata-delete failures now flip `ok = False` and log at `WARNING`.
+
+- Two new tests in `tests/test_azure_keyvault_certificate_storage.py` pinning both behaviours. Suite: 40 passed + 2 skipped (SDK optional, unchanged).
+
+## v2.6.6 (Patch — close #193: 4 cleanup points from the v2.5.5 key-options review)
+
+Four atomic commits closing the follow-up issue [#193](https://github.com/fabriziosalmi/certmate/issues/193) raised against PR #156 / v2.5.5. Each commit is a single review nit, mergeable in isolation. No behaviour change visible to operators; one tiny information-disclosure tightening on the API.
+
+### What landed
+
+- **`test(key-options)`: fix stale docstring + pin soft-validate contract** — `test_save_settings_rejects_inconsistent_global_defaults`'s docstring claimed to test rejection of `rsa` + `elliptic_curve`, but the body actually tested rejection of `rsa` + `key_size=1024`. The test was correct; the docstring described behaviour the code doesn't implement. Docstring updated, and a new `test_save_settings_accepts_inactive_branch_stash` pins the deliberate soft-validate contract (inactive field is stashed verbatim so the UI can preserve the previous value on RSA <-> ECDSA toggles without round-trip failures).
+
+- **`fix(api)`: run key-options validation after domain scope check** — `validate_key_options` ran *before* `_check_domain_scope` on the cert-create endpoint, so an out-of-scope caller could probe field-specific 400 messages for a domain they were not allowed to see. Moved the validation to fire after the scope check + after the SAN scope loop. In-scope path is byte-identical; out-of-scope callers now get the scope 403 instead of a 400 carrying field-level reasoning.
+
+- **`fix(api)`: stop persisting per-cert key overrides as dead state** — the cert-create endpoint wrote `key_type`/`key_size`/`elliptic_curve` into the domain entry of `settings.json`, but no code path read them (verified by grepping every accessor pattern across the modules tree). Renewals preserve the original shape because certbot writes `--key-type` / `--rsa-key-size` / `--elliptic-curve` into its own `renewal/<domain>.conf` at create time. The `settings.json` copy was a no-op write that risked future readers being misled into trusting an unsynchronised value.
+
+- **`refactor(settings)`: hoist `_SECRET_KEYS` / `_NON_SECRET_KEYS` to module scope** — both were rebuilt on every settings GET. Negligible overhead in absolute terms, but the regex re-compiled and the set literal re-instantiated each request. Pulled to module scope; same behaviour, smaller hot path.
+
+## v2.6.5 (Patch — UI polish: top-nav icon centering + cert-detail serial wrap)
+
+Two small UI fixes spotted in manual browser testing. No code path changes, no API surface change, no behavior change beyond pixels.
+
+### What landed
+
+- **`fix(nav)`: center desktop top-nav icons with their labels**. The five top-nav links (Certificates / Settings / Help / Activity / API Docs) had `-translate-y-px` on the `<i>`, which pushed each icon glyph one pixel above the text baseline. The parent `<a>` already does the right thing with `inline-flex items-center`, so the nudge fought it and the row read visibly off-center. Dropping the translate restores flex centering; `text-[0.85em] leading-none` stay — the slightly smaller icon is by design.
+
+- **`fix(modal)`: wrap long cert serial numbers so they fit the modal**. The Serial field in the Client Certificate Details modal rendered a 30+ digit decimal as a single unbreakable run, overflowing past the right edge of the modal. Render the value in a `font-mono text-xs break-all` span so the number wraps cleanly to a second line. Monospace also visually de-emphasises the value relative to the bold `Serial:` label — right for an identifier humans rarely read in full.
+
+The other long fields (Identifier, Common Name) already wrap because they contain hyphens — only the serial needed the treatment.
+
+### Verification
+
+Browser smoke test in a fresh Docker container (isolated data dir): screenshot of `/` confirms the top-nav row now has each icon vertically centered with its label. The serial-wrap change is a 3-line CSS modifier on an already-escaped value; verified by inspection. Full Cloudflare real-cert e2e is overkill for a pixel fix, skipped.
+
+## v2.6.4 (Patch — hotfix: docker-multiplatform security-scan job permissions)
+
+Regression introduced in v2.6.2 (PR #196) by the `permissions: read-all` top-level on `docker-multiplatform.yml`. The `security-scan` job uploads Trivy SARIF to the GitHub Security tab via `github/codeql-action/upload-sarif`, which requires `security-events: write`. Under read-all the upload step failed every build on main / on tag pushes with:
+
+> Resource not accessible by integration - https://docs.github.com/rest
+
+(PR builds were unaffected because the `security-scan` job is gated on `github.event_name != 'pull_request'`, so the failure only surfaced after merge.)
+
+### Fix
+
+Job-level permissions override on `security-scan` granting the narrow scopes it actually needs:
+
+```yaml
+permissions:
+  security-events: write
+  contents: read
+```
+
+The workflow default stays `read-all`; every other step (`build`) is unaffected.
+
+The two failed runs in the activity log (the v2.6.3 merge commit and the v2.6.3 tag push) will not be retried automatically — they remain as historical failures. Future pushes will succeed.
+
+## v2.6.3 (Patch — pin all CI dependencies by SHA + base image digest)
+
+Closes the Scorecard `Pinned-Dependencies` check (0 → ~9). The single biggest score uplift on the path from the v2.6.2 baseline.
+
+### What landed
+
+- **All 20 GitHub Action usages across the four workflows pinned to commit SHA**, with the human-readable tag preserved as a trailing comment. Pattern:
+
+  ```yaml
+  uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+  ```
+
+  Pinning by SHA makes every workflow run byte-identical: Dependabot will open PRs when upstream tags move, and we review each bump deliberately instead of inheriting silently whatever upstream pushed to the moving tag.
+
+- **Three actions bumped to current major** in the same pass:
+  - `actions/setup-python` v4 → v5
+  - `actions/cache` v3 → v4
+  - `codecov/codecov-action` v3 → v5
+  - `peter-evans/dockerhub-description` v3 → v4
+
+  The actionlint warnings on the v4/v3 versions (deprecation notice from GitHub runners) go away with this bump.
+
+- **`aquasecurity/trivy-action@master` → pinned to v0.36.0 commit SHA**. Using `@master` in CI is an active risk — upstream HEAD changes silently bring new behaviour or, worse, become an attack surface if the upstream repo is compromised. Now we get the version we tested with, every run.
+
+- **Dockerfile base image pinned by sha256 digest** in both build stages:
+
+  ```dockerfile
+  FROM python:3.12-slim-trixie@sha256:401f6e1a67dad31a1bd78e9ad22d0ee0a3b52154e6bd30e90be696bb6a3d7461
+  ```
+
+  The tag `3.12-slim-trixie` is a moving Docker Hub reference; the digest is content-addressed and guaranteed byte-identical. CVE fixes on the base image now arrive only when we bump the digest deliberately, not implicitly on the next `docker build`.
+
+### Verification
+
+Local Docker build with digest pin succeeded; image runs identically to the v2.6.2 image (no behaviour change — the digest currently points to the same bytes as the tag).
+
+### Branch protection note
+
+This is the first PR shipped under the new `main` branch protection rules established alongside v2.6.2: required status checks (`build`, `test (3.12)`, `Analyze python`, `Analyze javascript`) must be green, conversation resolution required, `required_linear_history` enforces squash/rebase merges. The version bump is part of the PR commits (per the new standard) rather than a separate post-merge commit on main.
+
+### Expected Scorecard impact
+
+- `Pinned-Dependencies`: 0/10 → ~9/10 (the `pipCommand` warnings remain — moving the `pip install -r requirements.txt` invocations to `--require-hashes` is a separate, bigger lift).
+- Overall score: from ~7.0 (post v2.6.2) → ~8/10. Three structural gaps left for future PRs: branch-protection Scorecard scoring (will detect the new protection at the next run, +partial), SAST (sale settimanalmente con commit count), Code-Review (requires a co-reviewer pattern).
+
+## v2.6.2 (Patch — Scorecard quick wins: SECURITY.md + workflow read-all)
+
+Two Scorecard checks moved from 0/10 to 10/10. No runtime behaviour change.
+
+### What landed
+
+- **`SECURITY.md`**: closes Scorecard `Security-Policy` (0 → 10). Declares the supported version line (latest minor only — `2.6.x` today, retired the day `2.7.0` ships), reporting channels (**GitHub Private Vulnerability Reporting** as the recommended path, **fabrizio.salmi@gmail.com** as fallback), response SLAs (72h acknowledgement, 7d triage, 30d fix for high/critical), in/out-of-scope boundaries, and coordinated-disclosure expectations. Private Vulnerability Reporting has been enabled on the repository so the advisory form is live.
+- **`permissions: read-all` top-level** on `ci.yml` + `docker-multiplatform.yml`: closes Scorecard `Token-Permissions` (0 → 10). The two pre-existing workflows that silently inherited the repo default now declare read-only at the workflow level. Neither needs write — coverage upload goes through `codecov-action`'s own auth, Docker push uses `DOCKERHUB_TOKEN`, not `GITHUB_TOKEN`. The two workflows shipped in v2.6.1 already followed this pattern.
+
+Expected next Scorecard run: 5.6 → ~7.0.
+
+## v2.6.1 (Patch — trust-signal upgrade: Scorecard, CodeQL, Codecov)
+
+Phase 1 of a "serious project" trust-signal pass. Three atomic CI/docs commits, no runtime behaviour change.
+
+### What landed
+
+- **OSSF Scorecard workflow** (`.github/workflows/scorecard.yml`): runs `ossf/scorecard-action` on every main push, weekly cron, and manual dispatch. Publishes to scorecard.dev so the README badge renders the live score. SARIF uploaded to the Security tab. Permissions scoped per-job (`security-events: write`, `id-token: write`); workflow default stays `read-all`.
+- **CodeQL SAST workflow** (`.github/workflows/codeql.yml`): analyses python and javascript on every main push + PR + weekly cron. Uses the `security-extended` query suite. Findings land in the Security tab via `github/codeql-action/analyze`. Default-setup was `not-configured` — this PR wires it up explicitly so the analysis is reproducible and reviewable.
+- **README badges**: CodeQL, OSSF Scorecard, Codecov. The CI workflow already uploaded coverage via `codecov/codecov-action@v3` — the badge surfaces a number that was already being computed but invisible. Placed in the engineering-signal cluster next to CI / Build Multi-Platform, before the promo badges.
+
+### Out of scope (Phase 2)
+
+SLSA Provenance Level 3 on the Docker images pushed by `docker-multiplatform.yml` (cryptographic attestation that the image came from this exact source). Deferred to its own PR — the release path needs its own review window.
+
+### Follow-ups for the Scorecard score
+
+Initial score will likely sit around 6-7/10. Known gaps that the workflow will flag:
+
+- **Pinned-Dependencies**: action versions are pinned to major tags (`@v4`, `@v3`), not SHAs. Tightening to SHA across all workflows is the biggest single uplift.
+- **Branch-Protection**: `main` has no required reviews / required status checks configured at the repo level.
+- **Token-Permissions**: pre-existing workflows (`ci.yml`, `docker-multiplatform.yml`) don't declare `permissions:` blocks. New workflows in this PR do.
+
+These are tracked separately and not blocking — the workflow lands first so we have a baseline measurement.
+
+## v2.6.0 (Minor — Azure Key Vault native Certificate-object storage mode)
+
+Community contribution from [@rocogamer](https://github.com/rocogamer) (PR #139, clean rebase of #118). Adds a configurable `storage_mode` to the Azure Key Vault storage backend so it can persist certificates as native `Certificate` objects (PKCS12, `issuer_name="Unknown"`) in addition to — or instead of — the existing per-PEM Secrets layout. Native Certificate objects bind directly from Azure App Service, Application Gateway, Front Door, API Management and AKS Ingress without manual PFX export.
+
+### What landed
+
+- **`storage_mode: secrets`** (default) — current per-PEM Secrets layout, fully backwards-compatible. Existing installs see zero behaviour change after upgrade.
+- **`storage_mode: certificate`** — single Certificate object per domain. Metadata (domain, DNS provider, email, etc.) stored as tags on the Certificate object. `issuer_name="Unknown"` so Key Vault never tries to renew — CertMate stays the source of truth.
+- **`storage_mode: both`** — writes to both surfaces. Reads compare `updated_on` timestamps and return the freshest copy (stale-read detection across surface skew when a renewal succeeds on one surface but fails on the other).
+- **New admin endpoint** `POST /api/storage/azure-keyvault/backfill-certificates` (and a "Backfill Certificate objects" button in Settings → Storage) imports Certificate objects for existing Secrets-only domains. Idempotent: already-imported domains are reported as `skipped`. Accepts `?limit=N` to cap how many domains are processed per call; response includes a `remaining` count for paginating large vaults.
+- **CRC-aware secret domain listing**: bug-fix bundled in the same PR. The regex in `_list_secret_domains` was `endswith('-metadata')`, which never matched any secret in production because `_sanitize_secret_name` always appends an 8-char CRC32 suffix. Anchored to `^cert-.+-metadata-[0-9a-f]{8}$`. Pre-existing Azure KV backends were silently walking an empty domain list — `list_certificates()` and the backfill endpoint had no effect — without this fix.
+- **40 unit tests added** in `tests/test_azure_keyvault_certificate_storage.py` covering build_pfx round-trip, store/retrieve/delete routing across all three modes, tag truncation, metadata round-trip, surface-independence contracts, and settings migration. 38 pass + 2 skip cleanly when `azure-keyvault-certificates` SDK is not installed.
+
+### Permissions
+
+In `certificate` or `both` mode the Service Principal needs Certificates `Get/List/Import/Delete` in addition to its previous Secrets permissions. See `docs/architecture.md` for the full permissions table and the security note on Secrets/Get exposure (importing a Certificate object auto-creates a Secret containing the full PFX).
+
+### Verification
+
+Pre-merge: full test suite green on the merge-with-main tree — 97 passed, 1 skipped, 2 pre-existing xfail (docker + Playwright + Cloudflare real-cert lifecycle). Azure KV unit tests: 38 pass + 2 skip as designed.
+
+Follow-ups from review tracked separately — 1 minor graceful-degradation gap in `both`-mode retrieve fallback + 1 metadata-delete silence, no shipping behaviour affected.
+
+## v2.5.5 (Minor — configurable cert key type/size, RSA + ECDSA)
+
+Community contribution from [@rocogamer](https://github.com/rocogamer) (PR #156). Every cert issued by CertMate was previously hardcoded to RSA-2048 because `CAManager.build_certbot_command` never passed `--key-type` or `--rsa-key-size` to certbot. Two real-world asks made this awkward — compliance operators required RSA-3072/4096, and modern stacks prefer ECDSA for smaller certs and faster TLS handshakes. Both groups had to patch the code or fork.
+
+### What landed
+
+- **Global default** under Settings → General → "Default Certificate Key":
+  `default_key_type` (`rsa` / `ecdsa`), `default_key_size` (`2048` / `3072` / `4096`),
+  `default_elliptic_curve` (`secp256r1` / `secp384r1`). Mutually exclusive selectors
+  in the UI.
+- **Per-cert override** under the create-cert form's "Advanced Options". Leaving it
+  on "Use global default" sends no key fields and the backend inherits the configured
+  default.
+- **Renewals preserve the original shape automatically** — certbot persists the
+  `--key-type` / `--rsa-key-size` / `--elliptic-curve` flags into its own
+  `renewal/<domain>.conf` at create time, so no new bookkeeping in CertMate.
+- **Backwards-compatible default**: settings without these fields migrate to
+  `rsa` / `2048` / `secp256r1` at load time, so existing installs see no behaviour
+  change after upgrade.
+- **`validate_key_options()` helper** rejects contradictory shapes up-front with a
+  400: RSA + curve, ECDSA + size, unsupported sizes, unsupported curves.
+- **Side-fix**: the GET `/api/settings` masking regex matched the `key` substring
+  in `default_key_type`, returning `'********'` which matched no `<option>` in the
+  UI dropdown. Fixed via an explicit `_NON_SECRET_KEYS` allowlist.
+- **24 unit tests added** (`tests/test_key_options.py`, `tests/test_settings_masking_allowlist.py`).
+
+### Verification
+
+Pre-merge smoke gate against `certmate.org` with random subdomains:
+
+- ECDSA + `secp384r1` override: cert emitted, `openssl x509 -text` confirms
+  `id-ecPublicKey`, `NIST CURVE: P-384`, `ecdsa-with-SHA384`. Force-renew preserves
+  the shape end-to-end.
+- RSA + `key_size=3072` override: cert emitted, `Public-Key: (3072 bit)`,
+  `sha256WithRSAEncryption`. Force-renew preserves the shape end-to-end.
+- Full test suite (docker + Playwright + Cloudflare real-cert lifecycle):
+  97 passed, 1 skipped, 2 pre-existing xfail.
+
+Follow-ups from review (4 minor non-blocking points: stale test docstring, info-leak
+in scope-check ordering, dead state in settings, module-scope nit) tracked separately
+and will land in a cleanup PR — none affect the shipping behaviour.
+
+## v2.5.4 (Patch — 2 community-reported bug fixes)
+
+Two atomic commits resolving issues reported by contributors on GitHub.
+Fast + UI test suite and the Cloudflare real-cert lifecycle e2e both
+green locally (97 passed, 1 skipped, 2 pre-existing xfail).
+
+### Real bug fixes
+
+- **`fix(wizard)`: list all 21 backend-supported DNS providers (#87)** —
+  the setup wizard's PROVIDERS map only knew 14 providers, so users on
+  PowerDNS, rfc2136, NS1, DNS Made Easy, Hurricane Electric, Dynu or
+  DuckDNS had no way to finish the wizard — *Skip wizard* (by design)
+  does not persist `setup_completed`, so the wizard reappeared on every
+  refresh. The list is now the full set of providers the backend
+  supports via `_MULTI_PROVIDER_REQUIRED_FIELDS`. Side-fix in the same
+  commit: corrects two pre-existing silent typos where the wizard saved
+  credentials under keys the certbot plugins do not read — `porkbun`
+  `secret_api_key` → `secret_key`, `godaddy` `api_secret` → `secret`.
+  Credentials saved through the wizard are now usable for first cert
+  issuance without a detour through Settings.
+
+- **`fix(ui)`: paint health strip on every cert row, not just the first
+  (#189)** — the `.health-*` selectors put `border-left` on the `<tr>`,
+  but the certificates table uses `border-collapse: separate` (Tailwind
+  default), where Chrome silently paints only the first row's border
+  and drops it on rows 2+. Moved the strip to `td:first-child` of the
+  row so the colored health indicator renders reliably on every row,
+  regardless of collapse mode.
+
+## v2.5.3 (Patch — multi-pass audit response + draconian test coverage push)
+
+Twenty atomic commits over a single branch, the result of running every
+finding from a multi-source audit (security CRITICAL/HIGH/MEDIUM/LOW + a
+performance audit + a UI audit) through empirical verification before
+acting. ~62 audit findings were checked; only the ones that survived
+verification turned into commits. Honest summary: 8 real bugs fixed, 10
+parziali / defense-in-depth landed, 35 false positives documented, the
+rest pre-existing-and-deferred.
+
+The release also nearly doubles unit test coverage on previously-uncovered
+critical-path modules: +160 new tests across 5 new test files (570 unit
+tests total, up from 410).
+
+### Real bug fixes
+
+- **`fix(certificates)`: race condition on metadata RMW** —
+  `record_backend_deployment_status` and `record_browser_deployment_status`
+  did load → mutate → save without holding the per-domain lock that already
+  exists in the class. Two concurrent deployment-status updates lost one
+  of the writes silently.
+
+- **`fix(deployer)`: deploy-hook parameter-expansion bypass** — the
+  safe-vars regex `\$\{?CERTMATE_[A-Z_]+\}?` accepted partial brace forms,
+  letting `${CERTMATE_FOO:-/etc/passwd}` and the other bash expansion
+  operators smuggle arbitrary paths past the validator. Closing-brace is
+  now required immediately after the var name.
+
+- **`fix(file_operations)`: UnboundLocalError in safe_file_write** —
+  if `mkstemp()` raised before `temp_file` was bound, the except handlers
+  referenced an unbound local, masking the actual OSError. Operators saw
+  "no local variable temp_file" instead of "No space left on device".
+
+- **`fix(certificates)`: corrupt metadata.json silently clobbered** —
+  `_load_metadata` swallowed `JSONDecodeError` along with everything else
+  and returned `{}`; the next save would overwrite the only copy. Now
+  JSON corruption is quarantined to `metadata.json.corrupt-<utc>` and
+  logged at ERROR, separately from IO errors which still get the empty-
+  dict fallback.
+
+- **`fix(health)`: scheduler-setup failure now surfaces on /health** —
+  if APScheduler setup raised, the only signal was a single ERROR log
+  line. `/health` now reports `scheduler: failed` with the exception
+  message and timestamp; admins can detect a broken scheduler without
+  grepping logs.
+
+- **`fix(tests)`: stale UI test assertions rewritten against v2.5.x** —
+  four `tests/test_ui.py` assertions had been failing on main since v2.5.0
+  rewrote the help page and the dashboard create-form toggle. Updated
+  them to current selectors + handle the setup-wizard overlay during
+  Playwright clicks. e2e suite: 112 passed, 0 failed.
+
+### Performance fixes
+
+- **`perf(settings)`: request-scoped cache for load_settings** — typical
+  `/api/certificates` requests called `settings_manager.load_settings()`
+  ~100 times when listing 50 certs. Now cached on `flask.g` for the
+  request's lifetime; first call hits disk, subsequent calls return a
+  deepcopy. ~15-30ms saved per typical request; more at scale.
+
+- **`perf(renewal)`: thread settings through check_renewals** — the
+  request-scoped cache doesn't fire in background threads. Pass the
+  once-loaded settings down to `get_certificate_info` so the hourly
+  renewal job hits disk once, not N times.
+
+- **`perf(probe)`: TLS probe timeout 5s → 3s + slow-probe warning** —
+  unreachable hosts block a Flask worker for the full timeout. Tightened
+  default + added `CERTMATE_TLS_PROBE_TIMEOUT_SECONDS` env var (clamped
+  to `[1, 30]`) + WARN log when a probe takes more than 1s.
+
+- **`perf(rate-limit)`: bound login-attempt dicts** — botnet IP rotation
+  could grow `_login_attempts_by_ip` unbounded. Sweep empty buckets when
+  either dict crosses the 10K soft cap.
+
+- **`perf(backup)`: single iterdir pass in create_unified_backup** —
+  `cert_dir.iterdir()` was called twice. Now once.
+
+### Hardening (defense-in-depth)
+
+- **`chore(hardening)`: SQLite WAL fallback detection** — `PRAGMA
+  journal_mode=WAL` silently falls back on filesystems that don't support
+  WAL (NFS, network mounts). Now logs a warning at startup if the effective
+  mode is anything but WAL.
+- **`chore(hardening)`: deploy-hook timeout int coercion** — `_run_hook`
+  read `hook.get('timeout')` without `int()`; a string timeout from a
+  hand-edited settings.json crashed the renewal worker. Coerce defensively.
+- **`chore(ux)`: SSE retry give-up after 10 failures** — logged-out tabs
+  produced a 401-every-30s loop indefinitely. Now gives up after ~3 minutes
+  of exponential retries.
+- **`chore(ux)`: MutationObserver readyState guard** — modal focus-trap
+  observer was attached in `DOMContentLoaded` only; if certmate.js loaded
+  later the listener never ran. Mirror the readyState pattern used by
+  `CM.refreshRole`.
+- **`chore(ux)`: confirm dialog before clear-cache** — settings.js's
+  `clearDeploymentCache` now matches the dashboard's `invalidateAllCache`
+  with a `CertMate.confirm()` step.
+
+### Documentation
+
+- **`docs(installation)`: document `BEHIND_PROXY=true`** — undocumented
+  before; without it, per-client rate limiting collapses to per-proxy
+  when CertMate sits behind nginx / traefik / cloudflare.
+- **`docs(installation)`: NFS guidance** — Python blocking I/O semantics
+  + recommended `soft,timeo=30,retrans=3` mount options.
+- **`docs`: neutralize DNS provider counts** — README and docs/ cited
+  22/23/24 inconsistently. Switched prose to neutral wording; canonical
+  number lives only in the table at `docs/dns-providers.md`. Same change
+  pushed to the GitHub Wiki.
+
+### Test coverage push (the draconian part)
+
+Five new test files, +160 unit tests on previously-uncovered modules:
+
+| Module | Before | New tests | Focus |
+|---|---|---|---|
+| `modules/core/private_ca.py` | 0% | 34 | CA shape (RSA-4096, BC=CA-true, KU.keyCertSign), CSR signing, signature verification, CRL generation |
+| `modules/core/csr_handler.py` | 0% | 38 | Validator entry-point: empty/garbage/truncated PEM, no-CN, control-char CN attacks (NUL, newline, CR), SAN ceiling at 100 |
+| `modules/core/ocsp_crl.py` | 0% | 20 | Status branches (good/revoked/unknown), CRL signature verification, manager-failure → 'unknown' not 'good' |
+| `modules/core/storage_backends.py` | ~25% | 56 | _is_transient heuristic, _with_retry decorator, _validate_storage_domain, Azure secret-name collision avoidance, StorageManager dispatch + fallback |
+| `modules/core/certificates.py` (gaps) | ~40% | 12 | Concurrent-issuance non-blocking lock, DNS alias status surfacing (ok/missing/mismatch/error), trailing-dot normalisation |
+
+Tests use real `cryptography` primitives (no mocked crypto operations);
+cloud-SDK request paths deliberately out of scope (they're covered by
+e2e). Total unit suite: 570 passed in ~12s.
+
+### Audit precision summary (transparency)
+
+Out of ~62 audit findings across 7 lists (CRITICAL/HIGH/MEDIUM/LOW for
+security + perf-CRITICAL/HIGH + perf-MEDIUM/LOW + UI CRITICAL/HIGH):
+- 8 true positives → fixes shipped
+- 10 partial / defense-in-depth → hardening shipped
+- 35 false positives → documented in commit messages why they were skipped
+- 2 already fixed incidentally during earlier waves
+- 7 YAGNI / over-engineering → deferred
+
+Each audit list was verified empirically (test scripts in Python where
+applicable) before deciding whether to commit. The audit author appears
+to have pattern-matched on code SHAPES (`innerHTML`, no .catch, no
+debounce, `except Exception`, `mkstemp`, etc.) without verifying the
+actual behaviour — the most clamorous claim ("validator allows
+backticks") was falsifiable in two lines of Python.
+
+### Backward compatibility
+
+- No API breakage. No data migration. No new required env vars.
+- New optional env vars: `BEHIND_PROXY`, `CERTMATE_TLS_PROBE_TIMEOUT_SECONDS`.
+- `/health` adds two new fields when the scheduler is in failure state
+  (`checks.scheduler == "failed"` plus `scheduler_error` + `scheduler_failed_at`).
+  Existing consumers that only read `status` and `checks.scheduler` see no
+  contract change for the success path.
+
+### Test results
+
+- 570 unit tests pass in ~12s
+- 112 e2e tests pass (real Cloudflare DNS-01 issuance + Playwright UI), 0 failures
+
+---
+
+## v2.5.2 (Patch — issue triage: 2 community bugs + 1 inconsistent web-auth response)
+
+Three scoped fixes from the v2.5.x issue triage. Each commit is one fix, mergeable in isolation. No API breakage, no data migration, no new env vars.
+
+### `fix(renew)` — pass `--no-random-sleep-on-renew` to certbot (closes [#171](https://github.com/fabriziosalmi/certmate/issues/171))
+
+`certbot renew` injects a random sleep of up to ~8 minutes before contacting the ACME server. The default exists to avoid stampeding Let's Encrypt when run from a flock of crontabs; CertMate's renewal endpoint is always invoked interactively from the UI / API, so the sleep doesn't help — it makes the POST time out as `NETWORK_ERROR` in the browser even though certbot eventually completes the renewal in the background. End state: cert refreshes on disk but the user sees a flat error.
+
+Add `--no-random-sleep-on-renew` unconditionally to the `cmd` built in [`modules/core/certificates.py:875-883`](modules/core/certificates.py#L875-L883). The flag has been in certbot since 1.5 (2020), so no version concern.
+
+Regression test: [`tests/test_issue171_no_random_sleep_renew.py`](tests/test_issue171_no_random_sleep_renew.py) mocks the shell executor, drives `renew_certificate()` against a fake on-disk cert, and asserts the cmd list contains the flag. Pins the behaviour so a future refactor of the cmd construction cannot quietly drop it.
+
+Reporter: [@ITJamie](https://github.com/ITJamie).
+
+### `fix(dashboard)` — give Domain column a `w-1/2` width hint (closes [#170](https://github.com/fabriziosalmi/certmate/issues/170))
+
+The Domain column used `max-w-0` + `truncate` on the `<td>` — the standard Tailwind technique for "let me truncate this cell in a table". It only works when the column has a width to truncate against. With the table's default `table-layout: auto` and no width on the `<th>`, the other `whitespace-nowrap` columns (Status, Expires "May 15, 2026 · 30 days left", Provider, Deployment, Actions) claimed their natural content width first and Domain got the leftover crumbs. On a viewport with all six columns visible the remaining space shrunk well below the width of any realistic FQDN and domain text truncated aggressively.
+
+Add `w-1/2` to the Domain `<th>`. With auto layout this acts as a floor, not a max: Domain claims at least 50% of the table width but can grow when there's spare. On a 1280px viewport that's a 640px floor — comfortably wide for any practical FQDN. The `<td>` keeps `max-w-0` + `truncate` so genuinely long names (rare wildcards under deep subdomains) still clip with an ellipsis.
+
+Reporter: [@ITJamie](https://github.com/ITJamie).
+
+### `fix(auth)` — redirect browser to `/login` on auth failure (was JSON 401)
+
+The `require_role` and `require_auth` decorators returned the API-style JSON
+`{"code":"AUTH_HEADER_MISSING","error":"Authorization header required"}`
+to every caller that wasn't authenticated, including browsers loading the protected HTML page routes (`/help`, `/settings`, `/audit`, `/activity`, `/redoc`, `/client-certificates`). Users saw the raw JSON body in the tab. The dashboard route `/` already redirected correctly via its hand-rolled flow; the rest were inconsistent.
+
+Add a helper `_is_browser_html_request()` that returns True only when both:
+- `request.path` does NOT live under `/api/` (the API surface is always JSON)
+- `request.accept_mimetypes` prefers `text/html` over `application/json` (a browser POST that `fetch()`s to `/api/...` is unaffected)
+
+Both decorators use it: on auth failure for browser HTML requests, return `redirect('/login?next=<path>')`; otherwise keep the existing JSON 401 byte-for-byte so curl, fetch, and API clients see no change.
+
+Regression test pins all three branches:
+- browser GET `/help` → 302 to `/login?next=/help`
+- JSON GET `/help` → 401 JSON, `code=AUTH_HEADER_MISSING`
+- browser GET `/api/...` → 401 JSON (never redirected)
+
+Reporter: [@fabriziosalmi](https://github.com/fabriziosalmi) (live observation while testing v2.5.1).
+
+### Tests
+
+Full non-UI suite green (438 passed, 9 skipped, 15 deselected). New test files:
+- `tests/test_issue171_no_random_sleep_renew.py` (1 test)
+- `tests/test_help_browser_redirect.py` (3 tests)
+
+### Backward compatibility
+
+- Renewal endpoint: same shape, faster response (no 5-8 min stall).
+- API responses to `/api/*` paths: byte-identical to v2.5.1.
+- Browsers hitting protected HTML routes without a session now get a 302 to `/login?next=<path>` instead of a JSON body. Pre-existing browser behaviour on `/` was already this; v2.5.2 makes the other web routes match.
+
+---
+
+## v2.5.1 (Patch — v2.5.0 follow-up: 9 fixes from manual browser testing)
+
+Nine small, scoped follow-ups caught during the manual browser pass on the v2.5.0 image. Each commit is one fix, mergeable in isolation. No API breakage, no data migration, no new env vars.
+
+### `fix(theme)` — only one toggle icon visible at a time
+
+The v2.5.0 swap from inline `style.display` to `classList.toggle('hidden')` broke the dark-mode toggle: FontAwesome's `.fas { display: inline-block }` is loaded after `tailwind.min.css` with equal specificity, so Tailwind's `.hidden` lost the cascade and both moon + sun icons rendered at once. Replaced the JS sync entirely with two CSS rules in `<head>` keyed off the `dark` class on `<html>` — ID-selector specificity (100) beats `.fas` (10), no `!important` needed, no FOUC, no JS race.
+
+### `fix(settings)` — restore icon → text gap on the tab nav
+
+The settings tab nav used `ml-1.5` on the label span. That class only appeared at this single callsite, so PurgeCSS dropped it from the prebuilt `tailwind.min.css` and the gap collapsed to zero. Switched to `ml-2`, which is bundled (32 callsites repo-wide). 2px visual delta.
+
+### `fix(redoc)` — point at the real swagger.json endpoint
+
+`/redoc` has been initialising ReDoc against `/static/swagger.json` since v2.2.0, but that static file has never existed — the OpenAPI spec is served by Flask-RESTx at `/api/swagger.json`. The bug went unnoticed because `/redoc` was an undocumented URL until v2.5.0 added it to the desktop nav and to the help page, surfacing the 404 to actual users.
+
+### `fix(dashboard)` — single-row top toolbar (tabs + Create button)
+
+Reflow the dashboard top-row so the cert-type toggle (Server / Client) sits on the same line as the **Create New Certificate** button on the right, instead of the button taking its own row underneath. `flex-wrap` lets the button drop to a second line on narrow viewports. The visual win is downstream: the stat cards and the certificate list move up by one row's worth of pixels.
+
+### `fix(dashboard)` — compact stat cards
+
+Drop the vertical footprint of the four metric cards (Total, Valid, Expiring, Deployed) by ~40%. The previous layout used a horizontal icon-then-label-and-value composition with `p-4` padding; the new layout stacks label + icon on one row, value on a second, with `px-3 py-2`. The skeleton placeholder is bumped down in lockstep so the pre-paint render matches the real card height — no layout shift when the API call resolves.
+
+### `fix(dashboard)` — empty-state "Create Certificate" button now works
+
+The CTA inside the welcome / empty-state block called `.focus()` directly on `#domain`. That input lives inside the create form container which is `display:none` by default, so `focus()` ran against a hidden element and silently did nothing — clicking the button looked broken. Added an `openCreateCertForm()` helper next to `toggleCreateCertForm()` that expands the form first (no-op if already open), focuses the domain input, and scrolls it into view. The top-right Create button is unaffected.
+
+### `fix(help)` — rewrite for user help, drop marketing, theme-aware code blocks
+
+Major surgery on the help page. The previous version was structured around a 6-card "quick links" grid duplicating the section headings below, an "About CertMate" marketing block, and per-feature promo cards under "What's New" — all of which read like the README, not like help.
+
+- Replaced the 6-card grid + scattered changelog link with one horizontal section-nav strip at the top (Quick Start, DNS, CA, API, Multi-account, Backup, Troubleshooting, Report an issue, What's new, Full changelog). Scrolls horizontally on narrow viewports.
+- Removed the "About CertMate" block entirely. Replaced with a single-line footer: *"CertMate is open source. github.com/fabriziosalmi/certmate"*.
+- Dropped the "What's New" feature-card grid. Now a single sentence linking to `RELEASE_NOTES.md`.
+- All section cards switched to `px-4 py-4` (was `px-6 py-6`): ~30% less vertical footprint.
+- Rewrote content for self-service diagnosis. DNS section gains a 6-row table mapping provider → token type → minimum API scope. CA section trimmed to 3 bullets, calls out EAB requirement on DigiCert + Private CA explicitly. Troubleshooting is now a `<dl>` with 5 concrete failure modes (DNS auth, propagation timeout, LE rate limit, deployment "unknown" status, Alpine.js load failure) plus the fix.
+- **New "Report an issue" section** with a diagnostic checklist (version, runtime, repro steps, console errors, `/health` output, screenshots) and a GitHub issue CTA — concrete artifacts the maintainer needs, not marketing copy.
+- `/health` link added to the top-right alongside Swagger / ReDoc so users can grab a one-line system status to attach.
+- **Theme-aware code blocks**: the two `<pre>` snippets used `bg-gray-900 text-green-300` unconditionally, which read as foreign dark islands inside the white cards in light mode. Switched to `bg-gray-100 text-gray-800` with `dark:` variants — terminal styling in dark mode, integrated with the surrounding card in light mode.
+
+Rendered page weight: 1358 → 709 lines.
+
+### `fix(palette)` — Cmd+K palette: adaptive height, no scrollbar when the viewport allows
+
+The Cmd+K palette's results pane had a fixed `max-h-72` (288px), which produced a scrollbar even on tall viewports where every result would fit without it. Replaced the static cap with a viewport-aware size computed at `open()` time, with a resize listener for live re-sizing while the palette is open. Floor of 180px keeps ~3 rows visible on genuinely short windows.
+
+### `fix(layout)` — reserve the scrollbar gutter to prevent horizontal shift
+
+Navigating between pages of different heights — or between settings sub-tabs (DNS short, Backup tall) — caused the whole layout to jump ~15px horizontally as the scrollbar appeared / disappeared between renders. The shift was small but constant and made the UI feel unstable. Added `scrollbar-gutter: stable; overflow-y: scroll;` on `<html>`. `scrollbar-gutter` does the right thing on Chrome 94+ / Firefox 97+ / Safari 16+; `overflow-y: scroll` covers older Safari / iOS as a fallback.
+
+### Tests
+
+Unit suite green pre-push. CI runs the same suite plus build and security-scan jobs.
+
+### Backward compatibility
+
+All changes are at the template / asset / client-side layer plus the version bump. No API, schema, or env-var changes.
+
+---
+
+## v2.5.0 (Minor — v3 UI massive pass: 51 fixes across all templates)
+
+A focused, single-branch sweep of the entire UI surface (`templates/`, `static/js/`, `static/css/`). 51 commits, each scoped to one fix, organized into four waves: cross-cutting refactors (R-1..R-6), per-page quick wins (QW-1..QW-15), per-page Tier A / Tier B work, and per-page section passes (2.x base, 3.x dashboard, 4.x settings, 5.x activity, 6.x login, 7.x help, 8.x cross-cutting).
+
+No API breakage. No data migration. No new env vars. All changes are at the template / asset / client-side layer, plus three small `modules/web/` additions to support `?next=` and `current_user` rendering.
+
+### Cross-cutting refactors
+
+- **R-1 — `templates/settings.html` Alpine root repair.** A long-standing structural bug had Alpine partials sitting outside the root `x-data` element due to an `<!-- comment inside attribute -->` that broke HTML parsing. Tabs and modals were silently un-reactive in some browsers. Re-parented partials inside the main card and removed the comment-in-attribute.
+- **R-2 — Standardized modal macro.** New `templates/partials/_modal.html` with a `{% call modal(id, title, size) %}` macro: dialog role, `aria-modal`, `aria-labelledby`, header with `[data-modal-close]`, scrollable body, panel sizing. Paired with `CertMate.modal.open/close` in [static/js/certmate.js](static/js/certmate.js): global Esc handler, backdrop click, focus trap, `modal:close` CustomEvent, MutationObserver-based discovery so partials added at runtime are wired automatically. Settings modals (`addAccountModal`, `editAccountModal`) migrated as the first callsites.
+- **R-3 — Component-class scaffold in [static/css/input.css](static/css/input.css).** New `@layer components` with `.btn`, `.btn-primary/secondary/danger/ghost`, `.btn-sm/lg`, `.card`, `.badge`, `.badge-success/warning/error/info`, `.form-input`, `.form-select`, `.form-label` — all defined via `@apply`. [tailwind.config.js](tailwind.config.js) safelist added so PurgeCSS doesn't drop classes until the migration of callsites lands in a follow-up sprint. No existing markup changed in this release.
+- **R-5 — Dashboard mobile card meta block.** On `md:hidden` widths each row gets a secondary line with expiry, provider, and deployment status. Previously these only rendered on desktop; mobile users couldn't tell certs apart at a glance.
+- **R-6 — Debug surface gating.** `?debug=1` opt-in writes `localStorage.certmate_debug='1'` and exposes `CertMate.debugEnabled`. All `[data-debug-control]` elements stay hidden until both the localStorage flag AND `/api/auth/me` returns `role === 'admin'`. Two-layer defense-in-depth — URL opt-in plus role check.
+
+### `templates/base.html` (2.1–2.3)
+
+- **2.1 / A1** — Theme toggle icon swap switched from `style.display` to `classList.toggle('hidden')` so Tailwind's dark-mode variant cascades correctly.
+- **2.2 / A4** — API Docs `/redoc` link added to the desktop nav alongside `/docs/`.
+- **2.2 / B1** — Logout button now server-side rendered via `{% if current_user %}` instead of a 500 ms client-side `fetch('/api/auth/me')` probe. New Jinja `context_processor` in [modules/web/routes.py](modules/web/routes.py) injects `current_user`.
+- **2.2 / B2** — Mobile-only search button (`sm:hidden`, icon-only).
+- **2.3 / A2** — `aria-label` on every icon-only top-nav button (theme, keyboard shortcuts, notifications, logout, search).
+- **2.3 / A3** — `aria-current="page"` on the active link in both desktop and mobile bottom nav.
+- **2.3 / B3** — Notification panel migrated to a proper Disclosure pattern: `aria-expanded`, `aria-controls`, Esc handler, focus restoration via `_closeNotifPanel()`. No focus trap (it's a disclosure, not a dialog).
+
+### `templates/index.html` (3.1–3.3) — dashboard
+
+- **3.1 / A1** — Debug button + console gated behind `?debug=1` per R-6.
+- **3.1 / A2** — Loading modal split `hidden` / `flex` classes correctly so it shows/hides without an extra reflow tick.
+- **3.2 / A3** — Explanatory `title` / `aria-label` on the Check-All checkbox.
+- **3.2 / A4** — Emoji prefixes dropped from CA provider `<option>` labels.
+- **3.2 / A5** — Quick Tips bullets replaced with a link to the Help page (single source of truth).
+- **3.2 / B3** — Cert-detail panel renders a skeleton on open and clears content on close so stale data never flashes.
+- **3.2 / B4** — Stats cards render a JS-driven skeleton via `STAT_METRICS_COUNT`; empty container shipped in the template.
+- **3.3 / B1** — `aria-label="${title} ${domain}"` on every per-row action button.
+- **3.3 / B2** — Sortable column headers: implicit `columnheader` role on `<th>`, internal `<button>` for interaction, `aria-sort` toggled via `setAttribute` on each sort.
+- **QW-4** — Dark-mode variants on the curl-snippet modal.
+- **QW-5** — Confirm guard on the delete action via `CertMate.confirm`.
+- **QW-11** — `autocomplete="off"` on cert-create domain inputs (primary + SAN), plus a more permissive SAN parser (`,;\n\t` separators, dedup).
+- **QW-12** — Form lock during in-flight create requests: `isCreatingCert` flag, disabled fields, spinner.
+- **QW-15** — `normalizeHostname()` strips scheme / port / path / trailing dot on submit, preserves `*.` wildcard prefix.
+
+### `templates/settings.html` (4.1–4.2)
+
+- **4.1 / A1** — Debug helper renamed `toggleDebugConsole` → `toggleSettingsDebugConsole` so it no longer collides with the dashboard's helper of the same name.
+- **4.2 / A2** — Tabs go icon-only on mobile; `aria-selected` bound to `tab === t.id`.
+- **4.2 / A3** — DNS-scope prefix added to status indicators. Orphan markup retained with an explanatory comment for the follow-up sprint that will migrate it to the new layout.
+
+### `templates/activity.html` (5.1–5.3)
+
+- **5.1** — Differentiated error states via `renderErrorState()` instead of a single generic banner.
+- **5.2** — Date-range filter (Today / 7d / 30d / All), full-text search across loaded entries, skeleton rows during load, clickable cert entries that deep-link into the dashboard detail panel via `?cert=<domain>`, server-side `limit` param + client "Load more" button (also fixed a backend bug — `/api/activity` returned a bare array but the client read `data.entries`, so the page was always empty), and `api_request` event type hidden from the default view (still surfaced when filtered).
+- **5.3** — ARIA semantics: `<ul role="feed">`, `<li role="article">`, `aria-busy` on the container during load. Errors use `role="alert"` with `aria-live="assertive"`.
+- **QW-8** — Tooltip with absolute timestamp on every relative time via `absoluteTime()`.
+
+### `templates/login.html` (6.1–6.3)
+
+- **QW-1** — FOUC fix: dark-mode script in `<head>` mirrors `base.html` so a user who toggled dark inside the app no longer sees a light flash on every `/login` redirect. `meta theme-color` paired for light + dark.
+- **6.2 / A1** — `/login` server-side redirects to `/` (or `?next=`) on a valid session cookie. The previous client-side check is kept as a defensive fallback.
+- **6.2 / A2** — `autocomplete="username"` and `autocomplete="current-password"` so password managers fill correctly.
+- **6.2 / A3** — `?next=` redirect with `safeNextUrl()` open-redirect guard: only same-origin relative paths (`/`-prefixed, no `//`).
+- **6.2 / A4** — Forgot-password hint pointing at the admin + the `scripts/reset_admin_password.py` in-container reset script (no email infra assumption).
+- **6.3 / A5** — Password visibility toggle: `aria-label`, `aria-pressed`, `aria-controls` swapped in lockstep with the icon glyph.
+
+### `templates/help.html` (7.1–7.2)
+
+- **7.1 / A1** — "What's New in v2.0" renamed to "v2.x" with a link to `RELEASE_NOTES.md`.
+- **7.1 / A2** — Clean six-item Quick Links grid (`grid-cols-3`) including a Backup card.
+- **7.2 / A3** — Swagger UI vs ReDoc disambiguated with explicit labels; eight `rel="noopener"` adds on outbound links.
+- **7.2 / B1** — In-page search filter for help sections via `data-help-section` markers.
+
+### Cross-cutting (8.x)
+
+- **8.2 / A2** — Graceful red `role="alert"` banner if `window.Alpine === undefined` after `DOMContentLoaded`, so a CDN failure doesn't leave the UI looking broken-but-silent.
+- **8.2 / A3** — Debug surface admin-role check (R-6 server-side leg).
+- **8.3 / A1** — Skip-to-content link as the first body child on every page (keyboard a11y).
+
+### Server-side additions
+
+Three small, backwards-compatible additions in `modules/web/`:
+
+- [modules/web/routes.py](modules/web/routes.py) — `context_processor` injecting `current_user` into every Jinja template render.
+- [modules/web/ui_routes.py](modules/web/ui_routes.py) — `/` route sets `request.current_user = user_info` after `validate_session`; redirect to login passes `?next=request.path`.
+- [modules/web/auth_routes.py](modules/web/auth_routes.py) — `login_page()` checks the session cookie server-side and 302s to `/` (or to `?next=` if present) instead of always rendering the login form.
+
+### Tests
+
+E2E suite run before push: **99 passed, 12 skipped, 2 xfailed in 55.5 s** against a freshly built `certmate:test` image (Docker fixture in `tests/conftest.py`, port 18888). The 2 xfailed are pre-existing markers in `test_ui.py`; the 12 skipped are real-cert / opt-in UI tests gated on explicit env. Unit suite green.
+
+### Backward compatibility
+
+- No API shape changes. No new required env vars.
+- The `?next=` parameter is opt-in; absence falls back to `/`.
+- `current_user` in Jinja is `None` for unauthenticated requests — no template that uses it assumes it's set.
+- R-3 component classes are scaffolded only; no callsite migrated, no class renamed.
+- Debug surface gating fails-closed: if `/api/auth/me` errors or returns a non-admin role, the surface stays hidden.
+
+### Acknowledgement
+
+This is a single-contributor sweep — 51 commits on `feature/v3-ui-fixes-2026-05-15`, each commit one fix. The discipline came out of the v2.4.x cycle where mixing fixes in single commits made review and rollback harder than they needed to be. Every fix in this release can be reverted in isolation.
+
+---
+
 ## v2.4.17 (Patch — two community fixes from @rocogamer)
 
 Bundle of two small, surgical community PRs from [@rocogamer](https://github.com/rocogamer) that came out of the maintainer-feedback loop earlier this session. Both are mergeable as-is and ship together because each is too small for a release of its own.
@@ -244,12 +1411,12 @@ Domain-scope denials have audited via `log_authz_denied` since v2.4.12; role-lev
 
 ### Certificate download — private-key role split
 
-Escalation of a finding the audit rated INFO/⚠️ in its coverage matrix. `DownloadCertificate.get` required only `viewer` and returned private-key material via four code paths: `?format=json`, `?file=privkey.pem`, `?file=combined.pem`, default ZIP. A scoped viewer key could therefore pull the private key for every certificate in its scope — information disclosure inconsistent with the read-only-monitoring intent of the role.
+Escalation of a finding the audit rated INFO/WARN in its coverage matrix. `DownloadCertificate.get` required only `viewer` and returned private-key material via four code paths: `?format=json`, `?file=privkey.pem`, `?file=combined.pem`, default ZIP. A scoped viewer key could therefore pull the private key for every certificate in its scope — information disclosure inconsistent with the read-only-monitoring intent of the role.
 
 The decorator stays `viewer` so the authn check still fires, and the handler now gates per file:
 
 | Path | Allowed roles |
-|---|---|
+|---|---|---|
 | `?file=cert.pem`, `?file=chain.pem`, `?file=fullchain.pem` | viewer, operator, admin |
 | `?include_private=0` (public-only ZIP, new) | viewer, operator, admin |
 | `?file=privkey.pem`, `?file=combined.pem`, `?format=json`, default ZIP / `?include_private=1` | operator, admin |
@@ -431,6 +1598,14 @@ Merges the ITJamie PR chain ([#128](https://github.com/fabriziosalmi/certmate/pu
 - 2 new test cases in `test_cert_lifecycle.py` (JSON download success + invalid format)
 - 1 new test case in `test_download_file_param.py` (JSON 404 for missing domains)
 - All validated against live Cloudflare DNS-01 with random subdomain `pr133test-91e7c166.certmate.org`
+
+## Unreleased
+
+### Features
+- **Configurable certificate key type/size**: every cert was hardcoded to RSA-2048 because `CAManager.build_certbot_command` never passed `--key-type` or `--rsa-key-size` to certbot. Operators with compliance requirements (RSA-3072/4096) or modern stacks (ECDSA, smaller certs and faster handshakes) had to patch the code. The settings page now exposes a global default (`default_key_type` / `default_key_size` / `default_elliptic_curve`) and the certificate creation form has an optional per-cert override under "Advanced Options". Renewals automatically preserve the original shape of each cert because certbot persists the `--key-type`/`--rsa-key-size`/`--elliptic-curve` flags into its own `renewal/<domain>.conf` at create time. Default for upgraded installs stays at `rsa`/`2048` so behaviour does not change unless the operator opts in. RSA accepts 2048/3072/4096; ECDSA accepts `secp256r1` and `secp384r1`. Validation runs on every save and every cert creation so a contradictory shape (e.g. `key_type=rsa` with an `elliptic_curve` override) is rejected with a 400 instead of failing later inside certbot.
+
+---
+
 
 ## v2.4.7 (Patch — base image bump bookworm → trixie)
 

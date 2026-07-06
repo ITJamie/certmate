@@ -23,22 +23,42 @@ env:
   REGISTRY: docker.io
   IMAGE_NAME: certmate
 
+# Default to read-only. The build job authenticates to Docker Hub via the
+# DOCKERHUB_TOKEN secret, not the workflow GITHUB_TOKEN, so no write
+# permission on the repo is needed for the push. If we ever add SLSA
+# attestation here (Phase 2), `id-token: write` lands at the job level.
+permissions: read-all
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
-      
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+    - name: Isolate docker config dir (per-run)
+      # Install the buildx CLI plugin into a per-run docker config dir instead
+      # of the host-shared ~/.docker/cli-plugins. Every runner instance on this
+      # host runs as the same user and shares ~/.docker, so two concurrent runs
+      # (the main-branch push and the tag push from one `git push origin main
+      # vX.Y.Z`) raced: one executed docker-buildx while the other overwrote it
+      # -> ETXTBSY "text file is busy". A unique DOCKER_CONFIG removes the shared
+      # target so builds never collide. (runner.* is only available inside steps,
+      # not in job-level env, so this is a step rather than `env:`.)
+      run: |
+        cfg="${RUNNER_TEMP}/.docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        mkdir -p "$cfg"
+        echo "DOCKER_CONFIG=$cfg" >> "$GITHUB_ENV"
+
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
       with:
         version: latest
-        
+
     - name: Log in to Docker Hub
       if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
       with:
         registry: ${{ env.REGISTRY }}
         username: ${{ secrets.DOCKERHUB_USER }}
@@ -59,7 +79,7 @@ jobs:
 
     - name: Extract metadata
       id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
       with:
         images: ${{ env.REGISTRY }}/${{ steps.ns.outputs.namespace }}/${{ env.IMAGE_NAME }}
         tags: |
@@ -95,7 +115,7 @@ jobs:
         fi
         
     - name: Build and push Docker image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25  # v5
       with:
         context: .
         platforms: ${{ steps.platforms.outputs.platforms }}
@@ -110,7 +130,7 @@ jobs:
     - name: Update Docker Hub description
       if: github.ref == 'refs/heads/main' && steps.should_push.outputs.push == 'true'
       continue-on-error: true  # Don't fail build if description update fails
-      uses: peter-evans/dockerhub-description@v3
+      uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77  # v4 (was v3)
       with:
         username: ${{ secrets.DOCKERHUB_USER }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -123,21 +143,67 @@ jobs:
       run: echo ${{ steps.build.outputs.digest }}
       
   security-scan:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     needs: build
     if: github.event_name != 'pull_request'
-    
+    # Job-level permission override: the workflow default is read-all
+    # (set at the top of this file in v2.6.2), but the Trivy SARIF
+    # upload step needs to write into the Security > Code scanning
+    # tab. Granting it here keeps every other step read-only.
+    permissions:
+      security-events: write
+      contents: read
+
     steps:
+    - name: Ensure Trivy is installed
+      # aquasecurity/trivy-action internally invokes setup-trivy, which
+      # on this self-hosted runner reports "Cache restored successfully"
+      # but does not leave a working binary on PATH — the next
+      # entrypoint.sh step fails with `trivy: command not found`
+      # (exit 127, run 26595913239). Install the versioned release
+      # tarball directly into a user-writable PATH entry and tell
+      # trivy-action to skip its own setup. Pin matches the version
+      # setup-trivy was trying to cache.
+      run: |
+        set -euo pipefail
+        if command -v trivy >/dev/null 2>&1; then
+          echo "trivy already on PATH: $(command -v trivy)"
+          exit 0
+        fi
+        TRIVY_VERSION=0.70.0
+        case "$(uname -m)" in
+          x86_64) BIN_ARCH=64bit ;;
+          aarch64|arm64) BIN_ARCH=ARM64 ;;
+          *) echo "Unsupported arch: $(uname -m)" >&2; exit 1 ;;
+        esac
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        curl -fsSL \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${BIN_ARCH}.tar.gz" \
+          -o "$tmp/trivy.tgz"
+        tar -xzf "$tmp/trivy.tgz" -C "$tmp" trivy
+        install -d "$HOME/.local/bin"
+        install -m 0755 "$tmp/trivy" "$HOME/.local/bin/trivy"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        echo "Installed trivy ${TRIVY_VERSION} at $HOME/.local/bin/trivy"
+
     - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
+      # Pinned to v0.36.0 (was @master — never pin to a mutable branch
+      # in CI; upstream HEAD changes silently bring new behaviour or
+      # become an attack surface if compromised).
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
       with:
+        # Use the trivy installed by the previous step. setup-trivy's
+        # cache hit on this self-hosted runner was reporting success
+        # without producing a usable binary.
+        skip-setup-trivy: true
         image-ref: ${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:latest
         format: 'sarif'
         output: 'trivy-results.sarif'
         severity: 'HIGH,CRITICAL'
         
     - name: Upload Trivy scan results to GitHub Security tab
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@458d36d7d4f47d0dd16ca424c1d3cda0060f1360  # v3
       if: always()
       with:
         sarif_file: 'trivy-results.sarif'

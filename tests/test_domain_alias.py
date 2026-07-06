@@ -12,7 +12,7 @@ from modules.core.shell import MockShellExecutor
 CORE_ALIAS_PROVIDERS = [
     'cloudflare', 'route53', 'azure', 'google', 'powerdns', 'digitalocean',
     'linode', 'edgedns', 'gandi', 'ovh', 'namecheap', 'arvancloud',
-    'infomaniak', 'acme-dns', 'duckdns',
+    'infomaniak', 'acme-dns', 'duckdns', 'rfc2136',
 ]
 
 
@@ -323,14 +323,15 @@ def test_dns_alias_check_reports_missing_and_ok_records(tmp_path):
 
 
 def test_domain_alias_rejects_unsupported_provider(tmp_path):
-    mgr, _ = _manager(tmp_path, provider='rfc2136')
+    # hetzner is a real DNS provider but has no alias-zone writer.
+    mgr, _ = _manager(tmp_path, provider='hetzner')
 
     with patch('modules.core.certificates.check_certbot_plugin_installed', return_value=True):
         with pytest.raises(RuntimeError) as exc_info:
             mgr.create_certificate(
                 domain='example.com',
                 email='test@example.com',
-                dns_provider='rfc2136',
+                dns_provider='hetzner',
                 staging=True,
                 domain_alias='validation.example.org',
             )
@@ -425,7 +426,14 @@ def test_lexicon_alias_create_and_delete_use_target_record(monkeypatch):
 
     class FakeClient:
         def __init__(self, config):
-            calls.append(('config', config['provider_name'], config['domain']))
+            # config is a Lexicon ConfigResolver; resolve through it so the
+            # test exercises the same key namespaces Lexicon itself reads.
+            calls.append((
+                'config',
+                config.resolve('lexicon:provider_name'),
+                config.resolve('lexicon:domain'),
+                config.resolve('lexicon:cloudflare:auth_token'),
+            ))
 
         def __enter__(self):
             return FakeOperations()
@@ -443,6 +451,10 @@ def test_lexicon_alias_create_and_delete_use_target_record(monkeypatch):
     dns_alias_hook._lexicon_change(hook_config, 'validation-token', 'create')
     dns_alias_hook._lexicon_change(hook_config, 'validation-token', 'delete')
 
+    # Provider credentials must resolve under the provider namespace, not be
+    # lost — proves the nested ConfigResolver wiring is correct.
+    assert ('config', 'cloudflare', 'certmate-validation.example.net',
+            _provider_config('cloudflare')['api_token']) in calls
     assert ('create', 'TXT', '_acme-challenge.certmate-validation.example.net', 'validation-token') in calls
     assert ('delete', 'TXT', '_acme-challenge.certmate-validation.example.net', 'validation-token') in calls
 
@@ -477,3 +489,80 @@ def test_acme_dns_alias_rejects_non_matching_subdomain():
             'validation-token',
             'create',
         )
+
+
+def test_lexicon_alias_azure_passes_full_fqdn_for_dnspython_zone_resolution(monkeypatch):
+    """Regression for #243: Azure alias mode must hand Lexicon the full alias
+    FQDN together with resolve_zone_name, so Lexicon resolves the real
+    (possibly sub-delegated) hosted zone via dnspython. The previous approach
+    pre-resolved/guessed a zone and passed that instead, which Lexicon's
+    tldextract then collapsed back to the registered domain — breaking
+    issuance against a delegated validation zone."""
+    calls = []
+
+    class FakeOperations:
+        def create_record(self, rtype, name, content):
+            calls.append(('create', rtype, name, content))
+
+        def delete_record(self, identifier=None, rtype=None, name=None, content=None):
+            calls.append(('delete', rtype, name, content))
+
+    class FakeClient:
+        def __init__(self, config):
+            # config is a Lexicon ConfigResolver. Resolve resolve_zone_name via
+            # the exact key Lexicon's Client reads (lexicon:resolve_zone_name).
+            # The previous flat-dict approach left this key in the provider
+            # namespace, where Lexicon never looked, so it resolved to None and
+            # the dnspython zone lookup never ran. See issue #243.
+            calls.append((
+                'config',
+                config.resolve('lexicon:provider_name'),
+                config.resolve('lexicon:domain'),
+                config.resolve('lexicon:resolve_zone_name'),
+                config.resolve('lexicon:azure:auth_subscription_id'),
+            ))
+
+        def __enter__(self):
+            return FakeOperations()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setitem(__import__('sys').modules, 'lexicon.client', MagicMock(Client=FakeClient))
+
+    alias = 'domain.com.acme-validation.validationdomain.com'
+    hook_config = {
+        'provider': 'azure',
+        'domain_alias': alias,
+        'config': _provider_config('azure'),
+    }
+
+    dns_alias_hook._lexicon_change(hook_config, 'val-token', 'create')
+
+    # Full FQDN handed to Lexicon, with dnspython zone resolution enabled at
+    # the top-level lexicon: namespace, and credentials nested under azure:.
+    assert ('config', 'azure', alias, True,
+            _provider_config('azure')['subscription_id']) in calls
+    assert ('create', 'TXT', f'_acme-challenge.{alias}', 'val-token') in calls
+
+
+def test_azure_alias_lexicon_config_uses_dnspython_zone_resolution():
+    """Regression for #243: Azure DNS-01 alias mode against a sub-delegated
+    validation zone (e.g. acme-validation.example.net delegated under
+    example.net) must resolve the real hosted zone via dnspython, not
+    Lexicon's default tldextract — which collapses to the registered domain
+    (example.net) that does not exist in the resource group."""
+    cfg = dns_alias_hook._lexicon_config(
+        'azure',
+        'domain.com.acme-validation.example.net',
+        {
+            'subscription_id': 'sub', 'resource_group': 'rg', 'tenant_id': 't',
+            'client_id': 'c', 'client_secret': 'secret',
+        },
+    )
+    # dnspython SOA lookup instead of tldextract guess.
+    assert cfg['resolve_zone_name'] is True
+    # The full alias FQDN is passed; Lexicon resolves the owning zone from it.
+    assert cfg['domain'] == 'domain.com.acme-validation.example.net'
+    assert cfg['provider_name'] == 'azure'
+    assert cfg['auth_subscription_id'] == 'sub'

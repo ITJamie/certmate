@@ -7,9 +7,34 @@ on:
     branches: [ main, develop ]
   workflow_dispatch:
 
+# Default to read-only. The single job below only reads source and uploads
+# coverage via codecov-action (which manages its own auth via the upload
+# token, not the GITHUB_TOKEN), so no job needs write here.
+permissions: read-all
+
+# Per-ref: a newer push to a branch supersedes that branch's own older
+# in-flight run. This does NOT cover the shared-container clobber across
+# DIFFERENT refs (two open PRs) — that is handled by a host-global group on
+# the `test` job below.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Host-global serialization. The e2e suite (tests/conftest.py) binds a
+    # FIXED-name container (certmate-test-suite) and port (18888) on the
+    # self-hosted host and `docker rm -f`s it on startup, so two test jobs from
+    # DIFFERENT refs/PRs running at once cycle each other's container mid-run
+    # and the HTTP e2e tests fail with connection-refused (observed when two
+    # PRs were opened together). The per-ref group above cannot see across
+    # refs; this single host-wide group makes every test job — regardless of
+    # branch — queue and run one at a time. cancel-in-progress:false so a
+    # waiting PR's tests are queued, never dropped.
+    concurrency:
+      group: certmate-selfhosted-test-container
+      cancel-in-progress: false
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       matrix:
         # 3.12 matches the production Dockerfile. Python 3.14 is temporarily
@@ -21,15 +46,15 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5 (was v4)
       with:
         python-version: ${{ matrix.python-version }}
 
     - name: Cache pip dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4 (was v3)
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
@@ -44,7 +69,9 @@ jobs:
 
     - name: Lint with flake8
       run: |
-        pip install flake8
+        # Pinned so the build pulls a known version (OpenSSF Scorecard
+        # Pinned-Dependencies flags bare, unversioned pip installs).
+        pip install flake8==7.3.0
         # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
         # exit-zero treats all errors as warnings
@@ -52,7 +79,7 @@ jobs:
 
     - name: Security check with bandit
       run: |
-        pip install bandit
+        pip install bandit==1.9.4
         bandit -r modules/ app.py --severity-level medium
 
     - name: Run tests with coverage
@@ -60,17 +87,64 @@ jobs:
         FLASK_ENV: testing
         TESTING: true
       run: |
-        pytest -v --tb=short --cov=. --cov-report=xml --cov-report=html -m "not ui"
+        # Measure the application package (modules/), not the whole repo: a
+        # bare --cov=. folds the tests/ and scripts/ trees (which run at ~100%)
+        # into the number, inflating it and hiding the real app coverage.
+        pytest -v --tb=short --cov=modules --cov-report=xml --cov-report=html -m "not ui"
 
     - name: Upload coverage reports
       if: matrix.python-version == '3.12'
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe  # v5 (was v3)
       with:
-        file: ./coverage.xml
+        # Required since main is a protected branch — without a token Codecov
+        # rejects the upload ("Token required because branch is protected") and
+        # the badge silently freezes at a stale value. fail_ci_if_error stays
+        # false so a transient Codecov outage never blocks a release.
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./coverage.xml
         flags: unittests
         name: codecov-umbrella
+        fail_ci_if_error: false
 
     - name: Test Docker build
       if: matrix.python-version == '3.12'
       run: |
         docker build -t certmate:test .
+
+  # The Tailwind bundle (static/css/tailwind.min.css) is committed to the repo
+  # and served as-is — there is no build step at deploy time. So a stale bundle
+  # ships silently whenever input.css / tailwind.config.js change without a
+  # rebuild. This job rebuilds from source and fails if the committed output
+  # drifts, forcing `npm run css:build` to be part of every CSS-touching PR.
+  frontend-css:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+    - name: Set up Node
+      uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4
+      with:
+        node-version: '20'
+        cache: npm
+
+    - name: Install frontend dependencies
+      run: npm ci
+
+    - name: Rebuild CSS bundle
+      run: npm run css:build
+
+    - name: Fail if committed bundle is stale
+      run: |
+        if ! git diff --exit-code -- static/css/tailwind.min.css; then
+          echo "::error::static/css/tailwind.min.css is out of date. Run 'npm run css:build' and commit the result."
+          exit 1
+        fi
+
+    # Theme-token regression gate: the migration (docs/THEME_MIGRATION.md)
+    # collapsed every light + dark: color pair onto semantic tokens. This fails
+    # the build if a new raw pair (e.g. bg-white dark:bg-gray-800) is
+    # reintroduced in a template or first-party JS file, keeping the theme
+    # editable from one place.
+    - name: Theme token regression gate
+      run: python3 scripts/theme_codemod.py --check

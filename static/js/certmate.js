@@ -53,7 +53,14 @@
         if (toastContainer && document.body.contains(toastContainer)) return toastContainer;
         toastContainer = document.createElement('div');
         toastContainer.id = 'cm-toasts';
-        toastContainer.className = 'fixed top-4 right-4 z-[9999] flex flex-col gap-3 max-w-sm w-full pointer-events-none';
+        // Anchor top-right on desktop; on mobile span the viewport (left-4 +
+        // right-4) instead of `right-4 w-full`, which pushed the left edge to
+        // -16px and clipped content on screens narrower than the max width.
+        toastContainer.className = 'fixed top-4 right-4 left-4 sm:left-auto z-[9999] flex flex-col gap-3 sm:max-w-sm pointer-events-none';
+        // Announce async results to assistive tech. Individual error toasts
+        // additionally get role="alert" (assertive) below.
+        toastContainer.setAttribute('aria-live', 'polite');
+        toastContainer.setAttribute('aria-atomic', 'false');
         document.body.appendChild(toastContainer);
         return toastContainer;
     }
@@ -66,10 +73,10 @@
     };
 
     var TOAST_COLORS = {
-        success: 'bg-green-50 dark:bg-green-900/40 border-green-300 dark:border-green-700 text-green-800 dark:text-green-200',
-        error: 'bg-red-50 dark:bg-red-900/40 border-red-300 dark:border-red-700 text-red-800 dark:text-red-200',
-        warning: 'bg-yellow-50 dark:bg-yellow-900/40 border-yellow-300 dark:border-yellow-700 text-yellow-800 dark:text-yellow-200',
-        info: 'bg-blue-50 dark:bg-blue-900/40 border-blue-300 dark:border-blue-700 text-blue-800 dark:text-blue-200'
+        success: 'bg-success-surface border-success-line text-success-strong',
+        error: 'bg-danger-surface border-danger-line text-danger-strong',
+        warning: 'bg-warning-surface border-warning-line text-warning-strong',
+        info: 'bg-info-surface border-info-line text-info-strong'
     };
 
     CM.toast = function(message, type, duration, options) {
@@ -99,6 +106,11 @@
 
         var toast = document.createElement('div');
         toast.className = 'pointer-events-auto relative border rounded-lg shadow-lg p-4 flex flex-col gap-2 transform translate-x-full opacity-0 transition-all duration-300 overflow-hidden ' + (TOAST_COLORS[type] || TOAST_COLORS.info);
+        // Errors are assertive (interrupt the screen reader); the polite
+        // container handles success/info without interrupting.
+        if (type === 'error') {
+            toast.setAttribute('role', 'alert');
+        }
 
         var headerHtml =
             '<div class="flex items-start gap-3">' +
@@ -193,15 +205,48 @@
         return overlay;
     }
 
-    function createDialogBox(title, bodyHtml) {
+    var dialogSeq = 0;
+    function createDialogBox(title, bodyHtml, role) {
         var box = document.createElement('div');
-        box.className = 'relative bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-md border border-gray-200 dark:border-gray-700 transform scale-95 opacity-0 transition-all duration-200';
+        var titleId = 'cm-dialog-title-' + (++dialogSeq);
+        // Dialog semantics so assistive tech announces this as a modal dialog
+        // and scopes the user inside it. 'alertdialog' for confirm (a decision
+        // is required), 'dialog' for prompt/info.
+        box.setAttribute('role', role || 'dialog');
+        box.setAttribute('aria-modal', 'true');
+        box.setAttribute('aria-labelledby', titleId);
+        box.setAttribute('tabindex', '-1');
+        box.className = 'relative bg-surface rounded-xl shadow-2xl w-full max-w-md border border-border transform scale-95 opacity-0 transition-all duration-200';
         box.innerHTML =
-            '<div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">' +
-                '<h3 class="text-lg font-semibold text-gray-900 dark:text-white">' + CM.escapeHtml(title) + '</h3>' +
+            '<div class="px-6 py-4 border-b border-border">' +
+                '<h3 id="' + titleId + '" class="text-lg font-semibold text-foreground">' + CM.escapeHtml(title) + '</h3>' +
             '</div>' +
             '<div class="px-6 py-4">' + bodyHtml + '</div>';
         return box;
+    }
+
+    // Trap Tab focus inside a dynamically-created overlay and restore focus to
+    // the previously-focused element when it closes. Mirrors the [data-modal-
+    // root] machinery below, for the JS-built confirm/prompt overlays that
+    // aren't static modal roots.
+    function trapOverlayFocus(overlay) {
+        var prevFocus = document.activeElement;
+        overlay.addEventListener('keydown', function (e) {
+            if (e.key !== 'Tab') return;
+            var f = overlay.querySelectorAll(FOCUSABLE_SELECTOR);
+            if (!f.length) { e.preventDefault(); return; }
+            var first = f[0], last = f[f.length - 1];
+            if (e.shiftKey && document.activeElement === first) {
+                e.preventDefault(); last.focus();
+            } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault(); first.focus();
+            }
+        });
+        return function restoreFocus() {
+            if (prevFocus && typeof prevFocus.focus === 'function') {
+                try { prevFocus.focus(); } catch (e) { /* element gone */ }
+            }
+        };
     }
 
     function animateIn(overlay, box) {
@@ -222,7 +267,7 @@
     }
 
     var BTN_BASE = 'px-4 py-2 rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 dark:focus:ring-offset-gray-800';
-    var BTN_CANCEL = BTN_BASE + ' bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 focus:ring-gray-300';
+    var BTN_CANCEL = BTN_BASE + ' bg-surface-2 text-label hover:bg-gray-200 dark:hover:bg-gray-600 focus:ring-gray-300';
     var BTN_DANGER = BTN_BASE + ' bg-red-600 text-white hover:bg-red-700 focus:ring-red-500';
     var BTN_PRIMARY = BTN_BASE + ' bg-blue-600 text-white hover:bg-blue-700 focus:ring-blue-500';
 
@@ -234,14 +279,15 @@
         return new Promise(function(resolve) {
             var overlay = createOverlay();
             var bodyHtml =
-                '<p class="text-gray-600 dark:text-gray-300 text-sm">' + CM.escapeHtml(message) + '</p>' +
+                '<p class="text-muted text-sm">' + CM.escapeHtml(message) + '</p>' +
                 '<div class="flex justify-end gap-3 mt-6">' +
                     '<button data-action="cancel" class="' + BTN_CANCEL + '">Cancel</button>' +
                     '<button data-action="confirm" class="' + (danger ? BTN_DANGER : BTN_PRIMARY) + '">' + CM.escapeHtml(options.confirmText || 'Confirm') + '</button>' +
                 '</div>';
 
-            var box = createDialogBox(title, bodyHtml);
+            var box = createDialogBox(title, bodyHtml, 'alertdialog');
             overlay.appendChild(box);
+            var restoreFocus = trapOverlayFocus(overlay);
             animateIn(overlay, box);
 
             var confirmBtn = box.querySelector('[data-action="confirm"]');
@@ -249,6 +295,7 @@
 
             function close(result) {
                 animateOut(overlay);
+                restoreFocus();
                 resolve(result);
             }
 
@@ -256,8 +303,10 @@
             cancelBtn.addEventListener('click', function() { close(false); });
             overlay.querySelector('.absolute').addEventListener('click', function() { close(false); });
 
-            // Focus confirm button, handle Escape
-            setTimeout(function() { confirmBtn.focus(); }, 50);
+            // Focus the safe choice (Cancel) for destructive prompts so an
+            // inadvertent Enter doesn't confirm a delete/revoke before the
+            // message is read; focus Confirm for non-destructive ones.
+            setTimeout(function() { (danger ? cancelBtn : confirmBtn).focus(); }, 50);
             overlay.addEventListener('keydown', function(e) {
                 if (e.key === 'Escape') close(false);
             });
@@ -273,9 +322,9 @@
             var overlay = createOverlay();
             var inputId = 'cm-prompt-' + Date.now();
             var bodyHtml =
-                '<label for="' + inputId + '" class="block text-gray-600 dark:text-gray-300 text-sm mb-3">' + CM.escapeHtml(message) + '</label>' +
+                '<label for="' + inputId + '" class="block text-muted text-sm mb-3">' + CM.escapeHtml(message) + '</label>' +
                 '<input id="' + inputId + '" type="text" value="' + CM.escapeHtml(defaultValue) + '" ' +
-                    'class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none">' +
+                    'class="w-full px-3 py-2 border text-foreground border-border rounded-lg bg-input text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none">' +
                 '<div class="flex justify-end gap-3 mt-6">' +
                     '<button data-action="cancel" class="' + BTN_CANCEL + '">Cancel</button>' +
                     '<button data-action="confirm" class="' + BTN_PRIMARY + '">OK</button>' +
@@ -283,6 +332,7 @@
 
             var box = createDialogBox(title, bodyHtml);
             overlay.appendChild(box);
+            var restoreFocus = trapOverlayFocus(overlay);
             animateIn(overlay, box);
 
             var input = box.querySelector('input');
@@ -291,6 +341,7 @@
 
             function close(value) {
                 animateOut(overlay);
+                restoreFocus();
                 resolve(value);
             }
 
@@ -300,6 +351,10 @@
 
             input.addEventListener('keydown', function(e) {
                 if (e.key === 'Enter') close(input.value);
+            });
+            // Escape at the overlay level so it works regardless of which
+            // control (input or button) currently holds focus.
+            overlay.addEventListener('keydown', function(e) {
                 if (e.key === 'Escape') close(null);
             });
 
@@ -372,6 +427,238 @@
             var output = this._output || document.getElementById('debugOutput');
             if (output) output.innerHTML = '';
         }
+    };
+
+    // ── Modal standardization (R-2) ───────────────────────────────
+    // Global behavior for any [data-modal-root] element: Esc key,
+    // backdrop click, [data-modal-close] buttons, focus trap inside,
+    // and a `modal:close` CustomEvent dispatched on dismiss so
+    // callsites can subscribe for side-effects (form reset, body
+    // overflow restore) without intercepting individual close
+    // buttons. Visibility is still toggled by `.hidden` class — the
+    // existing showLoadingModal / closeXxxModal helpers don't have
+    // to change shape.
+    var FOCUSABLE_SELECTOR =
+        'a[href], button:not([disabled]), textarea:not([disabled]), ' +
+        'input:not([disabled]):not([type="hidden"]), select:not([disabled]), ' +
+        '[tabindex]:not([tabindex="-1"])';
+    var modalLastFocus = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+
+    function isModalVisible(el) {
+        return el && el.matches && el.matches('[data-modal-root]')
+            && !el.classList.contains('hidden');
+    }
+
+    function visibleModal() {
+        var roots = document.querySelectorAll('[data-modal-root]');
+        for (var i = roots.length - 1; i >= 0; i--) {
+            if (isModalVisible(roots[i])) return roots[i];
+        }
+        return null;
+    }
+
+    function focusableIn(root) { return root.querySelectorAll(FOCUSABLE_SELECTOR); }
+
+    function dismissModal(root) {
+        if (!root || root.hasAttribute('data-modal-no-dismiss')) return;
+        root.classList.add('hidden');
+        root.dispatchEvent(new CustomEvent('modal:close', { bubbles: false }));
+    }
+
+    CM.modal = {
+        open: function(id) {
+            var root = document.getElementById(id);
+            if (!root) return;
+            if (modalLastFocus) modalLastFocus.set(root, document.activeElement);
+            root.classList.remove('hidden');
+            var f = focusableIn(root);
+            if (f.length > 0) f[0].focus();
+            root.dispatchEvent(new CustomEvent('modal:open', { bubbles: false }));
+        },
+        close: function(id) {
+            var root = document.getElementById(id);
+            dismissModal(root);
+        }
+    };
+
+    // Esc to close + Tab to trap focus inside the topmost open modal.
+    document.addEventListener('keydown', function(e) {
+        var root = visibleModal();
+        if (!root) return;
+        if (e.key === 'Escape' && !root.hasAttribute('data-modal-no-dismiss')) {
+            e.preventDefault();
+            dismissModal(root);
+            return;
+        }
+        if (e.key === 'Tab') {
+            var f = focusableIn(root);
+            if (f.length === 0) { e.preventDefault(); return; }
+            var first = f[0], last = f[f.length - 1];
+            if (e.shiftKey && document.activeElement === first) {
+                e.preventDefault(); last.focus();
+            } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault(); first.focus();
+            }
+        }
+    });
+
+    // [data-modal-close] anywhere, or click on the root itself (backdrop).
+    document.addEventListener('click', function(e) {
+        var closeBtn = e.target.closest && e.target.closest('[data-modal-close]');
+        if (closeBtn) {
+            var root = closeBtn.closest('[data-modal-root]');
+            if (root) dismissModal(root);
+            return;
+        }
+        var clickedRoot = e.target.closest && e.target.closest('[data-modal-root]');
+        if (clickedRoot && e.target === clickedRoot) {
+            dismissModal(clickedRoot);
+        }
+    });
+
+    // Observe `.hidden` class toggles to auto-focus on open and
+    // restore focus on close. Existing callsites that call
+    // `.classList.remove('hidden')` directly (e.g. showLoadingModal,
+    // showCurlModal flows) get focus management for free.
+    if (typeof MutationObserver !== 'undefined' && modalLastFocus) {
+        var modalObserver = new MutationObserver(function(mutations) {
+            mutations.forEach(function(m) {
+                if (m.attributeName !== 'class') return;
+                var t = m.target;
+                if (!t.matches('[data-modal-root]')) return;
+                var wasHidden = m.oldValue ? m.oldValue.indexOf('hidden') !== -1 : false;
+                var isHidden = t.classList.contains('hidden');
+                if (wasHidden && !isHidden) {
+                    modalLastFocus.set(t, document.activeElement);
+                    var f = focusableIn(t);
+                    if (f.length > 0) f[0].focus();
+                } else if (!wasHidden && isHidden) {
+                    var prev = modalLastFocus.get(t);
+                    if (prev && typeof prev.focus === 'function') {
+                        try { prev.focus(); } catch (e) { /* element gone */ }
+                    }
+                }
+            });
+        });
+        // Attach the observer to every modal root. If the script loaded
+        // BEFORE DOMContentLoaded we have to wait for it (the roots may not
+        // exist yet); if it loaded AFTER (defer / dynamic import), the event
+        // has already fired and `addEventListener` would silently never run —
+        // leaving modals without Esc / backdrop / focus-trap support. Mirror
+        // the readyState pattern used by CM.refreshRole above.
+        function _attachModalObservers() {
+            document.querySelectorAll('[data-modal-root]').forEach(function(root) {
+                modalObserver.observe(root, {
+                    attributes: true, attributeFilter: ['class'], attributeOldValue: true
+                });
+            });
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', _attachModalObservers);
+        } else {
+            _attachModalObservers();
+        }
+    }
+
+    // ── Debug-console gating ─────────────────────────────────────
+    // The Debug button + console in index.html / settings.html are
+    // dev-only surfaces. Show them only when explicitly opted in via
+    // `?debug=1` in the URL (persisted to localStorage, so once
+    // toggled it stays on for the session/install) or by setting
+    // localStorage.certmate_debug = '1' directly. `?debug=0` clears
+    // the flag.
+    try {
+        var params = new URLSearchParams(window.location.search);
+        if (params.has('debug')) {
+            if (params.get('debug') === '0') {
+                localStorage.removeItem('certmate_debug');
+            } else {
+                localStorage.setItem('certmate_debug', '1');
+            }
+        }
+    } catch (e) { /* old browser or storage disabled */ }
+
+    CM.debugEnabled = (function() {
+        try { return localStorage.getItem('certmate_debug') === '1'; }
+        catch (e) { return false; }
+    })();
+
+    // Even with `?debug=1` explicitly opted-in, gate the actual unhide
+    // on the caller being an admin. The debug surfaces leak internal
+    // information (deployment-probe logs, cache hit/miss counters,
+    // settings shape, etc.) that shouldn't be visible to viewer or
+    // operator roles even if they figure out the URL flag — defense in
+    // depth on top of the URL opt-in (8.2 fix).
+    if (CM.debugEnabled) {
+        document.addEventListener('DOMContentLoaded', function() {
+            fetch('/api/auth/me', { credentials: 'same-origin' })
+                .then(function(r) { return r.ok ? r.json() : null; })
+                .then(function(data) {
+                    if (!data || !data.user || data.user.role !== 'admin') return;
+                    document.querySelectorAll('[data-debug-control]').forEach(function(el) {
+                        el.classList.remove('hidden');
+                    });
+                })
+                .catch(function() { /* network/parse error: leave debug hidden */ });
+        });
+    }
+
+    CM.copyDiagnosticsSnapshot = function(buttonEl) {
+        var originalText = buttonEl ? buttonEl.innerHTML : '';
+        if (buttonEl) {
+            buttonEl.disabled = true;
+            buttonEl.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>Copying…';
+        }
+        return CM.api('GET', '/api/diagnostics/snapshot')
+            .then(function(data) {
+                var text = JSON.stringify(data, null, 2);
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    return navigator.clipboard.writeText(text).then(function() {
+                        CM.toast('Diagnostic snapshot copied to clipboard!', 'success');
+                    });
+                } else {
+                    // Fallback using temporary textarea
+                    var textarea = document.createElement('textarea');
+                    textarea.value = text;
+                    textarea.style.position = 'fixed';
+                    textarea.style.opacity = '0';
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    try {
+                        document.execCommand('copy');
+                        CM.toast('Diagnostic snapshot copied to clipboard!', 'success');
+                    } catch (err) {
+                        CM.toast('Failed to copy snapshot. Copy it manually from the console.', 'error');
+                        console.info('[CertMate] clipboard fallback used — snapshot text available in variable');
+                    }
+                    document.body.removeChild(textarea);
+                }
+            })
+            .catch(function(err) {
+                CM.toast('Failed to retrieve diagnostic snapshot: ' + (err.message || err), 'error');
+            })
+            .finally(function() {
+                if (buttonEl) {
+                    buttonEl.disabled = false;
+                    buttonEl.innerHTML = originalText;
+                }
+            });
+    };
+
+    // ── Scroll lock (modals) ─────────────────────────────────────
+    // Stop the page behind an open modal from scrolling on wheel/touch. The
+    // page scroller is <html> (base.html sets `overflow-y: scroll`), so we
+    // toggle overflow there; scrollbar-gutter:stable keeps the layout from
+    // shifting when the scrollbar is removed. Counter-based so stacked modals
+    // don't unlock the page prematurely.
+    var _scrollLocks = 0;
+    CM.lockScroll = function () {
+        _scrollLocks++;
+        document.documentElement.style.overflow = 'hidden';
+    };
+    CM.unlockScroll = function () {
+        _scrollLocks = Math.max(0, _scrollLocks - 1);
+        if (_scrollLocks === 0) document.documentElement.style.overflow = '';
     };
 
     // ── Expose globally ──────────────────────────────────────────

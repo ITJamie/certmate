@@ -12,21 +12,144 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
     @app.route('/api/activity')
     @auth_manager.require_role('viewer')
     def activity_api():
-        """Activity log endpoint"""
+        """Activity log endpoint.
+
+        Honors ``?limit=N`` from the query string, bounded to [1, 500]
+        so the client can implement Load-more pagination without hitting
+        an unbounded read on a large audit log. Response is shaped as
+        ``{entries, count, limit}`` so the client can decide whether to
+        offer a "Load more" affordance (entries.length >= limit
+        ⇒ there may be more).
+        """
         try:
+            raw_limit = request.args.get('limit', 100)
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                limit = 100
+            limit = max(1, min(limit, 500))
+
             audit_logger = managers['audit']
-            logs = audit_logger.get_recent_entries(limit=50)
-            return jsonify(logs)
+            logs = audit_logger.get_recent_entries(limit=limit)
+            return jsonify({
+                'entries': logs,
+                'count': len(logs),
+                'limit': limit,
+            })
         except Exception as e:
             logger.error(f"Activity API error: {e}")
             return jsonify({'error': 'Failed to fetch activity'}), 500
 
+    @app.route('/api/audit/verify')
+    @auth_manager.require_role('admin')
+    def audit_verify_api():
+        """Verify the tamper-evident audit hash chain.
+
+        Read-only integrity check: recomputes the SHA-256 chain and reports
+        whether it is intact or, on the first break, the exact ``seq`` and
+        reason (modification / deletion / reorder / truncation). Admin-gated
+        because the result and the head hash are sensitive integrity evidence.
+
+        Returns the verifier result plus HTTP 200 when intact and 409 when the
+        chain is broken, so an operator (or a monitoring probe) can alert on a
+        non-2xx without parsing the body. A brand-new instance that has not
+        audited anything yet has no chain file — that is NOT a tamper, so it
+        returns 200 with ``state='absent'`` (unless a signed checkpoint attests
+        the chain once existed, in which case a missing file IS a deletion and
+        stays 409). The honest threat-model caveat (a local chain does not bind
+        the operator) is documented in ``modules/core/audit_chain.py`` and
+        ``docs/compliance.md``.
+        """
+        try:
+            audit_logger = managers.get('audit')
+            if audit_logger is None or not hasattr(audit_logger, 'verify_chain'):
+                return jsonify({'error': 'Audit chain not available'}), 503
+            result = audit_logger.verify_chain()
+            if not result.get('ok') and 'does not exist' in (result.get('reason') or ''):
+                # No chain file. Benign only if nothing ever attested one.
+                has_cp = getattr(audit_logger, 'has_checkpoints', lambda: False)()
+                if not has_cp:
+                    result['state'] = 'absent'
+                    return jsonify(result), 200
+            status = 200 if result.get('ok') else 409
+            return jsonify(result), status
+        except Exception as e:
+            logger.error(f"Audit verify API error: {e}")
+            return jsonify({'error': 'Failed to verify audit chain'}), 500
+
+    @app.route('/api/audit/public-key')
+    @auth_manager.require_role('admin')
+    def audit_public_key_api():
+        """Return this instance's audit signing identity (Ed25519 public key +
+        fingerprint), so an auditor can pin it out-of-band before verifying an
+        export bundle. 404 when the instance has no signing key configured."""
+        try:
+            audit_logger = managers.get('audit')
+            info = audit_logger.public_key_info() if audit_logger and hasattr(audit_logger, 'public_key_info') else None
+            if not info:
+                return jsonify({'error': 'Audit signing not available'}), 404
+            return jsonify(info), 200
+        except Exception as e:
+            logger.error(f"Audit public-key API error: {e}")
+            return jsonify({'error': 'Failed to read audit signing key'}), 500
+
+    @app.route('/api/audit/export')
+    @auth_manager.require_role('admin')
+    def audit_export_api():
+        """Export the audit chain as a signed, independently-verifiable bundle.
+
+        Optional ?from_seq / ?to_seq for an incremental, self-verifying slice.
+        An auditor verifies it off the box with
+        `python -m modules.core.audit_verify --bundle bundle.json [--pubkey key.pem]`
+        without running or trusting CertMate. Admin-only: the bundle is the full
+        audit record."""
+        try:
+            audit_logger = managers.get('audit')
+            if audit_logger is None or not hasattr(audit_logger, 'export_bundle'):
+                return jsonify({'error': 'Audit chain not available'}), 503
+
+            def _seq(name):
+                raw = request.args.get(name)
+                if raw is None:
+                    return None
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return None
+            bundle = audit_logger.export_bundle(from_seq=_seq('from_seq'), to_seq=_seq('to_seq'))
+            return jsonify(bundle), 200
+        except Exception as e:
+            logger.error(f"Audit export API error: {e}")
+            return jsonify({'error': 'Failed to export audit bundle'}), 500
+
     @app.route('/metrics')
     @auth_manager.require_role('admin')
     def metrics():
-        """Prometheus metrics endpoint"""
+        """Prometheus metrics endpoint.
+
+        Builds the collection context from the managers so the certificate,
+        DNS-provider and cache gauges are actually populated. Without a
+        context, generate_metrics_response only emits application_uptime and
+        every labelled inventory metric stays empty ('No data' at scrape).
+        """
         try:
-            return generate_metrics_response()
+            app_context = None
+            settings_manager = managers.get('settings')
+            file_ops = managers.get('file_ops')
+            cert_manager = managers.get('certificates')
+            if settings_manager and file_ops and cert_manager:
+                try:
+                    app_context = {
+                        'settings': settings_manager.load_settings(),
+                        'cert_dir': file_ops.cert_dir,
+                        'get_certificate_info': cert_manager.get_certificate_info,
+                        'cache': managers.get('cache'),
+                    }
+                except Exception as ctx_err:
+                    logger.warning(
+                        "Metrics context unavailable, emitting base metrics "
+                        f"only: {ctx_err}")
+            return generate_metrics_response(app_context)
         except Exception as e:
             logger.error(f"Metrics error: {e}")
             return jsonify({'error': 'Internal Server Error'}), 500
@@ -40,8 +163,19 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
 
         # Scheduler
         scheduler = managers.get('scheduler')
-        checks['scheduler'] = 'running' if (scheduler and scheduler.running) else 'not_running'
-        if checks['scheduler'] != 'running':
+        scheduler_status = managers.get('scheduler_status') or {}
+        if scheduler and scheduler.running:
+            checks['scheduler'] = 'running'
+        elif scheduler_status.get('state') == 'failed':
+            # Setup raised an exception. Surface the reason so operators can
+            # diagnose without grepping logs; without this the /health response
+            # collapsed to a bare 'not_running' that hid the actual cause.
+            checks['scheduler'] = 'failed'
+            checks['scheduler_error'] = scheduler_status.get('error')
+            checks['scheduler_failed_at'] = scheduler_status.get('timestamp')
+            overall = 'degraded'
+        else:
+            checks['scheduler'] = 'not_running'
             overall = 'degraded'
 
         # Cert directory
@@ -68,11 +202,42 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
         # Always return 200 — Flask is serving requests.
         # Load balancers and the conftest health-wait both check for 200.
         # The 'status' field ('healthy'/'degraded') is for monitoring systems.
+        # VERSION was never set in app.config, so /health always reported
+        # "unknown"; fall back to the canonical package version (same source
+        # Swagger and the Prometheus build_info use).
+        from modules import __version__
         return jsonify({
             'status': overall,
-            'version': app.config.get('VERSION', 'unknown'),
+            'version': app.config.get('VERSION') or __version__,
             'checks': checks
         })
+
+    @app.route('/health/ready')
+    def readiness_check():
+        """Readiness probe for orchestrators (Kubernetes readiness, compose
+        healthcheck, deploy gates).
+
+        Distinct from /health on purpose: /health is *liveness* and stays
+        200 whenever Flask serves requests, so a load balancer keeps routing
+        traffic to a process that is otherwise fine. But if APScheduler — the
+        only thing that runs automatic renewals on this single-instance
+        build — failed to start, the instance is serving yet quietly never
+        renewing anything. That used to be invisible to every probe because
+        /health returned 200. This endpoint returns 503 in exactly that case
+        so the failure becomes loud: a deploy gate fails, a readiness probe
+        flips the pod out of rotation, an alert fires.
+        """
+        scheduler = managers.get('scheduler')
+        scheduler_status = managers.get('scheduler_status') or {}
+        running = bool(scheduler and getattr(scheduler, 'running', False))
+        ready = running and scheduler_status.get('state') != 'failed'
+        body = {
+            'ready': ready,
+            'scheduler': 'running' if running else (scheduler_status.get('state') or 'not_running'),
+        }
+        if not ready and scheduler_status.get('error'):
+            body['scheduler_error'] = scheduler_status.get('error')
+        return jsonify(body), (200 if ready else 503)
 
     @app.route('/api/events/stream')
     def events_stream():
@@ -83,7 +248,11 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
         returns a 401 JSON error and does not expose the event stream.
         """
         from flask import Response, stream_with_context, request as _req
-        if auth_manager.is_local_auth_enabled() and auth_manager.has_any_users():
+        # Once the instance is configured (local auth + user, OR an operator
+        # bearer token) require a valid session. SSE can't carry a bearer
+        # header, so a bearer-only deployment simply has no live stream — the
+        # web UI it feeds is locked for that deployment anyway.
+        if not auth_manager.is_setup_mode():
             session_id = _req.cookies.get('certmate_session')
             if not session_id or not auth_manager.validate_session(session_id):
                 return jsonify({'error': 'Unauthenticated'}), 401
@@ -136,7 +305,15 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
 
         if request.method == 'GET':
             try:
-                return jsonify(notifier._get_config())
+                # Audit H5: this endpoint previously returned raw
+                # `notifications` config including plaintext
+                # `smtp_password` + webhook URLs with embedded auth
+                # tokens. Now goes through the central masking helper
+                # so the response shape matches `/api/web/settings`
+                # for the same subtree.
+                from modules.core.settings import mask_secrets_in_settings
+                raw = notifier._get_config() or {}
+                return jsonify(mask_secrets_in_settings(raw))
             except Exception as e:
                 logger.error(f"Failed to read notifications config: {e}")
                 return jsonify({'error': 'Failed to read notifications config'}), 500
@@ -146,8 +323,39 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
             if not isinstance(data, dict):
                 return jsonify({'error': 'Body must be a JSON object'}), 400
 
+            # Audit H4 (May 2026): the prior `s['notifications'] = data`
+            # wholesale-replaced the subtree. The UI round-trips a GET
+            # response — where SMTP `smtp_password` and webhook URLs
+            # arrive masked as `'********'` — back into POST, and the
+            # plain assignment overwrote real on-disk secrets with the
+            # literal sentinel. Strip the sentinel BEFORE the write
+            # (same shape PR #215 + audit C2 fix applied elsewhere)
+            # and deep-merge against the existing notifications block
+            # so a partial UI submit (e.g. toggling `enabled` without
+            # re-typing the SMTP password) does not destroy siblings.
+            from modules.core.settings import (
+                _strip_masked_values, _deep_merge_dict, _restore_masked_list_secrets,
+            )
+            clean_data = _strip_masked_values(data)
+
             def _mutator(s):
-                s['notifications'] = data
+                existing = s.get('notifications')
+                if isinstance(existing, dict) and isinstance(clean_data, dict):
+                    merged = _deep_merge_dict(existing, clean_data)
+                else:
+                    existing = existing if isinstance(existing, dict) else {}
+                    merged = clean_data
+                # The webhooks list is replaced wholesale by the merge above, so
+                # per-channel secrets/tokens the UI sent back masked must be
+                # restored from the prior on-disk list (sentinel = unchanged).
+                if isinstance(merged, dict):
+                    old_ch = existing.get('channels') if isinstance(existing, dict) else None
+                    new_ch = merged.get('channels')
+                    old_whs = old_ch.get('webhooks') if isinstance(old_ch, dict) else None
+                    new_whs = new_ch.get('webhooks') if isinstance(new_ch, dict) else None
+                    if isinstance(new_whs, list):
+                        _restore_masked_list_secrets(old_whs, new_whs)
+                s['notifications'] = merged
                 return s
 
             settings_manager.update(_mutator)
@@ -171,6 +379,81 @@ def register_misc_routes(app, managers, require_web_auth, auth_manager):
         except Exception as e:
             logger.error(f"Failed to save notifications config: {e}")
             return jsonify({'error': 'Failed to save notifications config'}), 500
+
+    @app.route('/api/settings/rate-limits', methods=['GET', 'PUT'])
+    @auth_manager.require_role('admin')
+    def api_rate_limits_config():
+        """Get or replace the configurable API rate limits (#319).
+
+        GET  -> {enabled, limits (effective = defaults + overrides), defaults}
+        PUT  -> {enabled?: bool, limits?: {endpoint: requests_per_minute}}
+        Only the known endpoint keys are accepted, each a positive integer.
+        """
+        from modules.core.rate_limit import RateLimitConfig
+        settings_manager = managers.get('settings')
+        if settings_manager is None:
+            return jsonify({'error': 'Settings not available'}), 503
+        defaults = dict(RateLimitConfig.DEFAULT_LIMITS)
+
+        if request.method == 'GET':
+            try:
+                block = (settings_manager.load_settings() or {}).get('rate_limits') or {}
+                overrides = block.get('limits') if isinstance(block.get('limits'), dict) else {}
+                return jsonify({
+                    'enabled': bool(block.get('enabled', True)),
+                    'limits': {**defaults, **{k: v for k, v in overrides.items() if k in defaults}},
+                    'defaults': defaults,
+                })
+            except Exception as e:
+                logger.error(f"Failed to read rate limits: {e}")
+                return jsonify({'error': 'Failed to read rate limits'}), 500
+
+        try:
+            data = request.json or {}
+            if not isinstance(data, dict):
+                return jsonify({'error': 'Body must be a JSON object'}), 400
+
+            enabled = bool(data.get('enabled', True))
+            raw_limits = data.get('limits', {})
+            if not isinstance(raw_limits, dict):
+                return jsonify({'error': 'limits must be an object'}), 400
+
+            clean_limits = {}
+            for key, value in raw_limits.items():
+                if key not in defaults:
+                    return jsonify({'error': f'Unknown rate-limit key: {key}'}), 400
+                # bool is an int subclass; reject it and any non-int (float/str).
+                if isinstance(value, bool) or not isinstance(value, int):
+                    return jsonify({'error': f'{key} must be an integer'}), 400
+                if value < 1 or value > 100000:
+                    return jsonify({'error': f'{key} must be between 1 and 100000'}), 400
+                clean_limits[key] = value
+
+            def _mutator(s):
+                s['rate_limits'] = {'enabled': enabled, 'limits': clean_limits}
+                return s
+
+            settings_manager.update(_mutator)
+            audit_logger = managers.get('audit')
+            if audit_logger:
+                actor = getattr(request, 'current_user', {}) or {}
+                audit_logger.log_operation(
+                    operation='update',
+                    resource_type='rate_limits_config',
+                    resource_id='rate_limits',
+                    status='success',
+                    details={'enabled': enabled, 'overrides': sorted(clean_limits.keys())},
+                    user=actor.get('username'),
+                    ip_address=request.remote_addr,
+                )
+            return jsonify({
+                'message': 'Rate limits updated',
+                'enabled': enabled,
+                'limits': {**defaults, **clean_limits},
+            })
+        except Exception as e:
+            logger.error(f"Failed to save rate limits: {e}")
+            return jsonify({'error': 'Failed to save rate limits'}), 500
 
     @app.route('/api/notifications/test', methods=['POST'])
     @auth_manager.require_role('admin')

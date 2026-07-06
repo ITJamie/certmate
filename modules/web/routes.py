@@ -10,7 +10,7 @@ from functools import wraps
 from pathlib import Path
 from collections import defaultdict
 from time import time
-from flask import request, redirect, url_for
+from flask import request, redirect, url_for, send_from_directory
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,62 @@ _login_attempts_by_user = defaultdict(list)
 _LOGIN_RATE_LIMIT_USER = 10
 _LOGIN_RATE_WINDOW_USER = 300  # seconds (5 minutes)
 
+# Soft caps on the rate-limit bucket dicts. Per-IP attempts are bounded by
+# _LOGIN_RATE_LIMIT_IP (the rate-limit kicks in at 5 attempts/min), so each
+# list is tiny — but the DICT itself acquires one entry per unique IP/username
+# that ever attempted. A botnet rotating through millions of source IPs (or
+# attacker-chosen usernames behind a proxy) records each key once as [ts] and
+# never revisits it, so the bucket stays non-empty. The previous sweep only
+# dropped ALREADY-empty buckets — but a bucket goes empty only when
+# _trim_attempts runs on its key, which happens solely for the current
+# request's key, so a rotated key was never reclaimed and the dict grew
+# unbounded. The sweep below trims every bucket to its active window when the
+# dict crosses the soft cap, then drops the ones left empty — bounding each
+# dict to the keys active within the window rather than forever.
+_MAX_TRACKED_IPS = 10000
+_MAX_TRACKED_USERS = 10000
+
+
+def _reclaim_stale_buckets(bucket, cap, window):
+    """Bound *bucket* when it crosses *cap* by reclaiming stale keys.
+
+    Trims every key to its active *window* (dropping timestamps the
+    rate-limiter would already ignore) and deletes the keys left empty. This
+    is what reclaims rotated keys: a key recorded once as ``[ts]`` and never
+    revisited is dropped once that lone timestamp ages out of the window — the
+    old empty-only sweep could never reach it, so the dict grew without bound
+    under source-IP / username rotation. As a hard backstop against
+    within-window flooding (every key fresh, so trimming keeps them all), if
+    the dict still exceeds 2x cap it evicts the keys whose most recent attempt
+    is oldest until it is back under cap. The O(n) pass is gated behind the cap
+    check, so the steady-state cost of a normal login is unchanged.
+    """
+    if len(bucket) <= cap:
+        return
+    cutoff = time() - window
+    for key, attempts in list(bucket.items()):
+        kept = [t for t in attempts if t > cutoff]
+        if kept:
+            bucket[key] = kept
+        else:
+            del bucket[key]
+    if len(bucket) > 2 * cap:
+        # Every remaining bucket is non-empty here, so max() is safe.
+        for key in sorted(bucket, key=lambda k: max(bucket[k]))[:len(bucket) - cap]:
+            del bucket[key]
+
+
+def _sweep_empty_buckets():
+    """Reclaim stale rate-limit buckets when a dict crosses its soft cap.
+
+    Called opportunistically from _check_login_rate_limit. Bounds both the
+    per-IP and per-username dicts under rotation attacks — see
+    _reclaim_stale_buckets. Name kept for the existing call site and tests.
+    """
+    _reclaim_stale_buckets(_login_attempts_by_ip, _MAX_TRACKED_IPS, _LOGIN_RATE_WINDOW_IP)
+    _reclaim_stale_buckets(_login_attempts_by_user, _MAX_TRACKED_USERS, _LOGIN_RATE_WINDOW_USER)
+
+
 # Domain name validation pattern
 _DOMAIN_RE = re.compile(r'^(\*\.)?([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
 
@@ -57,6 +113,10 @@ def _check_login_rate_limit(ip_address, username=None):
     that don't pass it skip the per-username bucket (used by tests
     and existing callers during the migration window).
     """
+    # Cheap O(1) check; the actual sweep only runs when the dict crossed
+    # its soft cap. Keeps the dicts bounded under botnet IP rotation.
+    _sweep_empty_buckets()
+
     now = time()
     retry_after = None
 
@@ -124,7 +184,7 @@ def register_web_routes(app, managers):
         """Decorator for web pages: redirect to /login if not authenticated"""
         @wraps(f)
         def decorated(*args, **kwargs):
-            if not auth_manager.is_local_auth_enabled() or not auth_manager.has_any_users():
+            if auth_manager.is_setup_mode():
                 return f(*args, **kwargs)
             session_id = request.cookies.get('certmate_session')
             if session_id:
@@ -132,8 +192,21 @@ def register_web_routes(app, managers):
                 if user_info:
                     request.current_user = user_info
                     return f(*args, **kwargs)
-            return redirect(url_for('login_page'))
+            # Preserve the originally-requested path as ?next=… so a
+            # successful login can bounce the user back where they
+            # were trying to go (6.2 fix).
+            return redirect(url_for('login_page', next=request.path))
         return decorated
+
+    # Expose the authenticated user to every Jinja template so base.html
+    # can render the logout button server-side instead of via a 500ms-
+    # delayed JS fetch that produces a visible layout shift. Templates
+    # see this as `current_user` (truthy dict / falsy None).
+    @app.context_processor
+    def _inject_current_user():
+        return {
+            'current_user': getattr(request, 'current_user', None),
+        }
 
     from .ui_routes import register_ui_routes
     from .misc_routes import register_misc_routes
@@ -141,6 +214,7 @@ def register_web_routes(app, managers):
     from .cert_routes import register_cert_routes
     from .settings_routes import register_settings_routes
     from .backup_cache_routes import register_backup_cache_routes
+    from .oidc_routes import register_oidc_routes
 
     register_ui_routes(app, managers, require_web_auth, auth_manager)
     register_misc_routes(app, managers, require_web_auth, auth_manager)
@@ -153,3 +227,20 @@ def register_web_routes(app, managers):
                              settings_manager, dns_manager)
     register_backup_cache_routes(app, managers, require_web_auth, auth_manager,
                                  file_ops, settings_manager, cache_manager)
+    register_oidc_routes(app, managers, auth_manager, managers['oidc'],
+                         _check_login_rate_limit, _record_login_attempt)
+
+    @app.route('/.well-known/acme-challenge/<path:filename>')
+    def serve_acme_challenge(filename):
+        """Serve HTTP-01 challenge tokens written by certbot.
+
+        Intentionally public (no auth): the ACME server fetches this
+        unauthenticated during validation. The directory is the same one
+        certbot writes to — both resolve via acme_webroot_dir() and it is
+        published on app.config in factory.configure_app. send_from_directory
+        (werkzeug safe_join) blocks path traversal, returning 404 for '..' or
+        absolute paths.
+        """
+        acme_path = os.path.join(
+            app.config['ACME_CHALLENGES_DIR'], '.well-known', 'acme-challenge')
+        return send_from_directory(acme_path, filename, mimetype='text/plain')

@@ -20,13 +20,13 @@ This document covers the complete CertMate architecture — both the main server
 
 ## Main System Architecture
 
-CertMate is a modular, pluggable SSL/TLS certificate management system built with Python/Flask. It supports multiple CA providers, 22+ DNS providers, and pluggable storage backends.
+CertMate is a modular, pluggable SSL/TLS certificate management system built with Python/Flask. It supports multiple CA providers, two dozen+ DNS providers, and pluggable storage backends.
 
 **Key Facts:**
 - **Language**: Python 3.9+ (Flask, Flask-RESTX)
 - **Storage**: Local filesystem default + 4 cloud backends (Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisical)
 - **CA Providers**: Let's Encrypt, DigiCert ACME, Private CA
-- **DNS Providers**: 22 supported (Cloudflare, AWS Route53, Azure, Google, and more)
+- **DNS Providers**: two dozen+ supported (Cloudflare, AWS Route53, Azure, Google, and more — see [DNS Providers](./dns-providers.md) for the full list)
 - **API**: REST with Swagger/OpenAPI via Flask-RESTX
 - **Current Certificate Types**: Server-side TLS (DV, OV, EV)
 
@@ -177,10 +177,52 @@ All backends implement `CertificateStorageBackend`:
 | Backend | Storage Location |
 |---------|-----------------|
 | **Local Filesystem** | `certificates/{domain}/` (default) |
-| **Azure Key Vault** | Azure Key Vault secrets |
+| **Azure Key Vault** | Secrets, native Certificate objects, or both — see below |
 | **AWS Secrets Manager** | AWS Secrets Manager |
 | **HashiCorp Vault** | Vault KV v1/v2 |
 | **Infisical** | Infisical secrets |
+
+#### Azure Key Vault — storage modes
+
+The Azure Key Vault backend can persist certificates as Secrets (the
+default), as native Certificate objects, or both, controlled by
+`certificate_storage.azure_keyvault.storage_mode` in `settings.json`.
+
+| Mode | Writes Secrets | Writes Certificate object | When to use |
+|---|---|---|---|
+| `secrets` (default) | yes | no | Backwards-compatible behaviour. Each `cert.pem` / `chain.pem` / `fullchain.pem` / `privkey.pem` and the metadata are stored as separate Key Vault Secrets. |
+| `certificate` | no | yes | Bind directly from App Service, Application Gateway, Front Door, API Management, AKS Ingress, etc. The cert + chain + private key are imported as a single PKCS12 `Certificate` object with `issuer_name="Unknown"` so Key Vault does not try to renew it. |
+| `both` | yes | yes | Transitional or mixed-consumer setups. Reads still prefer the Secrets path (cheaper). |
+
+A manual **Backfill Certificate objects** action in the Storage settings
+panel (`POST /api/storage/azure-keyvault/backfill-certificates`) imports a
+Certificate object for every domain that already lives in the vault as
+Secrets but does not yet have one. Existing Certificate objects are
+skipped. The endpoint accepts an optional `?limit=N` query parameter to
+cap how many domains it processes per call; large vaults can paginate by
+calling repeatedly until the response reports `0` remaining.
+
+##### Security note — Certificate objects expose the private key via the Secrets API
+
+When Key Vault imports a PKCS12 Certificate object, it also creates a
+companion **Secret** with the same name whose value is the full PFX
+(including the private key). This is by-design in Azure: it is the
+documented way for VM extensions and App Service to consume the cert,
+and any principal granted `Secrets/Get` on the vault can therefore
+download the private key — *the Certificates `Get` permission alone is
+not sufficient to extract the private key, but `Secrets/Get` is*.
+Operators running CertMate in `certificate` or `both` mode should scope
+`Secrets/Get` carefully and prefer Azure RBAC over vault access policies
+for finer-grained control. See
+[Microsoft Learn — Certificates in Key Vault](https://learn.microsoft.com/azure/key-vault/certificates/about-certificates)
+for the full model.
+
+##### Service Principal permissions
+
+| Mode | Required permissions on the vault |
+|---|---|
+| `secrets` | Secrets `Get/Set/List/Delete` |
+| `certificate` / `both` | Adds Certificates `Get/List/Import/Delete` and keeps Secrets `Get/List` (Key Vault exposes the imported PFX, including the private key, only via the Secret with the same name as the Certificate object). |
 
 ---
 
@@ -217,9 +259,26 @@ All settings are stored in `data/settings.json`:
   "certificate_storage": {
     "backend": "local_filesystem",
     "cert_dir": "certificates"
-  }
+  },
+  "default_key_type": "rsa",
+  "default_key_size": 2048,
+  "default_elliptic_curve": "secp256r1"
 }
 ```
+
+### Certificate key type/size
+
+Three top-level keys control the public-key shape of newly issued certificates:
+
+| Key | Values | Applies when |
+|---|---|---|
+| `default_key_type` | `rsa` (default) / `ecdsa` | always |
+| `default_key_size` | `2048` (default) / `3072` / `4096` | `default_key_type == "rsa"` |
+| `default_elliptic_curve` | `secp256r1` (default) / `secp384r1` | `default_key_type == "ecdsa"` |
+
+A per-certificate override is supported: each entry in `domains` may carry an optional `key_type` plus either `key_size` (RSA) or `elliptic_curve` (ECDSA). When the override is present it wins; otherwise the global default applies. The defaults `rsa`/`2048` mirror the implicit certbot default that CertMate emitted before this setting existed, so upgraded installs see no change unless the operator picks something else.
+
+Renewals always preserve the shape that was in effect at creation time: certbot persists `--key-type`, `--rsa-key-size` and `--elliptic-curve` into its own `renewal/<domain>.conf` during the first issuance, and `certbot renew --cert-name <domain>` reuses those values automatically.
 
 ---
 

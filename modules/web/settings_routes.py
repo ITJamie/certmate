@@ -1,7 +1,17 @@
+import copy
 import logging
+import re
+
 from flask import request, jsonify
 
+from modules.core.constants import iter_cert_domain_dirs
+
 logger = logging.getLogger(__name__)
+
+# Secret-name masking is single-sourced in modules/core/settings.py
+# (_SECRET_KEY_RE + mask_secrets_in_settings); the GET handler below
+# imports it. A local duplicate of that regex used to live here but had
+# been dead code since the handlers switched to the shared helper.
 
 
 def register_settings_routes(app, managers, require_web_auth, auth_manager,
@@ -10,6 +20,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
     auth_manager_ref = auth_manager
     deploy_manager = managers.get('deployer')
     audit_logger = managers.get('audit')
+    file_ops = managers.get('file_ops')
 
     @app.route('/api/settings', methods=['GET'])
     @app.route('/api/web/settings', methods=['GET'])
@@ -27,22 +38,59 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
         already needs the masked structure to show form fields).
         """
         try:
+            from modules.core.settings import mask_secrets_in_settings
             settings = settings_manager.load_settings()
-            import copy, re
-            masked = copy.deepcopy(settings)
-            _SECRET_KEYS = re.compile(
-                r'(token|secret|password|key|credential)',
-                re.IGNORECASE
-            )
-            def _mask_dict(d):
-                if not isinstance(d, dict):
-                    return
-                for k in list(d.keys()):
-                    if _SECRET_KEYS.search(k) and isinstance(d[k], str) and d[k]:
-                        d[k] = '********'
-                    elif isinstance(d[k], dict):
-                        _mask_dict(d[k])
-            _mask_dict(masked)
+            # Centralised masking via modules/core/settings — same helper
+            # the backup-ZIP and notifications GET paths use, so the
+            # contract is single-sourced. Picks up the provider-specific
+            # acme-dns shared-secret fields (username + subdomain) that
+            # the older local walker missed (audit finding M2).
+            masked = mask_secrets_in_settings(settings)
+
+            # Audit M4: scoped API keys (allowed_domains set) must not
+            # see the full org-wide `domains` array. Mirrors the same
+            # scope filter `Settings.get` applies in resources.py. The
+            # `masked` dict is a fresh deep-copy from
+            # `mask_secrets_in_settings`, so mutating it in place here
+            # cannot affect the on-disk settings.
+            user = getattr(request, 'current_user', None) or {}
+            scope = user.get('allowed_domains')
+            if scope is not None:
+                raw_domains = masked.get('domains') or []
+                filtered = []
+                for entry in raw_domains:
+                    domain_name = (
+                        entry if isinstance(entry, str)
+                        else (entry.get('domain') if isinstance(entry, dict) else None)
+                    )
+                    if domain_name and auth_manager.domain_matches_scope(domain_name, scope):
+                        filtered.append(entry)
+                masked['domains'] = filtered
+
+            # Recovery helper: if the UI is about to show the wizard,
+            # surface a flag so the frontend can suggest restoring
+            # from backup instead of silently overwriting settings.
+            has_users = bool(settings.get('users'))
+            has_domains = bool(settings.get('domains'))
+            cert_dir = getattr(settings_manager.file_ops, 'cert_dir', None)
+            has_certs = (
+                cert_dir is not None
+                and any(iter_cert_domain_dirs(cert_dir))
+            ) if cert_dir else False
+            if not has_users and not has_domains and has_certs:
+                masked['certmate_recovery_suggested'] = True
+
+            # The user roster and API-key inventory have dedicated admin-only
+            # endpoints (/api/users, /api/keys). mask_secrets_in_settings only
+            # redacts secret-named LEAF values, so usernames/roles/emails and
+            # key names/roles/allowed_domains/token_prefix would otherwise leak
+            # to any viewer through this settings view. Strip them for anyone
+            # who is not an admin (kept for admin so the settings UI is
+            # unchanged for the role that already reads them elsewhere).
+            if (user.get('role') != 'admin'):
+                masked.pop('users', None)
+                masked.pop('api_keys', None)
+
             response = jsonify(masked)
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
             response.headers['Pragma'] = 'no-cache'
@@ -63,7 +111,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                 validate_settings_post,
                 diff_settings_keys,
             )
-            data = request.json
+            data = request.json or {}
             # Load *before* validating: validate_settings_post uses the
             # current state to drop no-op echoes from a GET-then-POST-back
             # round-trip (the dominant pattern from the web UI).
@@ -110,6 +158,17 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
             if not settings_manager.atomic_update(filtered):
                 return jsonify({'error': 'Update failed'}), 500
 
+            # The deployment-status cache only reads its TTL at construction, so
+            # a persisted cache_ttl change was a silent no-op until restart. Push
+            # it live now that the write succeeded.
+            if 'cache_ttl' in filtered:
+                cache_manager = managers.get('cache')
+                if cache_manager and hasattr(cache_manager, 'update_cache_settings'):
+                    try:
+                        cache_manager.update_cache_settings()
+                    except Exception as e:
+                        logger.warning("Failed to apply cache_ttl live: %s", e)
+
             after = settings_manager.load_settings() or {}
             changed = diff_settings_keys(before, after)
             if audit_logger and changed:
@@ -137,7 +196,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
             users = auth_manager.list_users()
             return jsonify({'users': users})
 
-        data = request.json
+        data = request.json or {}
         username = data.get('username')
         password = data.get('password')
         role = data.get('role', 'viewer')
@@ -197,18 +256,42 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                 return jsonify({'error': msg}), 404
             return jsonify({'error': msg}), 400
 
-        data = request.json
+        data = request.json or {}
         role = data.get('role')
-        if not role:
-            return jsonify({'error': 'Role required'}), 400
+        password = data.get('password')
+        email = data.get('email')
+        enabled = data.get('enabled')
+
+        # At least one mutable field must be present. The UI sends a single
+        # field per action (role change, password reset, enable/disable).
+        if role is None and password is None and email is None and enabled is None:
+            return jsonify({'error': 'Nothing to update'}), 400
+
+        if enabled is not None and not isinstance(enabled, bool):
+            return jsonify({'error': 'enabled must be a boolean'}), 400
+
+        # Mirror the create-user password policy on resets so a weakened
+        # credential cannot be slipped in through the edit surface.
+        if password is not None:
+            if len(password) > 256:
+                return jsonify({'error': 'Password must be ≤ 256 chars'}), 400
+            import re
+            if (len(password) < 12
+                    or not re.search(r'\d', password)
+                    or not re.search(r'[^A-Za-z0-9]', password)):
+                return jsonify({
+                    'error': 'Password must be at least 12 characters and include a digit and a symbol'
+                }), 400
 
         # Capture the previous role so the audit entry records the transition.
         old_users = auth_manager.list_users() or {}
         old_role = (old_users.get(username) or {}).get('role')
 
-        success, msg = auth_manager.update_user(username, role=role)
+        success, msg = auth_manager.update_user(
+            username, role=role, password=password, email=email, enabled=enabled,
+        )
         if success:
-            if audit_logger and old_role != role:
+            if audit_logger and role is not None and old_role != role:
                 actor = getattr(request, 'current_user', {}) or {}
                 audit_logger.log_user_role_changed(
                     username=username,
@@ -236,7 +319,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
             return jsonify(accounts)
 
         try:
-            data = request.json
+            data = request.json or {}
             name = data.get('name') or data.get('account_id')
             req_provider = provider or data.get('provider')
             config = data.get('config', {})
@@ -245,10 +328,42 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                 return jsonify({'error': 'Account name and provider required'}), 400
 
             if dns_manager.add_account(name, req_provider, config):
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='create_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{req_provider}:{name}",
+                        status='success',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return jsonify({'message': 'Account added', 'id': name})
+
+            if audit_logger:
+                user = getattr(request, 'current_user', None) or {}
+                audit_logger.log_operation(
+                    operation='create_account',
+                    resource_type='dns_provider',
+                    resource_id=f"{req_provider}:{name}" if req_provider and name else 'unknown',
+                    status='failure',
+                    user=user.get('username'),
+                    ip_address=request.remote_addr,
+                )
             return jsonify({'error': 'Failed to add account'}), 500
         except Exception as e:
             logger.error(f"Failed to add DNS account: {e}")
+            if audit_logger:
+                user = getattr(request, 'current_user', None) or {}
+                audit_logger.log_operation(
+                    operation='create_account',
+                    resource_type='dns_provider',
+                    resource_id=f"{req_provider}:{name}" if 'req_provider' in locals() and 'name' in locals() else 'unknown',
+                    status='failure',
+                    user=user.get('username'),
+                    ip_address=request.remote_addr,
+                    error=str(e)
+                )
             return jsonify({'error': 'Failed to add account'}), 500
 
     @app.route('/api/dns/<string:provider>/accounts/<string:account_id>',
@@ -262,7 +377,28 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
         """Route for updating or deleting a DNS provider account"""
         if request.method == 'DELETE':
             if dns_manager.delete_account(provider, account_id):
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='delete_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{provider}:{account_id}",
+                        status='success',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return jsonify({'message': 'Account deleted'})
+            
+            if audit_logger:
+                user = getattr(request, 'current_user', None) or {}
+                audit_logger.log_operation(
+                    operation='delete_account',
+                    resource_type='dns_provider',
+                    resource_id=f"{provider}:{account_id}",
+                    status='failure',
+                    user=user.get('username'),
+                    ip_address=request.remote_addr,
+                )
             return jsonify({'error': 'Failure to delete account'}), 500
 
         # PUT: update existing account
@@ -285,10 +421,45 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
             if dns_manager.add_account(account_id, provider, merged):
                 if set_as_default:
                     dns_manager.set_default_account(provider, account_id)
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='update_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{provider}:{account_id}",
+                        status='success',
+                        details={
+                            'set_as_default': set_as_default
+                        },
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return jsonify({'message': 'Account updated', 'id': account_id})
+            
+            if audit_logger:
+                user = getattr(request, 'current_user', None) or {}
+                audit_logger.log_operation(
+                    operation='update_account',
+                    resource_type='dns_provider',
+                    resource_id=f"{provider}:{account_id}",
+                    status='failure',
+                    user=user.get('username'),
+                    ip_address=request.remote_addr,
+                )
             return jsonify({'error': 'Failed to update account'}), 500
         except Exception as e:
             logger.error(f"Failed to update DNS account: {e}")
+            if audit_logger:
+                user = getattr(request, 'current_user', None) or {}
+                audit_logger.log_operation(
+                    operation='update_account',
+                    resource_type='dns_provider',
+                    resource_id=f"{provider}:{account_id}",
+                    status='failure',
+                    user=user.get('username'),
+                    ip_address=request.remote_addr,
+                    error=str(e)
+                )
             return jsonify({'error': 'Failed to update account'}), 500
 
     # ------------------------------------------------------------------ #
@@ -313,6 +484,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
             role = data.get('role', 'viewer')
             expires_at = data.get('expires_at')
             allowed_domains = data.get('allowed_domains')
+            is_agent = bool(data.get('is_agent', False))
 
             if not name:
                 return jsonify({'error': 'Key name is required'}), 400
@@ -320,10 +492,42 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                 return jsonify({'error': 'Key name must be ≤ 64 characters'}), 400
 
             user = getattr(request, 'current_user', {}) or {}
+
+            # Prevent privilege escalation through key creation. require_role
+            # ('admin') gates this endpoint by role LEVEL only — it never checks
+            # the caller's own allowed_domains — so a *scoped* admin key
+            # (role=admin, allowed_domains=[...]) could otherwise mint an
+            # unrestricted admin key and escape its own scope. A minted key must
+            # never exceed its creator's role or domain scope.
+            from ..core.auth import ROLE_HIERARCHY
+            caller_role = user.get('role', 'viewer')
+            caller_scope = user.get('allowed_domains')  # None = unrestricted
+            requested_level = ROLE_HIERARCHY.get(role)
+            if requested_level is not None and requested_level > ROLE_HIERARCHY.get(caller_role, -1):
+                return jsonify({'error': 'Cannot create a key with a role higher than your own'}), 403
+            if caller_scope is not None:
+                # A domain-scoped creator may only mint keys scoped within its
+                # own domains: never an unscoped key, never a domain outside
+                # scope. An empty list (locked-out key) is more restrictive, so
+                # it is allowed.
+                if allowed_domains is None:
+                    return jsonify({'error': 'A domain-scoped key cannot create an unscoped key'}), 403
+                requested_scope = allowed_domains if isinstance(allowed_domains, list) else [allowed_domains]
+                outside = [d for d in requested_scope
+                           if not auth_manager_ref.domain_matches_scope(d, caller_scope)]
+                if outside:
+                    return jsonify({'error': 'Cannot grant domains outside your own key scope'}), 403
+            if role == 'admin' and allowed_domains is not None:
+                # admin bypasses domain scope on every non-per-domain endpoint
+                # (backups, settings, key management), so a "scoped admin" key is
+                # a false containment. Reject it; use operator for scoped access.
+                return jsonify({'error': 'Admin keys cannot be domain-scoped; use the operator role for scoped access'}), 400
+
             success, result_data = auth_manager_ref.create_api_key(
                 name, role=role, expires_at=expires_at,
                 created_by=user.get('username'),
                 allowed_domains=allowed_domains,
+                is_agent=is_agent,
             )
             if success:
                 if audit_logger:
@@ -389,7 +593,7 @@ def register_settings_routes(app, managers, require_web_auth, auth_manager,
                 return jsonify({'error': 'Failed to get deploy config'}), 500
 
         try:
-            data = request.json
+            data = request.json or {}
             ok, err = deploy_manager.save_config(data)
             if ok:
                 if audit_logger:

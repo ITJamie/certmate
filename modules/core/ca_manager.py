@@ -29,6 +29,18 @@ class CAManager:
                 'certificate_types': ['DV'],
                 'description': 'Free, automated SSL certificates'
             },
+            # Staging modelled as its own CA entry (#279) instead of a
+            # per-certificate boolean: it behaves like a different authority
+            # in every way that matters (directory, trust, rate limits).
+            'letsencrypt_staging': {
+                'name': 'Let\'s Encrypt (Staging)',
+                'production_url': 'https://acme-staging-v02.api.letsencrypt.org/directory',
+                'staging_url': 'https://acme-staging-v02.api.letsencrypt.org/directory',
+                'requires_eab': False,
+                'supports_wildcard': True,
+                'certificate_types': ['DV'],
+                'description': 'Let\'s Encrypt staging environment - untrusted test certificates with generous rate limits'
+            },
             'digicert': {
                 'name': 'DigiCert',
                 'production_url': 'https://acme.digicert.com/v2/DV',
@@ -65,15 +77,6 @@ class CAManager:
                 'certificate_types': ['DV'],
                 'description': 'Free SSL certificates from Google Trust Services'
             },
-            'buypass': {
-                'name': 'BuyPass Go',
-                'production_url': 'https://api.buypass.com/acme/directory',
-                'staging_url': 'https://api.test4.buypass.no/acme/directory',
-                'requires_eab': False,
-                'supports_wildcard': False,
-                'certificate_types': ['DV'],
-                'description': 'Free SSL certificates with 180-day validity from BuyPass'
-            },
             'sslcom': {
                 'name': 'SSL.com',
                 'production_url': 'https://acme.ssl.com/sslcom-dv-rsa',
@@ -82,6 +85,19 @@ class CAManager:
                 'supports_wildcard': True,
                 'certificate_types': ['DV', 'OV', 'EV'],
                 'description': 'Enterprise SSL certificates from SSL.com'
+            },
+            'actalis': {
+                'name': 'Actalis',
+                'production_url': 'https://acme-api.actalis.com/acme/directory',
+                # Actalis does not publish a staging/test ACME endpoint.
+                'staging_url': 'https://acme-api.actalis.com/acme/directory',
+                'requires_eab': True,
+                # ACME plans are DV only; wildcard is explicitly not
+                # offered via ACME (guide.actalis.com FAQ). The free plan
+                # is limited to single-domain 90-day certificates.
+                'supports_wildcard': False,
+                'certificate_types': ['DV'],
+                'description': 'European CA (Italy) with free 90-day DV certificates via ACME'
             }
         }
     
@@ -95,9 +111,20 @@ class CAManager:
         
         # Get CA provider configuration
         ca_providers = settings.get('ca_providers', {})
+        if ca_provider == 'letsencrypt_staging' and 'letsencrypt' in ca_providers:
+            # Staging shares the Let's Encrypt account shape (just an email,
+            # no credentials) — inherit it so selecting the staging CA works
+            # without re-entering settings. A populated letsencrypt_staging
+            # entry takes precedence, but the settings UI materializes the
+            # entry as {email: ''} on every save, so an EMPTY entry must
+            # alias too or the inheritance is dead for UI-managed installs.
+            staging_config = ca_providers.get('letsencrypt_staging')
+            if not staging_config or not (
+                    staging_config.get('email') or staging_config.get('accounts')):
+                ca_provider = 'letsencrypt'
         if ca_provider not in ca_providers:
             raise ValueError(f"CA provider '{ca_provider}' not configured")
-        
+
         provider_config = ca_providers[ca_provider]
         
         # Handle multi-account support
@@ -159,17 +186,48 @@ class CAManager:
             return False
         return self.ca_providers[ca_provider]['requires_eab']
     
-    def get_eab_credentials(self, ca_provider: str, account_config: Dict[str, Any]) -> Tuple[str, str]:
-        """Get External Account Binding credentials for CA provider"""
-        if not self.requires_eab(ca_provider):
+    def get_eab_credentials(self, ca_provider: str, account_config: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Get External Account Binding credentials for CA provider.
+
+        Accepts both field spellings: ``eab_key_id``/``eab_hmac_key``
+        (canonical, manual settings.json) and ``eab_kid``/``eab_hmac``
+        (what the settings UI saves via collectCAProviderSettings).
+
+        The UI spelling wins when both pairs are present: the settings
+        form is the only surface that rotates credentials, while the
+        canonical pair can only come from a past hand-edit the UI never
+        displays — preferring it would make a UI rotation a silent
+        no-op. An empty UI value falls back to the canonical one.
+
+        For ``private_ca`` EAB is optional: the generic Private CA entry
+        can point at any ACME directory — including public CAs that
+        enforce account binding (e.g. Actalis used without its dedicated
+        entry) — so credentials are returned when present and (None,
+        None) when absent. Public CAs with ``requires_eab: False`` never
+        emit EAB even if stray fields exist in the saved config, since
+        an unexpected externalAccountBinding can fail registration.
+        """
+        if not self.requires_eab(ca_provider) and ca_provider != 'private_ca':
             return None, None
-        
-        eab_key_id = account_config.get('eab_key_id', '')
-        eab_hmac_key = account_config.get('eab_hmac_key', '')
-        
+
+        account_config = account_config or {}
+        eab_key_id = account_config.get('eab_kid') or account_config.get('eab_key_id', '')
+        eab_hmac_key = account_config.get('eab_hmac') or account_config.get('eab_hmac_key', '')
+
         if not eab_key_id or not eab_hmac_key:
-            raise ValueError(f"EAB credentials not configured for CA provider '{ca_provider}'")
-        
+            if self.requires_eab(ca_provider):
+                raise ValueError(f"EAB credentials not configured for CA provider '{ca_provider}'")
+            if eab_key_id or eab_hmac_key:
+                # Exactly one half of the pair — proceeding without EAB is
+                # the only option, but silently dropping a half-configured
+                # binding makes the eventual registration failure baffling.
+                logger.warning(
+                    f"Incomplete EAB credentials for CA provider '{ca_provider}' "
+                    f"(only {'Key ID' if eab_key_id else 'HMAC key'} is set); "
+                    f"proceeding without EAB"
+                )
+            return None, None
+
         return eab_key_id, eab_hmac_key
     
     def create_ca_trust_bundle(self, ca_provider: str, account_config: Dict[str, Any] = None) -> Optional[str]:
@@ -195,8 +253,21 @@ class CAManager:
     def build_certbot_command(self, domain: str, email: str, ca_provider: str,
                             dns_provider: str, dns_config: Dict[str, Any],
                             account_config: Dict[str, Any], staging: bool = False,
-                            cert_dir: Path = None, san_domains: list = None) -> tuple:
+                            cert_dir: Path = None, san_domains: list = None,
+                            key_type: Optional[str] = None,
+                            key_size: Optional[int] = None,
+                            elliptic_curve: Optional[str] = None) -> tuple:
         """Build certbot command with CA-specific parameters.
+
+        Args:
+            key_type: Optional 'rsa' or 'ecdsa'. When omitted, no
+                ``--key-type`` flag is emitted and certbot picks its own
+                default (currently RSA-2048) — this preserves the
+                pre-feature behaviour for callers that don't opt in.
+            key_size: RSA key size in bits (2048/3072/4096). Required when
+                ``key_type='rsa'`` and ignored otherwise.
+            elliptic_curve: ECDSA curve name (secp256r1/secp384r1).
+                Required when ``key_type='ecdsa'`` and ignored otherwise.
 
         Returns:
             Tuple of (certbot_cmd list, extra_env dict) — extra_env contains
@@ -223,6 +294,13 @@ class CAManager:
             for san in san_domains:
                 certbot_cmd.extend(['-d', san])
 
+        # Key type / size flags. Only emitted when the caller explicitly
+        # picked one — leaving them off keeps the previous certbot default.
+        if key_type == 'rsa' and key_size:
+            certbot_cmd.extend(['--key-type', 'rsa', '--rsa-key-size', str(key_size)])
+        elif key_type == 'ecdsa' and elliptic_curve:
+            certbot_cmd.extend(['--key-type', 'ecdsa', '--elliptic-curve', elliptic_curve])
+
         # Add directory configuration if provided
         if cert_dir:
             cert_output_dir = cert_dir / domain
@@ -234,14 +312,14 @@ class CAManager:
                 '--logs-dir', str(cert_output_dir / 'logs')
             ])
 
-        # Add EAB credentials if required
-        if self.requires_eab(ca_provider):
-            eab_key_id, eab_hmac_key = self.get_eab_credentials(ca_provider, account_config)
-            if eab_key_id and eab_hmac_key:
-                certbot_cmd.extend([
-                    '--eab-kid', eab_key_id,
-                    '--eab-hmac-key', eab_hmac_key
-                ])
+        # Add EAB credentials if required — or optionally configured for
+        # a private CA whose ACME server enforces account binding.
+        eab_key_id, eab_hmac_key = self.get_eab_credentials(ca_provider, account_config)
+        if eab_key_id and eab_hmac_key:
+            certbot_cmd.extend([
+                '--eab-kid', eab_key_id,
+                '--eab-hmac-key', eab_hmac_key
+            ])
 
         # Add CA bundle for private CAs (pass via extra_env, not os.environ)
         if ca_provider == 'private_ca':
@@ -259,8 +337,10 @@ class CAManager:
         ca_info = self.ca_providers[ca_provider]
         
         # Check required fields based on CA provider
-        if ca_provider in ['digicert', 'zerossl', 'google', 'sslcom']:
-            if not config.get('eab_key_id') or not config.get('eab_hmac_key'):
+        if ca_info['requires_eab']:
+            has_kid = config.get('eab_key_id') or config.get('eab_kid')
+            has_hmac = config.get('eab_hmac_key') or config.get('eab_hmac')
+            if not has_kid or not has_hmac:
                 return False, f"{ca_info['name']} requires EAB Key ID and HMAC Key"
         
         elif ca_provider == 'private_ca':
@@ -289,17 +369,16 @@ class CAManager:
         }
         
         # Add provider-specific display info
-        if ca_provider in ['digicert', 'zerossl', 'google', 'sslcom']:
-            display_info['eab_configured'] = bool(config.get('eab_key_id'))
+        if self.requires_eab(ca_provider):
+            display_info['eab_configured'] = bool(
+                config.get('eab_key_id') or config.get('eab_kid')
+            )
         elif ca_provider == 'private_ca':
             display_info['acme_url'] = config.get('acme_url', '')
             display_info['ca_cert_configured'] = bool(config.get('ca_cert'))
+            display_info['eab_configured'] = bool(
+                config.get('eab_key_id') or config.get('eab_kid')
+            )
         
         return display_info
 
-    def _get_letsencrypt_directory_url(self, environment: str = 'production') -> str:
-        """Get Let's Encrypt directory URL for the specified environment"""
-        if environment == 'staging':
-            return self.ca_providers['letsencrypt']['staging_url']
-        else:
-            return self.ca_providers['letsencrypt']['production_url']

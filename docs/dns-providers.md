@@ -1,6 +1,6 @@
 # DNS Providers
 
-CertMate supports **24 DNS providers** for Let's Encrypt DNS-01 challenges through individual certbot plugins.
+CertMate supports a wide range of DNS providers for Let's Encrypt DNS-01 challenges through individual certbot plugins. The full list is in the table below.
 
 ---
 
@@ -13,6 +13,7 @@ CertMate supports **24 DNS providers** for Let's Encrypt DNS-01 challenges throu
 | **Azure DNS** | `certbot-dns-azure` | Service Principal | Major Cloud |
 | **Google Cloud DNS** | `certbot-dns-google` | Service Account JSON | Major Cloud |
 | **PowerDNS** | `certbot-dns-powerdns` | API URL, API Key | Enterprise |
+| **EfficientIP SOLIDserver** | custom REST API script | Host, API Credentials | Enterprise |
 | **DNS Made Easy** | `certbot-dns-dnsmadeeasy` | API Key, Secret Key | Enterprise |
 | **NS1** | `certbot-dns-nsone` | API Key | Enterprise |
 | **DigitalOcean** | `certbot-dns-digitalocean` | API Token | Cloud |
@@ -33,6 +34,9 @@ CertMate supports **24 DNS providers** for Let's Encrypt DNS-01 challenges throu
 | **Hurricane Electric** | `certbot-dns-he-ddns` | Username, Password | Free DNS |
 | **Dynu** | `certbot-dns-dynudns` | API Token | Dynamic DNS |
 | **DuckDNS** | `certbot-dns-duckdns` | Account Token | Free DDNS (no domain required) |
+| **deSEC** | `certbot-dns-desec` | API Token | Free, EU (DE), DNSSEC — delegate NS to `ns1.desec.io` / `ns2.desec.org` |
+| **Scaleway** | `certbot-dns-scaleway` | API Secret Key | EU (FR) sovereign cloud — community plugin (alpha), install separately: `pip install certbot-dns-scaleway` |
+| **Custom Script** | none (certbot core `--manual`) | Auth hook script path (+ optional cleanup hook) | Bring your own |
 
 ---
 
@@ -133,6 +137,25 @@ curl -X POST http://localhost:8000/api/settings \
     "powerdns": {
       "api_url": "https://your-powerdns-server:8081",
       "api_key": "your_powerdns_api_key"
+```
+    }
+  }
+}
+```
+
+### EfficientIP SOLIDserver
+
+```json
+{
+  "dns_provider": "solidserver",
+  "dns_providers": {
+    "solidserver": {
+      "host": "your-solidserver.example.com",
+      "username": "user",
+      "password": "password",
+      "dns_name": "dns_name",
+      "dnsview_name": "optionnal",
+      "propagation_seconds": 120
     }
   }
 }
@@ -373,6 +396,79 @@ Because DuckDNS only stores one TXT record per domain at a time, a single
 certbot run per DuckDNS subdomain is required — SAN certificates that span
 multiple DuckDNS subdomains are not supported.
 
+### Custom Script (bring your own provider)
+
+For DNS providers without a certbot plugin — Oracle Cloud (OCI), in-house DNS,
+appliance APIs — point CertMate at your own scripts and it drives them through
+certbot's core `--manual` mode. No plugin installation required.
+
+```json
+{
+  "dns_provider": "custom-script",
+  "dns_providers": {
+    "custom-script": {
+      "auth_hook": "/usr/local/bin/certmate-dns-auth.sh",
+      "cleanup_hook": "/usr/local/bin/certmate-dns-cleanup.sh"
+    }
+  }
+}
+```
+
+certbot invokes the auth hook once per validation challenge with the standard
+[manual-hook environment](https://eff-certbot.readthedocs.io/en/stable/using.html#hooks):
+`CERTBOT_DOMAIN` (the domain being validated) and `CERTBOT_VALIDATION`
+(the TXT value). The script must create the
+`_acme-challenge.$CERTBOT_DOMAIN` TXT record **and wait until it has
+propagated** — certbot validates immediately after the hook returns.
+The optional cleanup hook runs after validation to remove the record.
+
+Worked example for OCI DNS (covers [#285](https://github.com/fabriziosalmi/certmate/issues/285)). Note that a certificate covering both `example.com` and `*.example.com` produces TWO validation challenges on the same `_acme-challenge.example.com` name, and certbot runs all auth hooks before validating — so the hook must APPEND to the TXT rrset, never replace it (a plain `rrset update` would wipe the first token with the second):
+
+```bash
+#!/bin/sh
+# /usr/local/bin/certmate-dns-auth.sh
+set -eu
+ZONE="example.com"
+NAME="_acme-challenge.${CERTBOT_DOMAIN}"
+# Merge the new validation token with any records already on the name
+# (apex + wildcard certs place two TXT values on the same name).
+EXISTING=$(oci dns record rrset get --zone-name-or-id "$ZONE" \
+  --domain "$NAME" --rtype TXT \
+  --query 'data.items[].rdata' --raw-output 2>/dev/null || echo '[]')
+ITEMS=$(printf '%s' "$EXISTING" | python3 -c "
+import json, os, sys
+name = os.environ['NAME']
+rdata = [r.strip('\"') for r in json.load(sys.stdin)]
+rdata.append(os.environ['CERTBOT_VALIDATION'])
+print(json.dumps([
+    {'domain': name, 'rdata': v, 'rtype': 'TXT', 'ttl': 60} for v in rdata
+]))
+")
+NAME="$NAME" oci dns record rrset update --force \
+  --zone-name-or-id "$ZONE" \
+  --domain "$NAME" \
+  --rtype TXT \
+  --items "$ITEMS"
+sleep "${CERTMATE_DNS_PROPAGATION_SECONDS:-60}"
+```
+
+Requirements and trust model:
+
+- Paths must be **absolute**, the files must exist, be **executable**,
+  must not be world-writable, and must not contain whitespace or shell
+  metacharacters (certbot executes hooks through the shell). Validated at
+  issuance and by the test-provider API endpoint
+  (`POST /api/web/certificates/test-provider`)
+- Scripts run with CertMate's privileges — same trust model as deploy
+  hooks: only admins can configure them, treat them as part of your
+  deployment
+- The per-provider `dns_propagation_seconds` setting is exported to the
+  scripts as `CERTMATE_DNS_PROPAGATION_SECONDS` (an account-level
+  `propagation_seconds` field overrides it)
+- Renewals replay the hook paths from certbot's renewal configuration:
+  keep the scripts at a stable path (if you move them, reissue)
+- Wildcard certificates work (the hook receives each validation record)
+
 ---
 
 ## Creating Certificates
@@ -572,6 +668,16 @@ Cloudflare, PowerDNS, and Route53 all use the same request shape:
 ```
 
 For ACME-DNS, `domain_alias` must exactly match the configured ACME-DNS `subdomain`/fulldomain. CertMate updates that ACME-DNS record directly and does not attempt cleanup because ACME-DNS stores the latest validation value.
+
+For **RFC2136** (BIND, Technitium, and other dynamic-update servers), `domain_alias` writes the `_acme-challenge.<alias>` TXT into the alias zone with a TSIG-signed dynamic update, using the same `nameserver` / `tsig_key` / `tsig_secret` (and optional `tsig_algorithm`, default HMAC-SHA512) as normal issuance. CertMate discovers the owning zone from the server's SOA, so one TSIG key can serve several zones — including externally-managed domains whose owners only added the delegating CNAME:
+
+```json
+{
+  "domain": "external.example.com",
+  "dns_provider": "rfc2136",
+  "domain_alias": "internal.example.net"
+}
+```
 
 ### Wildcard Certificates with Domain Alias
 

@@ -26,7 +26,7 @@
             keys: {},
             loading: true,
             createdToken: '',
-            newKey: { name: '', role: 'viewer', expires_at: '', allowed_domains: '' },
+            newKey: { name: '', role: 'viewer', expires_at: '', allowed_domains: '', is_agent: false },
 
             loadKeys: function () {
                 var self = this;
@@ -103,6 +103,11 @@
                 if (domains !== undefined) {
                     payload.allowed_domains = domains;
                 }
+                // Mark this key as belonging to an AI/MCP agent so its actions
+                // are attributed in the audit trail as actor.kind='agent'.
+                if (self.newKey.is_agent) {
+                    payload.is_agent = true;
+                }
                 fetch('/api/keys', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -113,7 +118,7 @@
                         return r.json().then(function (data) {
                             if (r.ok) {
                                 self.createdToken = data.token;
-                                self.newKey = { name: '', role: 'viewer', expires_at: '', allowed_domains: '' };
+                                self.newKey = { name: '', role: 'viewer', expires_at: '', allowed_domains: '', is_agent: false };
                                 self.loadKeys();
                                 showMessage('API key "' + data.name + '" created', 'success');
                             } else {
@@ -178,4 +183,64 @@
     }
 
     window.apiKeyManager = apiKeyManager;
+
+    // Configurable API rate limits (#319). Self-contained: reads/writes the
+    // dedicated /api/settings/rate-limits endpoint, independent of the main
+    // settings form.
+    function rateLimitManager() {
+        return {
+            enabled: true,
+            limits: {},
+            keys: [],
+            loading: true,
+            saving: false,
+            load: function () {
+                var self = this;
+                fetch('/api/settings/rate-limits', { credentials: 'same-origin' })
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) {
+                        self.enabled = d.enabled !== false;
+                        self.keys = Object.keys(d.defaults || {});
+                        self.limits = Object.assign({}, d.defaults || {}, d.limits || {});
+                        self.loading = false;
+                    })
+                    .catch(function () {
+                        self.loading = false;
+                        showMessage('Failed to load rate limits', 'error');
+                    });
+            },
+            save: function () {
+                var self = this;
+                self.saving = true;
+                var limits = {};
+                self.keys.forEach(function (k) {
+                    var v = parseInt(self.limits[k], 10);
+                    if (!isNaN(v)) limits[k] = v;
+                });
+                fetch('/api/settings/rate-limits', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ enabled: self.enabled, limits: limits })
+                })
+                    .then(function (r) {
+                        return r.json().then(function (b) { return { ok: r.ok, b: b }; });
+                    })
+                    .then(function (res) {
+                        self.saving = false;
+                        if (res.ok) showMessage('Rate limits saved', 'success');
+                        else showMessage((res.b && res.b.error) || 'Failed to save rate limits', 'error');
+                    })
+                    .catch(function () {
+                        self.saving = false;
+                        showMessage('Failed to save rate limits', 'error');
+                    });
+            },
+            label: function (k) {
+                return k.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+            }
+        };
+    }
+
+    window.rateLimitManager = rateLimitManager;
 })();

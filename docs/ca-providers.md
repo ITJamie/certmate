@@ -15,8 +15,20 @@ CertMate supports multiple Certificate Authority providers, allowing you to choo
 - **Best For**: Development, small businesses, personal projects
 
 **Configuration:**
-- **Environment**: Production or Staging
 - **Email**: Required for certificate notifications
+
+### Let's Encrypt (Staging)
+
+- **Type**: Test certificates from the Let's Encrypt staging environment
+- **Certificate Types**: Domain Validation (DV) — NOT trusted by browsers
+- **Wildcard Support**: Yes
+- **EAB Required**: No
+- **Best For**: Validating DNS, deployment and renewal setup without consuming production rate limits
+
+Staging is a separate Certificate Authority entry (since v2.12.0), not a per-certificate
+flag: select it as the CA when creating a certificate, or set it as the default CA while
+testing. The email falls back to the Let's Encrypt account email when left empty.
+Converting a staging certificate to production requires a reissue with the production CA.
 
 ### DigiCert ACME
 
@@ -32,6 +44,26 @@ CertMate supports multiple Certificate Authority providers, allowing you to choo
 - **EAB HMAC Key**: Provided by DigiCert
 - **Email**: Required for certificate notifications
 
+### Actalis
+
+- **Type**: Free 90-day DV certificates from a European (Italian) CA
+- **Certificate Types**: Domain Validation (DV)
+- **Wildcard Support**: No (not offered via ACME)
+- **EAB Required**: Yes
+- **Best For**: EU users who want a European alternative to Let's Encrypt, eIDAS-ecosystem environments
+
+**Configuration Requirements:**
+- **ACME Directory URL**: `https://acme-api.actalis.com/acme/directory` (fixed, preconfigured)
+- **EAB Key ID**: From your Actalis customer area
+- **EAB HMAC Key**: From your Actalis customer area
+- **Email**: Required for certificate notifications
+
+**Free plan limits:**
+- Single-domain certificates only — a request with SAN entries is rejected with
+  `Your account only grants single-domain 90-days DV certificates`
+- 90-day validity
+- No wildcard certificates (paid SAN plans cover up to 5 hostnames)
+
 ### Private CA
 
 - **Type**: Internal/Corporate Certificate Authority
@@ -45,6 +77,14 @@ CertMate supports multiple Certificate Authority providers, allowing you to choo
 - [Boulder](https://github.com/letsencrypt/boulder)
 - [Pebble](https://github.com/letsencrypt/pebble)
 - Other ACME-compatible private CAs
+
+**Using a public ACME CA through Private CA:**
+
+The Private CA entry is also the generic escape hatch for any ACME CA without a dedicated CertMate entry: point it at the CA's directory URL and, if the CA enforces account binding, fill in the optional EAB Key ID and HMAC Key. For example, Actalis works both through its dedicated entry (recommended) and as a Private CA with:
+
+- **ACME Directory URL**: `https://acme-api.actalis.com/acme/directory`
+- **EAB Key ID / HMAC Key**: from the Actalis customer area
+- **CA Certificate**: leave empty (publicly trusted roots)
 
 ---
 
@@ -80,7 +120,7 @@ curl -X POST http://localhost:8000/api/certificates/create \
   }'
 
 # Test CA connection
-curl -X POST http://localhost:8000/api/test-ca-provider \
+curl -X POST http://localhost:8000/api/settings/test-ca-provider \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -98,7 +138,7 @@ curl -X POST http://localhost:8000/api/test-ca-provider \
 
 ## External Account Binding (EAB)
 
-Some CA providers (like DigiCert) require External Account Binding to link your ACME client to your CA account.
+Some CA providers (like DigiCert and Actalis) require External Account Binding to link your ACME client to your CA account.
 
 ### What is EAB?
 
@@ -111,6 +151,11 @@ Some CA providers (like DigiCert) require External Account Binding to link your 
 1. Log into your DigiCert account
 2. Navigate to ACME settings
 3. Generate or retrieve your EAB Key ID and HMAC Key
+
+**Actalis:**
+1. Register a free account at [actalis.com](https://www.actalis.com/)
+2. In the customer area, open **Manage with ACME**
+3. Retrieve the KID and HMAC key under **ACME Credentials**
 
 **Private CA:**
 - **step-ca**: EAB can be enabled/disabled per provisioner
@@ -139,13 +184,19 @@ You can optionally provide the root CA certificate in CertMate for trust chain v
 ## Troubleshooting
 
 ### Let's Encrypt
-- **Staging URL accessible**: Verify internet connectivity
+- **Untrusted certificate after issuance**: Check whether the certificate was issued by the staging CA — select the production "Let's Encrypt" entry and reissue
+- **Rate limited**: Switch to the "Let's Encrypt (Staging)" CA entry while testing
 - **Email valid**: Ensure email format is correct
 
 ### DigiCert
 - **Invalid EAB credentials**: Verify Key ID and HMAC Key
 - **Account not authorized**: Ensure ACME is enabled on your DigiCert account
 - **Wrong ACME URL**: Verify the directory URL with DigiCert support
+
+### Actalis
+- **`Your account only grants single-domain 90-days DV certificates`**: The free plan rejects SAN/multi-domain requests — issue one certificate per hostname or upgrade the plan
+- **Invalid EAB credentials**: Retrieve fresh credentials from the customer area under Manage with ACME
+- **Wildcard rejected**: Wildcard certificates are not available via ACME at Actalis
 
 ### Private CA
 - **ACME URL unreachable**: Check network connectivity
@@ -192,6 +243,10 @@ You can optionally provide the root CA certificate in CertMate for trust chain v
 ### DigiCert
 - [ACME Documentation](https://docs.digicert.com/certificate-tools/acme-user-guide/)
 - [Account Setup](https://docs.digicert.com/certificate-tools/acme-user-guide/acme-account-setup/)
+
+### Actalis
+- [How to enable ACME](https://guide.actalis.com/ssl/activation/acme)
+- [ACME FAQ](https://guide.actalis.com/faq/SSL/ACME)
 
 ### Private CA
 - [step-ca Documentation](https://smallstep.com/docs/step-ca/)

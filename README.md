@@ -9,9 +9,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://hub.docker.com/)
-[![API Documentation](https://img.shields.io/badge/API-Swagger-green)](http://localhost:8000/docs/)
+[![API Documentation](https://img.shields.io/badge/API-Swagger-green)](#api-usage)
+[![PyPI - certmate-cli](https://img.shields.io/pypi/v/certmate-cli?label=certmate-cli&color=3775A9)](https://pypi.org/project/certmate-cli/)
 [![CI](https://github.com/fabriziosalmi/certmate/actions/workflows/ci.yml/badge.svg)](https://github.com/fabriziosalmi/certmate/actions/workflows/ci.yml)
 [![Build Multi-Platform Docker Images](https://github.com/fabriziosalmi/certmate/actions/workflows/docker-multiplatform.yml/badge.svg)](https://github.com/fabriziosalmi/certmate/actions/workflows/docker-multiplatform.yml)
+[![CodeQL](https://github.com/fabriziosalmi/certmate/actions/workflows/codeql.yml/badge.svg)](https://github.com/fabriziosalmi/certmate/actions/workflows/codeql.yml)
+[![OSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/fabriziosalmi/certmate/badge)](https://securityscorecards.dev/viewer/?uri=github.com/fabriziosalmi/certmate)
+[![codecov](https://codecov.io/gh/fabriziosalmi/certmate/branch/main/graph/badge.svg)](https://codecov.io/gh/fabriziosalmi/certmate)
 [![European Open Source](https://img.shields.io/badge/European%20Open%20Source-Catalogue-0046ad)](https://europeanopensource.eu/)
 [![Listed on Hacker News](https://img.shields.io/badge/Listed%20on-Hacker%20News-F0652F)](https://news.ycombinator.com/item?id=44427452)
 [![Listed on Reddit](https://img.shields.io/badge/Listed%20on-Reddit-FF4500)](https://www.reddit.com/r/selfhosted/comments/1lkvbcj/ssl_certificates_automation/)
@@ -20,9 +24,47 @@
  
 ![screenshot1](screenshot_1.png)
 
-[Quick Start](#quick-start-with-docker) • [Documentation](#documentation) • [Installation](#installation-methods) • [DNS Providers](#supported-dns-providers) • [CA Providers](docs/ca-providers.md) • [Storage Backends](#certificate-storage-configuration) • [Backup and Recovery](#backup-and-recovery) • [API Reference](#api-usage)
+[Quick Start](#quick-start-with-docker) • [CLI](#command-line-interface) • [Documentation](#documentation) • [Installation](#installation-methods) • [DNS Providers](#supported-dns-providers) • [CA Providers](docs/ca-providers.md) • [Storage Backends](#certificate-storage-configuration) • [Backup and Recovery](#backup-and-recovery) • [API Reference](#api-usage)
 
 </div>
+
+---
+
+## Ecosystem
+
+CertMate is the open-source core of a small, focused toolset:
+
+- **[certmate-tools](https://github.com/fabriziosalmi/certmate-tools)** — free, privacy-first, client-side TLS / certificate / ACME diagnostics (runs entirely in your browser).
+- **[certmate-agent](https://github.com/fabriziosalmi/certmate-agent)** — conversational assistant: a local LLM mapped 1:1 to CertMate's REST API, with RAG over the docs.
+- **[nis2-public](https://github.com/fabriziosalmi/nis2-public)** — NIS2 continuous posture management & remediation.
+
+**Enterprise / high-scale** — multi-tenant, mTLS, white-label and NIS2-aligned deployments are available through *CertMate-ng* (source-available, BSL 1.1, EU-built). For access or a deployment discussion, email **fabrizio.salmi@gmail.com**.
+
+---
+
+## Command-line interface
+
+The whole certificate lifecycle from your terminal — `pip install certmate-cli`:
+
+![CertMate CLI — the full SSL certificate lifecycle from the terminal](demo/certmate-cli.gif)
+
+```bash
+pip install certmate-cli
+
+export CERTMATE_URL=https://certmate.example.com
+export CERTMATE_TOKEN=...                 # omit on a fresh (setup-mode) instance
+
+certmate health
+certmate cert create app.example.com --dns cloudflare --wait   # issue, block until live
+certmate cert ls
+certmate cert info app.example.com
+certmate audit verify
+```
+
+`certmate-cli` is a thin layer over **`certmate-sdk`** (`pip install certmate-sdk`) — a small,
+`httpx`-based Python client for the same REST API the web UI and MCP server drive. Both are
+first-party, live in [`clients/`](clients/), and are published to PyPI. The clip above is a real
+issuance over DNS-01 (Let's Encrypt staging); see [`demo/`](demo/).
 
 ---
 
@@ -31,7 +73,7 @@
 CertMate solves the complexity of SSL certificate management in modern distributed architectures. Whether you're running a single application or managing certificates across multiple datacenters, CertMate provides:
 
 - **Zero-Downtime Automation** - Certificates renew automatically 30 days before expiry, with deploy hooks to reload services
-- **Multi-Cloud Support** - Works with **23 DNS providers** (Cloudflare, AWS, Azure, GCP, Akamai Edge DNS, Hetzner, Porkbun, GoDaddy, and more)
+- **Multi-Cloud Support** - Works with two dozen+ DNS providers (Cloudflare, AWS, Azure, GCP, Akamai Edge DNS, Hetzner, Porkbun, GoDaddy, and more — see [docs/dns-providers.md](docs/dns-providers.md) for the full list)
 - **Enterprise-Ready** - RBAC, scoped API keys, Docker, Kubernetes, REST API, and monitoring built-in
 - **Simple Integration** - One-URL certificate downloads for easy automation
 - **Security-First** - Role-based access control, scoped API keys, audit logging, HMAC-signed webhooks
@@ -41,9 +83,10 @@ CertMate solves the complexity of SSL certificate management in modern distribut
 ## Key Features
 
 ### **Certificate Management**
-- **Multiple CA Providers** - Support for Let's Encrypt, DigiCert ACME, and Private CAs
-- **Let's Encrypt Integration** - Free, automated SSL certificates with staging/production environments
+- **Multiple CA Providers** - Support for Let's Encrypt, ZeroSSL, Google Trust Services, Actalis, DigiCert ACME, SSL.com, and Private CAs
+- **Let's Encrypt Integration** - Free, automated SSL certificates, with the staging environment available as a dedicated CA entry for testing
 - **DigiCert ACME Support** - Enterprise-grade certificates with External Account Binding (EAB)
+- **Actalis Support** - Free 90-day DV certificates from a European CA via ACME with EAB
 - **Private CA Support** - Internal/corporate CAs with custom trust bundles and ACME compatibility
 - **Wildcard Support** - Single certificate for `*.example.com` and `example.com`
 - **Multi-Domain Certificates** - SAN certificates for multiple domains
@@ -51,6 +94,7 @@ CertMate solves the complexity of SSL certificate management in modern distribut
 - **Automatic Renewal** - Smart renewal 30 days before expiry
 - **Certificate Validation** - Real-time SSL certificate status checking
 - **Per-Certificate CA Selection** - Choose different CAs for different certificates
+- **Zombie Certificate Scanner** - filesystem scanner to identify and clean up orphan ("zombie") certificates no longer tracked in the active configuration
 
 ### **Multi-DNS Provider Support**
 - **Multi-Account Support** - Manage multiple accounts per provider for enterprise environments
@@ -88,12 +132,13 @@ CertMate solves the complexity of SSL certificate management in modern distribut
 - **AWS Secrets Manager** - Scalable secret storage with AWS ecosystem integration and cross-region replication
 - **HashiCorp Vault** - Industry-standard secret management with versioning, audit logging, and fine-grained policies
 - **Infisical** - Modern open-source secret management with team collaboration and end-to-end encryption
+- **S3-Compatible Object Storage** - One backend for any S3 endpoint via a configurable endpoint URL (Hetzner, Contabo, OVHcloud, Scaleway, Exoscale, Wasabi, MinIO, AWS) — ideal for EU-sovereign object storage; no extra dependency
 - **Pluggable Architecture** - Easy to extend with additional storage backends
 - **Migration Support** - Seamless migration between storage backends without downtime
 - **Backward Compatibility** - Existing installations continue working without changes
 
 ### **Notifications & Automation**
-- **Multi-Channel Notifications** - Email (SMTP), Slack, Discord, and generic webhooks
+- **Multi-Channel Notifications** - Email (SMTP), Slack, Discord, Telegram, ntfy, Gotify, and generic webhooks
 - **Webhook HMAC Signatures** - SHA-256 signed payloads for secure webhook verification
 - **Deploy Hooks** - Post-issuance shell commands to reload Nginx/Apache or run custom scripts
 - **Weekly Digest** - Scheduled email summary of certificate status and upcoming renewals
@@ -107,6 +152,7 @@ CertMate solves the complexity of SSL certificate management in modern distribut
 - **Audit Logging** - Complete certificate lifecycle tracking with timeline view
 - **Environment Variables** - Secure credential management
 - **Rate Limit Handling** - Let's Encrypt rate limit awareness
+- **Log Sanitizer** - Automatically redacts sensitive parameters, private keys, and API tokens from application logs
 
 ### **User Interface**
 - **Command Palette** - Cmd+K / Ctrl+K quick search and navigation
@@ -124,10 +170,11 @@ CertMate solves the complexity of SSL certificate management in modern distribut
 - **Deploy Hook API** - Configure and test post-issuance hooks via REST API
 - **Backup API** - Programmatic backup creation and restoration
 - **Swagger & ReDoc** - Interactive API documentation at `/docs/` and `/redoc/`
+- **Model Context Protocol (MCP) Server** - Built-in Node.js MCP server providing tools for agentic AI assistants to manage certificates and run diagnostics
 
 ## Supported DNS Providers
 
-CertMate supports **23 DNS providers** through Let's Encrypt DNS-01 challenge via individual certbot plugins that provide reliable, well-tested DNS challenge support. **Multi-account support** is available for major providers, enabling enterprise-grade deployments with separate accounts for production, staging, and disaster recovery.
+CertMate supports a wide range of DNS providers through Let's Encrypt DNS-01 challenge via individual certbot plugins that provide reliable, well-tested DNS challenge support. The complete list is in the table below. **Multi-account support** is available for major providers, enabling enterprise-grade deployments with separate accounts for production, staging, and disaster recovery.
 
 | Provider               | Credentials Required          | Multi-Account | Use Case                        | Status     |
 | ---------------------- | ----------------------------- | ------------- | ------------------------------- | ---------- |
@@ -137,6 +184,7 @@ CertMate supports **23 DNS providers** through Let's Encrypt DNS-01 challenge vi
 | **Google Cloud DNS**   | Service Account JSON          | **Yes**       | Google Cloud Platform           | **Stable** |
 | **DigitalOcean**       | API Token                     | **Yes**       | Cloud infrastructure            | **Stable** |
 | **PowerDNS**           | API URL, API Key              | **Yes**       | Self-hosted, On-premises        | **Stable** |
+| **EfficientIP SOLIDserver** | Host, API Credentials     | **Yes**       | Enterprise DDI / Smart Architecture | **Stable** |
 | **RFC2136**            | Nameserver, TSIG Key/Secret   | **Yes**       | Standard DNS update protocol    | **Stable** |
 | **Linode** (Akamai Connected Cloud) | API Key             | Single        | Cloud hosting                   | **Stable** |
 | **Akamai Edge DNS**    | EdgeGrid (.edgerc) credentials| Single        | Enterprise managed DNS          | **Stable** |
@@ -146,7 +194,8 @@ CertMate supports **23 DNS providers** through Let's Encrypt DNS-01 challenge vi
 | **Vultr**              | API Key                       | Single        | Global cloud infrastructure     | **Stable** |
 | **DNS Made Easy**      | API Key, Secret Key           | Single        | Enterprise DNS management       | **Stable** |
 | **NS1**                | API Key                       | Single        | Intelligent DNS platform        | **Stable** |
-| **Hetzner**            | API Token                     | Single        | European cloud hosting          | **Stable** |
+| **Hetzner** (legacy DNS) | API Token                   | Single        | European cloud hosting          | **Stable** |
+| **Hetzner Cloud**      | API Token                     | Single        | Hetzner Cloud DNS (hcloud)      | **Stable** |
 | **Porkbun**            | API Key, Secret Key           | Single        | Domain registrar with DNS       | **Stable** |
 | **GoDaddy**            | API Key, Secret               | Single        | Popular domain registrar        | **Stable** |
 | **Hurricane Electric** | Username, Password            | Single        | Free DNS hosting                | **Stable** |
@@ -154,12 +203,16 @@ CertMate supports **23 DNS providers** through Let's Encrypt DNS-01 challenge vi
 | **ArvanCloud**         | API Key                       | Single        | Iranian cloud provider          | **Stable** |
 | **Infomaniak**         | API Token                     | Single        | Swiss ISP & cloud provider      | **Stable** |
 | **ACME-DNS**           | JSON Config                   | Single        | Generic ACME-DNS server         | **Stable** |
+| **Scaleway**           | API Token (secret key)        | Single        | European cloud (EU-sovereign)   | **Stable** |
+| **deSEC**              | API Token                     | Single        | Free, non-profit DNSSEC DNS     | **Stable** |
+| **DuckDNS**            | Token                         | Single        | Free dynamic DNS                | **Stable** |
+| **Custom Script**      | User-provided hook scripts    | Single        | Any provider via custom hooks   | **Stable** |
 
 ### Provider Categories
 
 - **Enterprise Multi-Account**: Cloudflare, AWS Route53, Azure DNS, Google Cloud DNS, DigitalOcean, PowerDNS, RFC2136
 - **Cloud Providers**: AWS Route53, Azure DNS, Google Cloud DNS, DigitalOcean, Linode, Akamai Edge DNS, Vultr, Hetzner
-- **Enterprise DNS**: Cloudflare, DNS Made Easy, NS1, PowerDNS
+- **Enterprise DNS**: Cloudflare, DNS Made Easy, NS1, PowerDNS, EfficientIP SOLIDserver
 - **Domain Registrars**: Gandi, OVH, Namecheap, Porkbun, GoDaddy 
 - **European Providers**: OVH, Gandi, Hetzner
 - **Free Services**: Hurricane Electric, Dynu
@@ -235,11 +288,12 @@ CLOUDFLARE_TOKEN=your_cloudflare_api_token_here
 # Optional: Application Settings
 SECRET_KEY=your_flask_secret_key_here
 FLASK_ENV=production
-HOST=0.0.0.0
+# Bind to localhost by default; front it with a reverse proxy for external access.
+HOST=127.0.0.1
 PORT=8000
 ```
 
-> **Storage Backends**: By default, certificates are stored locally. For enterprise deployments, you can configure Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, or Infisical via the web interface after startup. See [Storage Backends](#certificate-storage-configuration) for details.
+> **Storage Backends**: By default, certificates are stored locally. For enterprise deployments, you can configure Azure Key Vault, AWS Secrets Manager, HashiCorp Vault, Infisical, or any S3-compatible object storage via the web interface after startup. See [Storage Backends](#certificate-storage-configuration) for details.
 
 > **Backup Best Practices**: CertMate includes a unified backup system that creates atomic snapshots of both settings and certificates. After setup, create your first backup from Settings → Backup Management.
 
@@ -305,8 +359,9 @@ docker-compose up -d
 # Build and push to Docker Hub for all platforms
 ./build-multiplatform.sh -r YOUR_DOCKERHUB_USERNAME -p
 
-# Use pre-built multi-platform image
-docker run --platform linux/arm64 -d --name certmate --env-file .env -p 8000:8000 USERNAME/certmate:latest
+# Use pre-built multi-platform image (bound to localhost; put it behind a
+# reverse proxy and enable authentication before exposing it externally)
+docker run --platform linux/arm64 -d --name certmate --env-file .env -p 127.0.0.1:8000:8000 fabriziosalmi/certmate:latest
 ```
 
 > **Multi-Platform Guide**: See [Docker Guide](docs/docker.md) for comprehensive multi-architecture setup instructions.
@@ -340,36 +395,48 @@ For container orchestration and high availability deployments.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
- name: certmate
+  name: certmate
 spec:
- replicas: 2
- selector:
- matchLabels:
- app: certmate
- template:
- metadata:
- labels:
- app: certmate
- spec:
- containers:
- - name: certmate
- image: certmate:latest
- ports:
- - containerPort: 8000
- env:
- - name: API_BEARER_TOKEN
- valueFrom:
- secretKeyRef:
- name: certmate-secrets
- key: api-token
- volumeMounts:
- - name: certificates
- mountPath: /app/certificates
- volumes:
- - name: certificates
- persistentVolumeClaim:
- claimName: certmate-certificates
+  replicas: 1
+  selector:
+    matchLabels:
+      app: certmate
+  template:
+    metadata:
+      labels:
+        app: certmate
+    spec:
+      containers:
+        - name: certmate
+          image: certmate:latest
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1536Mi
+          env:
+            - name: API_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: certmate-secrets
+                  key: api-token
+            - name: CERTMATE_CERT_INFO_CACHE_TTL
+              value: "60"
+          volumeMounts:
+            - name: certificates
+              mountPath: /app/certificates
+      volumes:
+        - name: certificates
+          persistentVolumeClaim:
+            claimName: certmate-certificates
 ```
+
+For production sizing, OOM troubleshooting, and a `kubectl patch` example, see
+[Kubernetes Production Notes](docs/kubernetes.md).
 
 ### System Package Installation
 For system-wide installation on Linux distributions.
@@ -554,6 +621,64 @@ If the service fails to start:
 
 For more detailed installation instructions, see the [Installation Guide](docs/installation.md).
 
+## Single Sign-On (OIDC/SSO)
+
+CertMate supports authenticating users against an external OpenID Connect provider (Keycloak, Authentik, Okta, Google Workspace, Microsoft Entra, ...) using the Authorization Code + PKCE flow. SSO is **additive**: local username/password login and API keys keep working alongside it.
+
+### Configuring an IdP
+
+1. Open the CertMate UI as an admin → **Settings → SSO**.
+2. Set the **Issuer URL** to the IdP's base URL (the path before `/.well-known/openid-configuration`). For example:
+   - Keycloak: `https://idp.example.com/realms/main`
+   - Authentik: `https://idp.example.com/application/o/certmate/`
+   - Google: `https://accounts.google.com`
+3. Fill in the **Client ID** and **Client Secret** issued by the IdP for the CertMate application.
+4. In the IdP, register CertMate's callback URL as a valid redirect URI:
+
+   ```
+   https://your-certmate.example.com/api/auth/oidc/callback
+   ```
+
+5. Pick the claim names your IdP uses for username (`preferred_username` by default), email (`email`), and role (`groups`). Add **Role mappings** to translate IdP group/role claim values to CertMate roles — first match wins. Anything that doesn't match falls back to the configured **Default role** (`viewer` recommended).
+6. Toggle **Enable OIDC/SSO** on and save. Visit `/login` in a new browser session to see the **Sign in with <Provider>** button.
+
+### Role mapping example
+
+For a Keycloak realm that exposes a `groups` claim, the configuration block in `settings.json` looks like:
+
+```json
+"oidc": {
+  "enabled": true,
+  "provider_name": "Keycloak",
+  "issuer_url": "https://idp.example.com/realms/main",
+  "client_id": "certmate",
+  "client_secret": "********",
+  "scopes": ["openid", "email", "profile", "groups"],
+  "role_claim": "groups",
+  "role_mappings": [
+    { "claim_value": "certmate-admins",    "role": "admin" },
+    { "claim_value": "certmate-operators", "role": "operator" }
+  ],
+  "default_role": "viewer",
+  "auto_create_users": true,
+  "link_by_email": true
+}
+```
+
+### Provisioning and linking
+
+- **Just-in-time provisioning** (`auto_create_users`) creates a CertMate user row on first login. The row has an empty password hash so JIT-provisioned SSO accounts cannot fall back to local login.
+- **Email linking** (`link_by_email`) detects collisions with existing local users and merges identities — the user keeps their existing role and **their existing password hash**, so a local-then-linked account can still log in either way during a rollout. Disable `link_by_email` if you want JIT-only provisioning with no local-password fallback.
+- Subject (`sub` + `iss`) lookup always wins over email matching, so an already-linked SSO user is never accidentally re-merged when their IdP email changes.
+
+### Security
+
+- PKCE (S256) is enforced for every flow regardless of client type.
+- The id_token's signature, audience, issuer, expiry and nonce are validated server-side by Authlib using the IdP's published JWKS.
+- `client_secret` is masked (`********`) in every GET response and round-tripped safely through the Settings UI.
+- The `oidc` settings block is on the bulk-POST reject list — only the dedicated `/api/auth/oidc/settings` endpoint can mutate it, with full audit.
+- Failed callbacks count against the same per-IP rate limit as local login.
+
 ## API Usage
 
 CertMate provides a comprehensive REST API for programmatic certificate management. All endpoints require Bearer token authentication.
@@ -687,6 +812,10 @@ Authorization: Bearer your_token_here
 
 # Check certificate deployment status
 GET /api/certificates/example.com/deployment-status
+Authorization: Bearer your_token_here
+
+# Scan filesystem for orphan ("zombie") certificates no longer tracked by Certbot
+POST /api/certificates/zombies/scan
 Authorization: Bearer your_token_here
 ```
 
@@ -1744,6 +1873,14 @@ iptables -A INPUT -p tcp --dport 8000 -s 192.168.0.0/16 -j ACCEPT
 iptables -A INPUT -p tcp --dport 8000 -j DROP
 ```
 
+The rules above confine **inbound** access. You can also confine **outbound**
+traffic: route CertMate's HTTP(S) egress through a forward proxy and deny it any
+other route to the internet, so it can reach only your CA, DNS provider, object
+storage, and notification endpoints. With [Secure Proxy Manager](https://github.com/fabriziosalmi/secure-proxy-manager)
+v3.9.0+ this is a built-in default-deny egress allowlist. See
+[Confining outbound traffic](docs/installation.md#confining-outbound-traffic-egress-hardening)
+for a worked example.
+
 ### Performance Optimization
 
 #### Production Deployment
@@ -1754,7 +1891,14 @@ services:
   certmate:
     image: certmate:latest
     deploy:
-      replicas: 2
+      # CertMate runs an in-process renewal scheduler and per-domain locks, so
+      # it must run as a SINGLE writer. Multiple replicas (or >1 gunicorn
+      # worker) each fire the renewal check and would issue duplicate ACME
+      # orders and hit the CA's duplicate-certificate rate limit. A host-local
+      # flock guards multiple workers/containers on a *shared* data volume, but
+      # the safe default is one writer. For HA, front a single active instance
+      # rather than scaling this service.
+      replicas: 1
       resources:
         limits:
           cpus: '1.0'
@@ -1764,8 +1908,8 @@ services:
           memory: 256M
     environment:
       - FLASK_ENV=production
-      - GUNICORN_WORKERS=4
-      - GUNICORN_THREADS=2
+      - GUNICORN_WORKERS=1
+      - GUNICORN_THREADS=8
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -2013,6 +2157,11 @@ def metrics():
  return generate_latest()
 ```
 
+A ready-to-import **Grafana dashboard**, **Prometheus alert rules**, and an
+authenticated **scrape config** ship in [`monitoring/`](monitoring/) — see
+[monitoring/README.md](monitoring/README.md). The `/metrics` endpoint requires
+the admin role, so scrape it with an admin-scoped API token (Bearer).
+
 #### Log Aggregation
 ```yaml
 # docker-compose.logging.yml
@@ -2075,10 +2224,38 @@ CertMate includes a built-in notification system configurable from Settings > No
 - **Email (SMTP)** - Certificate expiry warnings and renewal confirmations
 - **Slack** - Incoming webhook integration for team channels
 - **Discord** - Webhook notifications for Discord servers
+- **Telegram** - Bot API messages (bot token + chat ID)
+- **ntfy** - Push to an [ntfy](https://ntfy.sh) topic (self-hostable); optional access token, per-message priority
+- **Gotify** - Push to a self-hosted [Gotify](https://gotify.net) server (server URL + app token, numeric priority)
 - **Generic Webhooks** - HTTP POST with HMAC-SHA256 signed payloads for custom integrations
 - **Weekly Digest** - Scheduled summary of certificate status and upcoming renewals
 
 All notification channels support per-event filtering (created, renewed, expiring, failed) and can be tested from the settings UI.
+
+> **Microsoft Teams:** no dedicated adapter is needed. Use a Teams channel's
+> built-in email address (channel → ... → Get email address) as a recipient on
+> the Email (SMTP) channel — Teams posts the message into the channel for you.
+
+### Downgrades & Recovery
+
+Downgrading to a version older than the one that wrote `settings.json` is not supported and may result in a broken configuration or loss of accounts. If you see a `DOWNGRADE DETECTED` message in the logs after rolling back, **restore the latest unified backup before using the UI**:
+
+```bash
+# List available backups inside the container
+docker exec certmate ls -lt /app/backups/unified/
+
+# Restore the most recent one
+curl -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"filename": "backup_YYYYMMDD_HHMMSS.zip", "create_backup_before_restore": true}' \
+  http://localhost:8000/api/backups/restore/unified
+```
+
+If you have lost the admin password and cannot log in, use the emergency reset script (requires container shell access):
+
+```bash
+docker exec -it certmate python scripts/reset_admin_password.py
+```
 
 ## Troubleshooting Guide
 
@@ -2163,6 +2340,57 @@ sudo chown -R 1000:1000 ./certificates ./data ./logs
 # Check volume mounts
 docker inspect certmate | jq '.[0].Mounts'
 ```
+
+#### Deployment Status Shows "Backend: Unreachable"
+
+**Q: All my certificates show "Backend: Unreachable" even though they are issued, served, and downloadable. Is something broken?**
+
+No. The deployment-status badge is an optional health indicator — it does not affect issuance, renewal, or download. CertMate's own process opens a TLS connection to `<domain>:<port>` and compares the served certificate's fingerprint against the stored one. The badge only answers whether CertMate itself can reach the service and see the expected certificate.
+
+- **Deployed** — handshake succeeded and the fingerprint matches.
+- **Wrong Cert** — handshake succeeded but a different certificate is served.
+- **Unreachable** — CertMate could not open a TLS connection to the domain at all.
+
+**Configuring the probe per certificate**
+
+By default the probe connects on port 443 with a direct TLS handshake (HTTPS). You can change the port and protocol per certificate via the API or the dashboard:
+
+| Protocol | Port (default) | Use case |
+|---|---|---|
+| `https-tls` | 443 | Standard HTTPS |
+| `tls` | 465 | SMTPS, IMAPS, or any direct TLS service |
+| `smtp-starttls` | 587 | SMTP with STARTTLS (port 25 also works) |
+
+From the **dashboard**, open a certificate's detail panel and click **Configure Probe**, then enter the port and protocol.
+
+From the **API**:
+
+```bash
+# Set probe to SMTP STARTTLS on port 587
+curl -X PATCH https://certmate.example.com/api/certificates/example.com \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"deployment_port": 587, "deployment_protocol": "smtp-starttls"}'
+
+# Reset to defaults (HTTPS on port 443)
+curl -X PATCH https://certmate.example.com/api/certificates/example.com \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"deployment_port": null, "deployment_protocol": "https-tls"}'
+```
+
+The probe protocol defaults to the global timeout (3s) and can be tuned via the `CERTMATE_TLS_PROBE_TIMEOUT_SECONDS` environment variable.
+
+**Global timeout tuning:**
+
+```bash
+# Accepts 1–30 seconds; default is 3
+CERTMATE_TLS_PROBE_TIMEOUT_SECONDS=10
+```
+
+**"Unreachable" for every certificate** is common in Kubernetes/ingress setups where the CertMate pod cannot dial the public/ingress IP directly (split-horizon DNS, an egress `NetworkPolicy`, or TLS terminated by an ingress controller / load balancer). If the target is merely slow, raise the probe budget or configure the port/protocol to match your topology.
+
+See [docs/kubernetes.md](docs/kubernetes.md#deployment-status-badge-shows-backend-unreachable) for the Kubernetes-specific note. (Reference: [#263](https://github.com/fabriziosalmi/certmate/issues/263).)
 
 #### DNS Provider Specific Issues
 
@@ -2273,12 +2501,13 @@ curl -sS -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/diagnostics
 | -------------------------------------------------- | ----------------------------------- | --------------------- |
 | **[README.md](README.md)**                         | Main documentation and quick start  | All users             |
 | **[docs/installation.md](docs/installation.md)**   | Installation and deployment         | System administrators |
-| **[docs/dns-providers.md](docs/dns-providers.md)** | DNS provider setup (22 providers)   | DevOps engineers      |
+| **[docs/dns-providers.md](docs/dns-providers.md)** | DNS provider setup                  | DevOps engineers      |
 | **[docs/ca-providers.md](docs/ca-providers.md)**   | Certificate Authority configuration | Enterprise users      |
 | **[docs/docker.md](docs/docker.md)**               | Docker and multi-platform builds    | DevOps engineers      |
 | **[docs/testing.md](docs/testing.md)**             | Testing framework and CI/CD         | Developers            |
 | **[docs/architecture.md](docs/architecture.md)**   | System architecture                 | Developers            |
 | **[docs/api.md](docs/api.md)**                     | Client certificates API reference   | Developers            |
+| **[docs/probes.en.md](docs/probes.en.md)**         | Deployment probe configuration      | DevOps engineers      |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)**             | Development and contribution guide  | Developers            |
 | **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**       | Community guidelines                | Contributors          |
 
@@ -2329,10 +2558,12 @@ cd certmate
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-pip install -r requirements-dev.txt
+pip install -r requirements-test.txt
 
-# Set up pre-commit hooks
-pre-commit install
+# Lint, format, and security-scan (the same tools CI runs)
+make lint
+make format
+make security
 
 # Run tests
 pytest

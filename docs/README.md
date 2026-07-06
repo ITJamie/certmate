@@ -9,11 +9,13 @@ Welcome to the CertMate documentation. This folder contains comprehensive guides
 ### Getting Started
 - **[Installation Guide](./installation.md)** — Setup, dependencies, production deployment
 - **[Docker Guide](./docker.md)** — Docker builds, multi-platform, Docker Compose
+- **[Kubernetes Notes](./kubernetes.md)** — Production resources, OOM sizing, runtime patching
 
 ### Core Features
-- **[DNS Providers](./dns-providers.md)** — 23 DNS providers, multi-account, domain alias
+- **[DNS Providers](./dns-providers.md)** — supported providers, multi-account, domain alias
 - **[CA Providers](./ca-providers.md)** — Let's Encrypt, DigiCert, Private CA
 - **[Client Certificates](./guide.md)** — Client cert lifecycle, web dashboard, batch ops
+- **[Model Context Protocol (MCP) Server](./mcp.md)** — Standalone Node.js server for AI agent integrations
 
 ### Reference
 - **[API Reference](./api.md)** — Complete REST API documentation
@@ -39,20 +41,24 @@ Welcome to the CertMate documentation. This folder contains comprehensive guides
 ### For Administrators
 
 1. **[Docker Deployment](./docker.md)** — Production Docker setup
-2. **[CA Providers](./ca-providers.md)** — Configure certificate authorities
-3. **[DNS Providers](./dns-providers.md#multi-account-support)** — Enterprise multi-account setup
+2. **[Kubernetes Notes](./kubernetes.md)** — Production pod sizing and operational patching
+3. **[CA Providers](./ca-providers.md)** — Configure certificate authorities
+4. **[DNS Providers](./dns-providers.md#multi-account-support)** — Enterprise multi-account setup
 
 ---
 
 ## Feature Overview
 
 ### Server Certificates
-- **23 DNS providers** for Let's Encrypt DNS-01 challenges
-- **Multiple CA providers**: Let's Encrypt, DigiCert ACME, Private CA
+- **two dozen+ DNS providers** for Let's Encrypt DNS-01 challenges (see [DNS Providers](./dns-providers.md) for the full list)
+- **Multiple CA providers**: Let's Encrypt, DigiCert, Private CA
 - **Multi-account support** per DNS provider
 - **Pluggable storage backends**: Local, Azure Key Vault, AWS, Vault, Infisical
 - **Auto-renewal** with configurable thresholds
 - **Docker support** with multi-platform builds (ARM64 + AMD64)
+- **Log Sanitizer** — Automatically redacts API tokens, private keys, and sensitive credentials from CertMate logs
+- **Zombie Certificate Scanner** — Multi-threaded filesystem scanner to identify and clean up orphan certificates
+- **Model Context Protocol (MCP) Server** — Standalone Node.js server to integrate with agentic AI assistants
 
 ### Client Certificates
 - **Self-signed CA** with 4096-bit RSA keys
@@ -139,6 +145,7 @@ docs/
   README.md            ← You are here
   index.md             ← Client certificates landing page
   installation.md      ← Installation & setup
+  kubernetes.md        ← Kubernetes production notes
   dns-providers.md     ← DNS providers & multi-account
   ca-providers.md      ← Certificate Authority providers
   docker.md            ← Docker build & deployment

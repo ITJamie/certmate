@@ -1,0 +1,231 @@
+# Theme Migration — decoupling light/dark via CSS-variable tokens
+
+Status: **shipped** (Phases 0–5 in v2.9.0; Phase 6 status-token pass follows) · Owner: Fabrizio · Created: 2026-05-25
+
+## Goal
+
+Today, changing the theme means editing colors across ~19 templates and the
+frontend JS. This migration makes a single block of CSS custom properties the
+source of truth for the whole palette, so retheming (or adding a new theme)
+means editing `:root` / `.dark` in one file — not hundreds of call sites.
+
+## Baseline (measured 2026-05-25)
+
+| Metric | Value |
+|---|---|
+| Color-class references in templates | ~3,197 across 19 files |
+| `dark:` variant pairs in templates | ~1,665 |
+| Color classes in app JS (non-vendored) | ~789 (dashboard.js 372, settings.js 150, setup-wizard.js 131, certmate.js 60, client-certs.js 57, …) |
+| Hardcoded hex in app JS | ~17 (toast/chart palettes); 80 more in `redoc.standalone.js` are **vendored, ignore** |
+| R-3 component classes adopted | `.card` only (12×); `.btn-*`, `.badge-*`, `.form-*` = 0 |
+
+Heaviest files: `partials/settings_dns.html` (635 / 395 dark:), `index.html`
+(311 / 150), `partials/settings_deploy.html`, `partials/settings_ca.html`.
+
+## Process risks to fix first
+
+1. **Built CSS is committed by hand.** `package.json` only has `css:build` /
+   `css:watch`; no CI rebuilds `static/css/tailwind.min.css`. Editing
+   `input.css` without rebuilding silently ships stale CSS. → add CI build +
+   freshness check in Phase 0.
+2. **~3,200 manual edits = guaranteed regressions.** Need a visual baseline
+   (light+dark screenshots of every page) and a semi-automatic codemod for the
+   mechanical `dark:` pairs, not blind find-replace.
+
+## Strategy: CSS custom properties as single source
+
+shadcn-style on Tailwind v3: colors become CSS variables in `:root` / `.dark`,
+exposed to Tailwind as semantic tokens (HSL channel-triplets so the `/opacity`
+utilities keep working). The ~1,665 `dark:` pairs collapse to single classes.
+
+### Proposed token map
+
+| Tailwind token | Replaces (examples) | Use |
+|---|---|---|
+| `bg-background` | `bg-gray-50 dark:bg-surface-dark` | page |
+| `bg-surface` | `bg-white dark:bg-surface-card` | card |
+| `bg-surface-2` | `bg-gray-100 dark:bg-gray-800` | elevated |
+| `text-foreground` | `text-gray-900 dark:text-white` | primary text |
+| `text-muted` | `text-gray-500 dark:text-gray-400` | secondary text |
+| `border-border` | `border-gray-200 dark:border-gray-700` | borders |
+| `bg-primary` / `text-primary` | brand (now var-backed) | brand |
+| `*-success/warning/danger/info` | green=valid, red=expired… | **status, not surfaces** |
+
+## Phases
+
+Each phase = one atomic commit (split partials in Phase 3 into their own
+commits). Phases group into one or more `vX.Y.Z` release PRs.
+
+### Phase 0 — Foundations & guardrails (no visual change)
+- [x] CI step runs `npm run css:build` and fails if `tailwind.min.css` is stale (`git diff --exit-code`). → `frontend-css` job in `.github/workflows/ci.yml`. The committed bundle was already drifted; rebuilt and committed.
+- [x] Define token layer: CSS vars in `:root` / `.dark` (input.css) + mapping in `tailwind.config.js`, **alongside** the existing palette — no templates touched yet. Tokens: `bg-background`, `bg-surface`, `bg-surface-2`, `text-foreground`, `text-muted`, `border-border` (safelisted).
+- [x] Write the codemod: `scripts/theme_codemod.py` — mapping table of recurring `dark:` pairs → tokens, dry-run report + `--apply`. Ambiguity report below.
+- [x] Screenshot-baseline tooling: `scripts/theme_baseline.py` — builds Docker with a fresh ephemeral data dir, bootstraps a throwaway admin, captures every real UI page in light + dark. Re-run after each phase and diff. **Capture run still pending** (needs `playwright install chromium` + a Docker build locally).
+
+#### Baseline scope (real pages only)
+Captured: `/` (setup, then index), `/login`, `/settings`, `/help`, `/activity`, `/redoc` — 7 pages × light/dark.
+
+> **Finding (out of scope, flagged):** the routes `/certificates` and `/audit` in `modules/web/ui_routes.py:25-41` render `certificates.html` / `audit.html`, which **do not exist** — both 500. Dead routes, excluded from the baseline. Worth a separate fix (remove the routes or restore the templates).
+
+#### Codemod usage
+```
+python scripts/theme_codemod.py                     # dry-run report, all templates
+python scripts/theme_codemod.py templates/base.html # report, one file
+python scripts/theme_codemod.py --apply templates/base.html
+```
+After every `--apply`: `npm run css:build`, diff against baseline, review residual `dark:` variants.
+
+#### Report snapshot (2026-05-25)
+**607 pairs auto-collapse** out of ~1,665 `dark:` variants:
+
+| Token | Pairs |
+|---|---|
+| `text-muted` | 203 |
+| `border-border` | 169 |
+| `text-foreground` | 141 |
+| `bg-surface` | 77 |
+| `bg-surface-2` | 16 |
+| `bg-background` | 1 |
+
+**557 occurrences / 29 variants are unmapped** — design decisions for the Phase 1 pilot, not auto-guessed:
+
+- `dark:bg-gray-700` (137): pairs with `bg-white` (cards/inputs) **and** `bg-gray-50` — decide surface vs surface-2 per context.
+- `dark:text-white` (120): the ones paired with `text-gray-900` already map to `text-foreground`; the rest are always-white text on colored backgrounds — likely leave as-is.
+- `dark:text-gray-300` (112): mostly `text-gray-700 dark:text-gray-300` = the form-label pattern — decide a dedicated label token vs `text-muted`/`text-foreground`.
+- `dark:border-gray-600` (41), `dark:text-gray-200` (39), opacity-suffixed surfaces (`dark:bg-gray-700/50` etc.), and `dark:border-white/5`.
+
+A handful of leftovers (`dark:text-gray-400{%`, `dark:text-gray-300'`) are class attributes containing Jinja/JS expressions — migrate by hand.
+
+### Phase 1 — Pilot: shell + primitives
+- [x] Migrate `base.html` (nav/header/footer/tab bar) to tokens. 19 pairs collapsed; token values match originals exactly.
+- [x] Migrate `login.html` to tokens. 12 pairs collapsed.
+- [ ] Adopt `.btn` / `.form-*` component classes (deferred — pilot used tokens only; the login inputs differ in sizing from `.form-input`, so component adoption is its own step).
+- [x] Validate light/dark parity. Verified live in Docker (base.html + login.html, both themes) — pilot accepted.
+
+#### Open design decisions (surfaced by the pilot)
+1. **Form-label text** (`text-gray-700 dark:text-gray-300`). **RESOLVED in Phase 5 → option (b):** added `--color-label` token at the exact gray-700/gray-300 values (faithful, no visual change) and migrated all 137 occurrences to `text-label`. Folding into `text-foreground` was rejected (would darken light mode 27%→11% L).
+2. **Border unification**: `border-gray-300` (inputs) now maps to `border-border` (= gray-200), so input borders lighten one step in light mode. Accepted for the pilot (single border token is the goal); revisit with `--color-input-border` only if review dislikes it.
+3. **Glass inputs / `dark:border-white/5` hairline / hover: variants / status colors**: intentionally NOT tokenized — glass controls have no light counterpart, the white/5 hairline is the canonical `.card` edge, and hover/status need their own variant-token pass (a later phase).
+
+### Phase 2 — Dashboard ✅
+- [x] `index.html` (dashboard chrome): create-cert form, list/stat cards, table headers + divides, detail panel, modals. Alpine `:class` ternaries and `divide-border` handled by hand.
+- [x] `static/js/dashboard.js`: JS-rendered rows, stats, empty/welcome states, detail panel, alias-check output. `node --check` clean.
+- Health/deployment status colors (green/amber/red/blue) deliberately left as literal status colors — they carry meaning and get a dedicated status-token pass later, not surface tokens.
+- Glass form inputs (`dark:bg-gray-700`/`dark:text-white`), form labels, and hover: variants left for their own treatment (consistent with the pilot).
+
+### Phase 3 — Settings cluster ✅
+- [x] `settings.html` + 10 partials + `_modal`: 441 pairs collapsed. Alpine `:class` interior pairs tokenized by the codemod (quotes glue only the branch-edge classes); ternary structure verified intact.
+- [x] `settings.js` + `setup-wizard.js`: 49 pairs, `node --check` clean. The other `settings-*.js` carry no color classes.
+- Left as-is (consistent with prior phases): glass inputs (`dark:bg-gray-700` ~99), form labels (`dark:text-gray-300` ~78, deferred), status badges, opacity surfaces, hover: variants, and ternary branch-edge classes.
+
+### Phase 4 — Remaining pages ✅
+- [x] Templates: activity, help, setup, `_client_certs` (123 pairs; no Alpine ternaries here).
+- [x] JS: client-certs.js, cmd-palette.js, report-issue.js, shortcuts.js (26 pairs, `node --check` clean). setup-wizard.js was already done in Phase 3.
+- Same carve-outs as before: glass inputs, body/label grays, opacity surfaces, status colors, hover:, and string-concatenation-boundary classes.
+
+### Phase 5 — Cleanup & lock-in ✅
+- [x] Closed the label decision: `text-label` token + 137 sites migrated (see above).
+- [x] Caught the codemod blind spot: it only scanned `class="..."`, missing `className='...'` assignments and JS string concatenation. Added a **boundary-aware literal-pass** (collapses adjacent `LIGHT DARK` substrings in any context) + the `--check` gate. Re-running the full sweep collapsed the remaining JS pairs (confirm/prompt dialog, report-issue + shortcuts modals).
+- [x] Removed unused legacy aliases `success`/`warning`/`danger` from `tailwind.config.js` (0 call sites). Kept `primary` (~375) and `secondary` (gradients).
+- [x] **CI guardrail**: `python3 scripts/theme_codemod.py --check` in the `frontend-css` job — fails the build if any collapsible light+dark pair is reintroduced in a template or first-party JS file.
+- **JS hex left as-is, by design:** the `#60a5fa`/etc. palette in `certmate.js` is the **debug-console logger** on a fixed always-dark surface (`bg-black`); `TOAST_COLORS` are literal status classes. Both are theme-independent status accents — conventionally not part of light/dark theming — so they stay literal rather than becoming theme tokens. A future **status-token pass** (success/warning/danger/info as vars) is the place to unify these if ever wanted.
+- Baseline refresh: optional; not run (capture was deferred — live Docker verification used at each phase instead).
+
+### Phase 6 — Status-token pass ✅
+- [x] Re-added `success`/`warning`/`danger` (+ new `info`) as **token groups**
+  (`surface`/`line`/`fg`/`strong`), var-backed in `:root`/`.dark` (HSL,
+  faithful to the inline values, dark surfaces blended over the card).
+- [x] Extended the codemod with a generated hue×shade table (`_expand_status`)
+  that folds the green/red/amber/blue info-box pairs onto the tokens —
+  normalising the 50-vs-100 / 700-vs-800 drift the inline callouts carried.
+  **300 pairs collapsed** across templates + first-party JS.
+- [x] `--check` now also guards status pairs (they live in `MAPPINGS`), so a
+  reintroduced light+dark status pair fails CI like any other.
+- Left literal by design: single status accents with no light/dark pair
+  (icon `text-*-500`), and standalone dark-only tints (no light counterpart).
+
+### Phase 7 — Form-field surface ✅ (v2.9.1)
+- [x] Add `--color-input` (white / gray-700) → `bg-input`; collapse 40
+  `bg-white dark:bg-gray-700` field pairs. Exact value match.
+
+### Phase 8 — Hover + recessed surfaces ✅ (v2.9.1)
+- [x] Add `--color-hover` (gray-100/700), `border.strong` (gray-300/500) and
+  `--color-sunken` (gray-50/700); collapse 51 hover/recessed pairs. Minority
+  hover shades left literal to keep the pass strictly zero-shift.
+
+### Phase 9 — Component-layer tokenization + accent ✅
+- [x] The R-3 component `@apply` rules (`.card`, `.form-input`/`.form-select`/
+  `.form-label`, `.btn-secondary`, `.btn-ghost`, `.nav-active`, `.nav-inactive`)
+  were a **codemod blind spot** — `--check` scans `class="…"`, not `@apply` —
+  and still carried raw gray/blue classes. Migrated them onto the tokens.
+- [x] Added a theme-aware `accent` token (blue-600 → blue-400 on dark) so
+  `.nav-active` no longer hard-codes blue; this is the on-surface accent #254
+  lacked.
+- Not done (by design): call-site adoption of `.btn`/`.form-*` (the inline
+  call sites are already tokenised; forcing the components would change button
+  sizing for zero decoupling gain). `.btn-danger` (solid action red) and the
+  `.badge-*` status variants stay literal. The `@apply` layer remains outside
+  the `--check` gate — a future codemod enhancement could scan it.
+
+### Phase 10 — Color-tail decomposition (planned, gradual)
+The decoupling left **565 `dark:` utilities** the codemod can't collapse: they
+have no light sibling to pair with, so `--check` never sees them. Audit
+(2026-05-25) shows they are not one problem but three, with opposite risk
+profiles:
+
+| Bucket | Count | Resolves to | New tokens |
+|---|---|---|---|
+| 1 — Neutrals (white/gray) | 388 (69%) | `foreground / surface / surface-2 / sunken / muted / border` | 0 |
+| 2 — Status (blue/red/amber) | 63 (11%) | `info / success / warning / danger` | 0 |
+| 3 — Rainbow (purple/indigo/orange) | 111 (20%) | **neutral** (decorative, demoted) | 0 |
+
+Key finding: **zero new tokens needed.** The token system already shipped *is*
+the contract; the 565 are everything that escaped it. The fix is enforcement +
+demotion, not new vocabulary. (The rainbow was measured to be decorative
+section-coding — purple = "advanced config", indigo = CA/Enterprise, orange =
+Storage — not status, and inconsistent across files.)
+
+Order, by rising UX risk:
+- **10a — Neutrals (388).** Invisible: `dark:text-white` → `text-foreground`,
+  `dark:bg-gray-700` → `bg-input`/`bg-surface-2`/`bg-sunken` (disambiguated by
+  context — same dark grey, different *light* intent, so human-classified per
+  cluster, not blind sed). Extend `theme_codemod.py` with a solo-dark→token
+  pass. Risk ~0, clears ~70%.
+- **10b — Status (63).** Map the blue/red/amber callouts onto the existing
+  info/success/warning/danger groups. Normalises 50-vs-100 drift. Low risk.
+- **10c — Rainbow (111).** The product decision (see contract below).
+  Decorative section hues collapse to neutral. Visible change, done last,
+  block-by-block with before/after screenshot QA. Decided: **contract α**
+  (color = meaning).
+
+## Color contract (the standard the 565 escaped)
+Decided 2026-05-25. Four rules; the tokens already shipped are the only palette.
+
+1. **Color is earned, never decorative.** A hue appears only if it carries
+   *status* (info/success/warning/danger) or *brand* (accent: links, active
+   nav, primary, focus). Everything else is neutral
+   (background/surface/surface-2/sunken/border/foreground/muted/label).
+2. **Identity comes from structure, not color.** Sections are distinguished by
+   spacing, headings, icons, dividers — not a fill hue.
+3. **One emphasis primitive.** Config/advanced blocks use a single neutral
+   inset panel (`bg-sunken border-border rounded-md`); an optional brand
+   left-border marks "active/important". No per-section palette.
+4. **Icons tint only with brand or status.** No purple/indigo/orange icon tints.
+
+Enforcement: the `--check` gate gains a rule that fails CI on raw
+`purple|indigo|orange` (and any non-token color) under `templates/` — a
+contract with a compiler behind it, so it can't rot back into the raver tunnel.
+
+## Status colors — now tokenized (Phase 6)
+Earlier phases deliberately deferred status colors (green/amber/red/blue with
+their `dark:` variants) as a separate, optional pass — they carry meaning and
+are conventionally theme-invariant. **Phase 6 did that pass:** the paired
+info-box surfaces/borders/text now use `bg-success-surface`,
+`text-danger-strong`, etc. Single status *accents* (icon `text-*-500`, no dark
+pair) stay literal — those are theme-independent and not part of light/dark
+theming.
+
+## Workflow alignment
+- Zero emoji in commits/PRs/release notes.
+- Atomic commits (one per phase, or per partial in Phase 3); one PR per release.
+- Before public push: Docker smoke + real cert issuance against Fab's domain with random subdomains.

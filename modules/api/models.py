@@ -156,13 +156,27 @@ def create_api_models(api):
         'domain_alias': fields.String(description='DNS alias target used for DNS-01 validation'),
         'alias_dns_provider': fields.String(description='DNS provider used to manage the alias target'),
         'san_domains': fields.List(fields.String, description='Subject Alternative Names included in the certificate'),
+        'ca_provider': fields.String(description='CA provider the certificate was issued with (from metadata; null for older certificates)'),
+        'challenge_type': fields.String(description='Challenge type used at issuance (from metadata)'),
+        'account_id': fields.String(description='DNS provider account used at issuance (from metadata)'),
         'total_issued': fields.Integer(description='Total certificates issued'),
         'total_active': fields.Integer(description='Total active certificates'),
         'total_revoked': fields.Integer(description='Total revoked certificates'),
         'total_expired': fields.Integer(description='Total expired certificates'),
         'latest_issuance': fields.String(description='Latest issuance timestamp'),
-        'oldest_active_issuance': fields.String(description='Oldest active issuance timestamp')
+        'oldest_active_issuance': fields.String(description='Oldest active issuance timestamp'),
+        'deployment_port': fields.Integer(description='TCP port for deployment probe'),
+        'deployment_protocol': fields.String(description='Protocol used by deployment probe (https-tls, tls, or smtp-starttls)')
     })
+
+    # Single source of truth: the dns_provider enum is derived from the
+    # canonical advertised provider list (DNSManager.SUPPORTED_PROVIDERS) so it
+    # cannot drift. The previous hand-maintained literal listed 24 of the 26
+    # providers, silently omitting hetzner-cloud and infomaniak from the API
+    # contract / Swagger. Pinned by
+    # test_api_models_dns_provider_enum_matches_supported.
+    from modules.core.dns_providers import DNSManager
+    dns_provider_enum = list(DNSManager.SUPPORTED_PROVIDERS)
 
     settings_model = api.model('Settings', {
         'cloudflare_token': MaskedString(description='Cloudflare API token (deprecated, use dns_providers)'),
@@ -172,15 +186,21 @@ def create_api_models(api):
         'api_bearer_token': MaskedString(description='API bearer token for authentication'),
         'dns_provider': fields.String(
             description='Active DNS provider',
-            enum=[
-                'cloudflare', 'route53', 'azure', 'google', 'powerdns',
-                'digitalocean', 'linode', 'gandi', 'ovh', 'namecheap',
-                'vultr', 'dnsmadeeasy', 'nsone', 'rfc2136', 'hetzner',
-                'porkbun', 'godaddy', 'he-ddns', 'dynudns', 'arvancloud',
-                'acme-dns', 'duckdns', 'edgedns'
-            ]
+            enum=dns_provider_enum
         ),
-        'dns_providers': fields.Nested(dns_providers_model, description='DNS provider configurations')
+        'dns_providers': fields.Nested(dns_providers_model, description='DNS provider configurations'),
+        'default_key_type': fields.String(
+            description='Global default key type for new certificates (per-domain overrides take precedence).',
+            enum=['rsa', 'ecdsa']
+        ),
+        'default_key_size': fields.Integer(
+            description="Global default RSA key size — applied when default_key_type='rsa'.",
+            enum=[2048, 3072, 4096]
+        ),
+        'default_elliptic_curve': fields.String(
+            description="Global default ECDSA curve — applied when default_key_type='ecdsa'.",
+            enum=['secp256r1', 'secp384r1']
+        )
     })
 
     create_cert_model = api.model('CreateCertificate', {
@@ -189,18 +209,54 @@ def create_api_models(api):
                                    description='Additional SANs (e.g., ["*.example.com"])'),
         'dns_provider': fields.String(
             description='DNS provider to use (optional, uses default from settings)',
-            enum=[
-                'cloudflare', 'route53', 'azure', 'google', 'powerdns',
-                'digitalocean', 'linode', 'gandi', 'ovh', 'namecheap',
-                'vultr', 'dnsmadeeasy', 'nsone', 'rfc2136', 'hetzner',
-                'porkbun', 'godaddy', 'he-ddns', 'dynudns', 'arvancloud',
-                'acme-dns', 'duckdns', 'edgedns'
-            ]
+            enum=dns_provider_enum
         ),
         'account_id': fields.String(description='DNS provider account ID'),
         'ca_provider': fields.String(description='CA provider (optional)',
-                                     enum=['letsencrypt', 'digicert', 'private_ca']),
-        'domain_alias': fields.String(description='Optional domain alias for DNS validation')
+                                     enum=['letsencrypt', 'letsencrypt_staging', 'zerossl',
+                                           'google', 'digicert', 'sslcom',
+                                           'actalis', 'private_ca']),
+        'domain_alias': fields.String(description='Optional domain alias for DNS validation'),
+        'key_type': fields.String(
+            description=(
+                "Optional override of the global default key type. Omit to "
+                "inherit settings.default_key_type."
+            ),
+            enum=['rsa', 'ecdsa']
+        ),
+        'key_size': fields.Integer(
+            description="RSA key size in bits — required when key_type='rsa'.",
+            enum=[2048, 3072, 4096]
+        ),
+        'elliptic_curve': fields.String(
+            description="ECDSA curve — required when key_type='ecdsa'.",
+            enum=['secp256r1', 'secp384r1']
+        )
+    })
+
+    reissue_cert_model = api.model('ReissueCertificate', {
+        'san_domains': fields.List(
+            fields.String,
+            description='Replacement SAN set. Omit to keep the current SANs; '
+                        'pass [] to drop every SAN. The set replaces the '
+                        "lineage's domains (expand and shrink)."),
+        'dns_provider': fields.String(description='Omit to keep the value the certificate was issued with'),
+        'account_id': fields.String(description='Omit to keep the value the certificate was issued with'),
+        'ca_provider': fields.String(description='Omit to keep the value the certificate was issued with'),
+        'challenge_type': fields.String(description='Omit to keep the value the certificate was issued with'),
+        'domain_alias': fields.String(description='Omit to keep the current alias; pass "" to clear it'),
+        'alias_dns_provider': fields.String(description='Provider managing the alias zone when it differs from dns_provider. Omit to keep the issued value'),
+        'key_type': fields.String(
+            description='Omit to keep the existing key shape (no key flags are '
+                        'sent and certbot preserves the lineage key). Set to '
+                        'deliberately re-key.',
+            enum=['rsa', 'ecdsa']
+        ),
+        'key_size': fields.Integer(description="RSA key size — required when key_type='rsa'.",
+                                   enum=[2048, 3072, 4096]),
+        'elliptic_curve': fields.String(description="ECDSA curve — required when key_type='ecdsa'.",
+                                        enum=['secp256r1', 'secp384r1']),
+        'async': fields.Boolean(description='Defer issuance to a background job (202 + job id)')
     })
 
     # Cache models
@@ -223,6 +279,42 @@ def create_api_models(api):
         'cleared_entries': fields.Integer(description='Number of entries that were cleared')
     })
 
+    browser_deployment_model = api.model('BrowserDeploymentStatus', {
+        'reachable': fields.Boolean(description='Whether the browser could reach the domain'),
+        'checked_at': fields.String(description='When the browser check happened'),
+        'method': fields.String(description='How the browser check was performed'),
+        'source': fields.String(description='Source of the browser report')
+    })
+
+    deployment_status_model = api.model('DeploymentStatus', {
+        'domain': fields.String(description='Domain name'),
+        'deployed': fields.Boolean(description='Whether the domain is serving a certificate'),
+        'reachable': fields.Boolean(description='Whether the domain responds over HTTPS'),
+        'certificate_match': fields.Raw(description='Whether the served certificate matches the local certificate'),
+        'method': fields.String(description='Check method'),
+        'port': fields.Integer(description='TCP port probed', default=443),
+        'protocol': fields.String(description='Probe protocol (https-tls, tls, smtp-starttls)'),
+        'timestamp': fields.String(description='Check timestamp'),
+        'error': fields.String(description='Optional error message'),
+        # Machine-readable error code surfaced when _check_domain_scope denies
+        # a scoped API key (e.g. 'DOMAIN_OUT_OF_SCOPE'). Without listing it
+        # here, @api.marshal_with would silently strip it from the 403 body.
+        'code': fields.String(description='Optional machine-readable error code'),
+        'browser': fields.Nested(browser_deployment_model, description='Browser-reported reachability')
+    })
+
+    browser_deployment_report_model = api.model('BrowserDeploymentReport', {
+        'domain': fields.String(required=True, description='Domain name'),
+        'reachable': fields.Boolean(required=True, description='Whether the browser could reach the domain'),
+        'checked_at': fields.String(description='When the browser check happened'),
+        'method': fields.String(description='How the browser check was performed'),
+        'source': fields.String(description='Source of the browser report')
+    })
+
+    browser_deployment_reports_model = api.model('BrowserDeploymentReports', {
+        'reports': fields.List(fields.Nested(browser_deployment_report_model), required=True, description='Batch of browser deployment reports')
+    })
+
     # Backup models
     backup_metadata_model = api.model('BackupMetadata', {
         'filename': fields.String(description='Backup filename'),
@@ -240,7 +332,17 @@ def create_api_models(api):
         'vault_url': fields.String(description='Azure Key Vault URL'),
         'client_id': fields.String(description='Azure Client ID'),
         'client_secret': fields.String(description='Azure Client Secret'),
-        'tenant_id': fields.String(description='Azure Tenant ID')
+        'tenant_id': fields.String(description='Azure Tenant ID'),
+        'storage_mode': fields.String(
+            description=(
+                "Whether to store certificates as Secrets, native Certificate "
+                "objects, or both. 'certificate'/'both' enables native consumption "
+                "from App Service, Application Gateway, Front Door, API Management "
+                "and AKS Ingress."
+            ),
+            enum=['secrets', 'certificate', 'both'],
+            default='secrets'
+        )
     })
 
     aws_secrets_manager_storage_model = api.model('AWSSecretsManagerStorage', {
@@ -264,15 +366,26 @@ def create_api_models(api):
         'environment': fields.String(description='Infisical Environment', default='prod')
     })
 
+    s3_compatible_storage_model = api.model('S3CompatibleStorage', {
+        'endpoint_url': fields.String(description='S3-compatible endpoint URL '
+                                      '(Hetzner / Contabo / OVHcloud / Scaleway / Wasabi / MinIO / AWS)'),
+        'bucket': fields.String(description='Bucket name'),
+        'access_key_id': fields.String(description='S3 access key ID'),
+        'secret_access_key': fields.String(description='S3 secret access key'),
+        'region': fields.String(description='Region', default='us-east-1'),
+        'prefix': fields.String(description='Object key prefix', default='certmate/certificates')
+    })
+
     storage_config_model = api.model('StorageConfig', {
         'backend': fields.String(description='Storage backend type',
                                  enum=['local_filesystem', 'azure_keyvault', 'aws_secrets_manager',
-                                       'hashicorp_vault', 'infisical']),
+                                       'hashicorp_vault', 'infisical', 's3_compatible']),
         'cert_dir': fields.String(description='Certificate directory for local filesystem'),
         'azure_keyvault': fields.Nested(azure_keyvault_storage_model),
         'aws_secrets_manager': fields.Nested(aws_secrets_manager_storage_model),
         'hashicorp_vault': fields.Nested(hashicorp_vault_storage_model),
-        'infisical': fields.Nested(infisical_storage_model)
+        'infisical': fields.Nested(infisical_storage_model),
+        's3_compatible': fields.Nested(s3_compatible_storage_model)
     })
 
     storage_test_config_model = api.model('StorageTestConfig', {
@@ -281,10 +394,14 @@ def create_api_models(api):
     })
 
     storage_migration_config_model = api.model('StorageMigrationConfig', {
-        'source_backend': fields.String(description='Source storage backend type', required=True),
-        'target_backend': fields.String(description='Target storage backend type', required=True),
-        'source_config': fields.Raw(description='Source backend configuration', required=True),
-        'target_config': fields.Raw(description='Target backend configuration', required=True)
+        # All four fields are optional: source defaults to the active
+        # certificate_storage from settings and target_backend can be read
+        # from target_config['backend'] (the envelope shape the settings
+        # form emits via collectStorageBackendSettings()).
+        'source_backend': fields.String(description='Source storage backend type (defaults to current certificate_storage.backend)'),
+        'target_backend': fields.String(description='Target storage backend type (defaults to target_config.backend)'),
+        'source_config': fields.Raw(description='Source backend configuration (defaults to current certificate_storage)'),
+        'target_config': fields.Raw(description='Target backend configuration; accepts either the per-backend dict or the {backend, <backend>: {...}} envelope', required=True)
     })
 
     # CA Provider models
@@ -338,8 +455,13 @@ def create_api_models(api):
         'dns_providers_model': dns_providers_model,
         'cache_stats_model': cache_stats_model,
         'cache_clear_response_model': cache_clear_response_model,
+        'browser_deployment_model': browser_deployment_model,
+        'browser_deployment_report_model': browser_deployment_report_model,
+        'browser_deployment_reports_model': browser_deployment_reports_model,
+        'deployment_status_model': deployment_status_model,
         'certificate_model': certificate_model,
         'create_cert_model': create_cert_model,
+        'reissue_cert_model': reissue_cert_model,
         'cache_entry_model': cache_entry_model,
         'backup_metadata_model': backup_metadata_model,
         'backup_list_model': backup_list_model,

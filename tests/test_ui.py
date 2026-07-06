@@ -102,7 +102,11 @@ class TestNavigation:
         browser_page.click('a[href="/help"]')
         browser_page.wait_for_url("**/help")
         browser_page.wait_for_load_state("networkidle")
-        expect(browser_page.locator("text=Getting Started").first).to_be_visible()
+        # v2.5.0 rewrote the help page: the old "Getting Started" anchor was
+        # replaced with "Quick Start" as the first section. Match the current
+        # nav strip + section heading so the test reflects the shipping UI.
+        expect(browser_page.locator("nav[aria-label='Help sections']")).to_be_visible()
+        expect(browser_page.locator("h3:has-text('Quick Start')")).to_be_visible()
 
     @pytest.mark.xfail(reason="Alpine.js defer timing in headless Chromium", strict=False)
     def test_client_certs_navigation(self, browser_page):
@@ -154,9 +158,15 @@ class TestSettingsUI:
     def test_dns_provider_selector(self, browser_page):
         browser_page.goto(f"{BASE_URL}/settings")
         browser_page.wait_for_load_state("networkidle")
-        # Should have DNS provider radio buttons
-        cloudflare_radio = browser_page.locator('input[name="dns_provider"][value="cloudflare"]')
-        expect(cloudflare_radio).to_be_visible()
+        # DNS provider cards live in the DNS tab; the default tab is General,
+        # so open the DNS tab first.
+        browser_page.locator('button[role="tab"][aria-label="DNS"]').click(timeout=10000)
+        browser_page.wait_for_timeout(300)
+        # The radio itself is sr-only (visually hidden); assert its visible
+        # wrapping card instead of the input.
+        cloudflare_card = browser_page.locator(
+            'label:has(input[name="dns_provider"][value="cloudflare"])')
+        expect(cloudflare_card).to_be_visible(timeout=5000)
 
     def test_auth_security_banner_visible(self, browser_page):
         browser_page.goto(f"{BASE_URL}/settings")
@@ -208,6 +218,61 @@ class TestSettingsUI:
         assert len(real_errors) == 0, f"JS errors: {real_errors}"
 
 
+class TestCAAndChallengeToggles:
+    """Regression tests for issue #226: CA provider config panels and the
+    HTTP-01 challenge toggle."""
+
+    def test_google_ca_panel_shows_when_selected(self, browser_page):
+        """Selecting Google Trust Services in the CA tab reveals the CA-side
+        config panel. Regression: it shared id="google-config" with the DNS-tab
+        Google panel, so getElementById matched the DNS one (rendered first)
+        and the CA panel stayed hidden (#226)."""
+        browser_page.goto(f"{BASE_URL}/settings")
+        browser_page.wait_for_load_state("networkidle")
+
+        # Switch to the CA tab — the label text is hidden on small viewports,
+        # so target the stable aria-label.
+        browser_page.locator('button[role="tab"][aria-label="CA"]').click(timeout=10000)
+        browser_page.wait_for_timeout(300)
+
+        browser_page.select_option('#default-ca', 'google')
+        browser_page.wait_for_timeout(300)
+
+        expect(browser_page.locator('#google-ca-config')).to_be_visible(timeout=5000)
+        # The DNS-tab Google panel is a distinct element and stays hidden.
+        expect(browser_page.locator('#google-config')).to_be_hidden()
+
+    def test_http01_hides_dns_config_panels(self, browser_page):
+        """Choosing HTTP-01 hides both the provider picker and the per-provider
+        config panels. Regression: the panels are siblings of the picker, so a
+        previously selected DNS config lingered under HTTP-01 (#226)."""
+        browser_page.goto(f"{BASE_URL}/settings")
+        browser_page.wait_for_load_state("networkidle")
+
+        # The DNS challenge/provider controls live in the DNS tab; the default
+        # tab is General, so open the DNS tab first.
+        browser_page.locator('button[role="tab"][aria-label="DNS"]').click(timeout=10000)
+        browser_page.wait_for_timeout(300)
+
+        # Select a provider so its config panel shows.
+        browser_page.click('label:has(input[name="dns_provider"][value="cloudflare"])')
+        browser_page.wait_for_timeout(300)
+        expect(browser_page.locator('#cloudflare-config')).to_be_visible(timeout=5000)
+
+        # Switch to HTTP-01 — picker and config panels must both disappear.
+        browser_page.click('label:has(input[name="challenge_type"][value="http-01"])')
+        browser_page.wait_for_timeout(300)
+        expect(browser_page.locator('#dns-provider-section')).to_be_hidden()
+        expect(browser_page.locator('#dns-config-section')).to_be_hidden()
+        expect(browser_page.locator('#cloudflare-config')).to_be_hidden()
+
+        # Switching back to DNS-01 restores them.
+        browser_page.click('label:has(input[name="challenge_type"][value="dns-01"])')
+        browser_page.wait_for_timeout(300)
+        expect(browser_page.locator('#dns-provider-section')).to_be_visible()
+        expect(browser_page.locator('#dns-config-section')).to_be_visible()
+
+
 class TestSettingsCloudflareFlow:
     """Test adding a Cloudflare account via UI."""
 
@@ -255,12 +320,32 @@ class TestCertCreationFlow:
         browser_page.goto(BASE_URL)
         browser_page.wait_for_load_state("networkidle")
 
-        # Fill domain
-        domain_input = browser_page.locator("#domain")
+        # The first-run setup wizard is rendered as a fixed-position overlay
+        # (#setupWizard, z-[110]) by static/js/setup-wizard.js when
+        # setup_completed is False — which is the case in a freshly-started
+        # test container. The overlay intercepts every pointer event, so any
+        # subsequent click against the dashboard times out. Remove the
+        # overlay DOM node so the test interacts with the live dashboard.
+        browser_page.evaluate(
+            "() => { const w = document.getElementById('setupWizard'); if (w) w.remove(); }"
+        )
+
+        # v2.5.0 (QW-15) put the create form behind a toggle: the
+        # #createCertFormContainer is `hidden` by default and the
+        # #toggleCreateForm button calls toggleCreateCertForm() to expand it.
+        # Before this fix the test did `#domain.fill(...)` directly against a
+        # hidden input and Playwright timed out with strict-mode violation.
+        toggle_btn = browser_page.locator('#toggleCreateForm')
+        expect(toggle_btn).to_be_visible()
+        toggle_btn.click()
+
+        # Now the form is visible and the input is fillable.
+        domain_input = browser_page.locator('#domain')
+        expect(domain_input).to_be_visible()
         domain_input.fill(test_domain)
 
-        # Click create button
-        create_btn = browser_page.locator('button:has-text("Create")')
+        # Click create button inside the now-visible form
+        create_btn = browser_page.locator('#createCertForm button[type="submit"], #createCertForm button:has-text("Create")')
         if create_btn.first.is_visible():
             create_btn.first.click()
             # Wait for cert creation (can take 30-120s)
@@ -268,13 +353,27 @@ class TestCertCreationFlow:
 
 
 class TestHelpPageUI:
-    """Help page UI."""
+    """Help page UI.
 
-    def test_docker_quick_start_visible(self, browser_page):
+    These tests originally asserted "Docker Quick Start" and "First Steps"
+    from the pre-v2.5.0 help page card grid. v2.5.0 / v2.5.1 rewrote the
+    help page (RELEASE_NOTES.md `fix(help): rewrite for user help, drop
+    marketing`) replacing the grid with a horizontal section-nav strip and
+    sections keyed by anchor id. The assertions are now repointed at two
+    stable sections that exist in the new structure.
+    """
+
+    def test_quick_start_section_visible(self, browser_page):
+        """The Quick Start section is the first content card and a stable anchor."""
         browser_page.goto(f"{BASE_URL}/help")
         browser_page.wait_for_load_state("networkidle")
-        expect(browser_page.locator("text=Docker Quick Start")).to_be_visible()
+        expect(browser_page.locator("section#quick-start")).to_be_visible()
+        expect(browser_page.locator("section#quick-start h3")).to_contain_text("Quick Start")
 
-    def test_first_steps_visible(self, browser_page):
+    def test_troubleshooting_section_visible(self, browser_page):
+        """The Troubleshooting section is the diagnostic anchor users hit when
+        something breaks; pinning its presence catches a regression that
+        accidentally removed it during a future help-page refactor."""
         browser_page.goto(f"{BASE_URL}/help")
-        expect(browser_page.locator("text=First Steps")).to_be_visible()
+        browser_page.wait_for_load_state("networkidle")
+        expect(browser_page.locator("section#troubleshooting")).to_be_visible()

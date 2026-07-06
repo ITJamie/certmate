@@ -8,20 +8,29 @@ def register_ui_routes(app, managers, require_web_auth, auth_manager):
     @app.route('/')
     def index():
         """Main dashboard UI"""
-        if not auth_manager.is_local_auth_enabled() or not auth_manager.has_any_users():
+        if auth_manager.is_setup_mode():
             return render_template('setup.html')
 
         session_id = request.cookies.get('certmate_session')
-        if not auth_manager.validate_session(session_id):
-            return redirect(url_for('login_page'))
+        user_info = auth_manager.validate_session(session_id)
+        if not user_info:
+            return redirect(url_for('login_page', next=request.path))
+        # Mirror the require_role decorator behavior so the context
+        # processor in routes.py sees the authenticated user and the
+        # template can render the logout button server-side.
+        request.current_user = user_info
 
         return render_template('index.html')
 
     @app.route('/certificates')
-    @auth_manager.require_role('viewer')
     def certificates_page():
-        """Certificates list page"""
-        return render_template('certificates.html')
+        """Certificates list (alias) — unified into the dashboard at `/`.
+
+        `certificates.html` never existed, so this route used to 500. The
+        certificate list lives on the dashboard now; redirect there (the
+        index route enforces auth), mirroring the client-certificates alias.
+        """
+        return redirect(url_for('index'))
 
     @app.route('/settings')
     @auth_manager.require_role('admin')
@@ -30,10 +39,13 @@ def register_ui_routes(app, managers, require_web_auth, auth_manager):
         return render_template('settings.html')
 
     @app.route('/audit')
-    @auth_manager.require_role('admin')
     def audit_page():
-        """Audit logs page"""
-        return render_template('audit.html')
+        """Audit log (alias) — unified into the activity page.
+
+        `audit.html` never existed (route used to 500). The audit/activity
+        log lives at `/activity`; redirect there (which enforces auth).
+        """
+        return redirect(url_for('activity_page'))
 
     @app.route('/help')
     @auth_manager.require_role('viewer')
@@ -46,6 +58,14 @@ def register_ui_routes(app, managers, require_web_auth, auth_manager):
     def activity_page():
         """Activity page"""
         return render_template('activity.html')
+
+    @app.route('/notifications')
+    @auth_manager.require_role('viewer')
+    def notifications_page():
+        """Notifications page — certificate expiry warnings, with client-side
+        snooze. Warnings are derived in the browser from /api/certificates
+        (same source as the top-bar bell badge), so no server-side state."""
+        return render_template('notifications.html')
 
     @app.route('/redoc')
     @auth_manager.require_role('viewer')

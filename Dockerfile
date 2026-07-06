@@ -1,5 +1,9 @@
-# Multi-stage build for optimized image size and faster builds
-FROM python:3.12-slim-trixie AS builder
+# Multi-stage build for optimized image size and faster builds.
+# Base image pinned by sha256 digest (not just the tag): the tag is a
+# moving target on Docker Hub, the digest is content-addressed and
+# guarantees byte-identical bytes. Bump deliberately when there's a
+# CVE fix or feature reason — not implicitly on every rebuild.
+FROM python:3.12-slim-trixie@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9 AS builder
 
 # Set working directory for build stage
 WORKDIR /build
@@ -42,17 +46,21 @@ RUN pip install -U pip setuptools wheel && \
         done; \
     fi
 
-# Production stage
-FROM python:3.12-slim-trixie
+# Production stage — same digest pin as the builder stage above.
+FROM python:3.12-slim-trixie@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9
 
 # Set working directory
 WORKDIR /app
 
-# Install runtime dependencies + tini for proper PID 1 signal handling
+# Install runtime dependencies + tini for proper PID 1 signal handling.
+# bash is needed because: (a) the certmate user is created with /bin/bash as
+# its login shell on the line below, and (b) operator-provided deploy hooks
+# routinely start with `#!/bin/bash` — without bash the kernel cannot resolve
+# the shebang and the script returns exit 127 (issue #207).
 # apt-get upgrade pulls security patches for glibc, zlib, etc.
 RUN apt-get update && \
     apt-get upgrade -y -o Acquire::Retries=3 && \
-    apt-get install -y -o Acquire::Retries=3 curl tini && \
+    apt-get install -y -o Acquire::Retries=3 bash curl tini && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --create-home --shell /bin/bash certmate
 

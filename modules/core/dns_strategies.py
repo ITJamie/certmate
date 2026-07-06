@@ -4,6 +4,9 @@ Implements the Strategy Pattern for DNS provider configuration and management.
 """
 
 import logging
+import os
+import sys
+import shlex
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -166,12 +169,45 @@ class Route53Strategy(DNSProviderStrategy):
 
 class AzureStrategy(DNSProviderStrategy):
     def create_config_file(self, config_data: Dict[str, Any]) -> Optional[Path]:
+        # The caller (CertificateManager.create_certificate /
+        # renew_certificate via _dns_config_for_strategy) injects either:
+        #   * ``_zone_domains`` — list of zones resolved by the per-provider
+        #     discovery hook (the path that unlocks wildcard issuance
+        #     against a parent hosted zone, e.g. ``*.example2.example.com``
+        #     under Azure-hosted ``example.com``); written as multiple
+        #     ``dns_azure_zoneN`` lines so the plugin's longest-match
+        #     selects the right zone per challenge, OR
+        #   * ``_zone_domain`` — single-zone string (legacy shape, kept so
+        #     pre-discovery callers and existing tests keep working).
+        # certbot-dns-azure 2.x aborts with "At least one zone mapping
+        # needs to be provided" if neither is present.
+        zone_domains = config_data.get('_zone_domains')
+        if zone_domains:
+            zones = [str(z).strip() for z in zone_domains if str(z).strip()]
+            if not zones:
+                raise ValueError(
+                    "Azure DNS config received an empty '_zone_domains' "
+                    "list. The discovery hook must return at least one "
+                    "hosted zone covering the cert FQDN(s)."
+                )
+            zone_arg: Any = zones
+        else:
+            single = str(config_data.get('_zone_domain') or '').strip()
+            if not single:
+                raise ValueError(
+                    "Azure DNS config requires a zone domain. The caller "
+                    "must inject '_zone_domains' (list) or '_zone_domain' "
+                    "(str) into dns_config before calling "
+                    "AzureStrategy.create_config_file()."
+                )
+            zone_arg = single
         return create_azure_config(
             config_data.get('subscription_id', ''),
             config_data.get('resource_group', ''),
             config_data.get('tenant_id', ''),
             config_data.get('client_id', ''),
             config_data.get('client_secret', ''),
+            zone_arg,
         )
 
     @property
@@ -441,7 +477,7 @@ class DuckDNSStrategy(DNSProviderStrategy):
 class GenericMultiProviderStrategy(DNSProviderStrategy):
     def __init__(self, provider_name: str):
         self.provider_name = provider_name
-        
+
     def create_config_file(self, config_data: Dict[str, Any]) -> Optional[Path]:
         return create_multi_provider_config(self.provider_name, config_data)
 
@@ -449,15 +485,147 @@ class GenericMultiProviderStrategy(DNSProviderStrategy):
     def plugin_name(self) -> str:
         return f'dns-{self.provider_name}'
 
+
+class CustomScriptStrategy(DNSProviderStrategy):
+    """Admin-supplied DNS hook scripts via certbot --manual (#286).
+
+    Covers any DNS provider without a certbot plugin (OCI, in-house DNS,
+    appliance APIs, ...): the admin points CertMate at an auth script and
+    an optional cleanup script, and certbot invokes them with
+    CERTBOT_DOMAIN / CERTBOT_VALIDATION in the environment exactly as
+    documented for --manual-auth-hook. The auth script is responsible for
+    creating the _acme-challenge TXT record AND waiting until it has
+    propagated — certbot does not sleep between hook and validation.
+
+    Trust model: same as deploy hooks — the script paths are configured by
+    an authenticated admin and execute with CertMate's privileges. The
+    paths are validated at issuance time (absolute, existing, executable,
+    not world-writable) so a typo or a tampered-permissions file fails
+    loudly instead of producing a baffling certbot error. certbot executes
+    manual hooks THROUGH THE SHELL (subprocess shell=True) and validates
+    them by splitting on whitespace, so paths containing whitespace or any
+    shell metacharacter are rejected outright — they cannot work even
+    quoted, and rejecting them here beats certbot's cryptic
+    HookCommandNotFound on a truncated token.
+
+    Renewals work because certbot persists manual_auth_hook /
+    manual_cleanup_hook in its per-domain renewal conf: the scripts are
+    stable admin paths, not temp files, so the replay just works. If the
+    admin moves a script after issuance, the conf still points at the old
+    path — reissue (or edit the renewal conf) after relocating scripts.
+    """
+
+    def __init__(self):
+        self._auth_hook: Optional[str] = None
+        self._cleanup_hook: Optional[str] = None
+
+    @staticmethod
+    def _validated_hook_path(path_value: Optional[str], label: str) -> Optional[str]:
+        if not path_value or not str(path_value).strip():
+            return None
+        path = Path(str(path_value).strip())
+        if not path.is_absolute():
+            raise ValueError(f"custom-script {label} must be an absolute path: {path}")
+        if not path.is_file():
+            raise ValueError(f"custom-script {label} does not exist: {path}")
+        if not os.access(path, os.X_OK):
+            raise ValueError(f"custom-script {label} is not executable: {path}")
+        if shlex.quote(str(path)) != str(path):
+            # certbot executes manual hooks through the shell AND its hook
+            # validation splits the command on whitespace, so a path with
+            # spaces or shell metacharacters cannot work even when quoted.
+            # Failing here gives a clear message instead of certbot's
+            # HookCommandNotFound on a truncated token.
+            raise ValueError(
+                f"custom-script {label} path contains whitespace or shell "
+                f"metacharacters, which certbot's shell-based hook execution "
+                f"cannot handle: {path}. Use a path containing only letters, "
+                f"digits, '/', '.', '_' and '-'."
+            )
+        mode = path.stat().st_mode
+        if mode & 0o002:
+            raise ValueError(
+                f"custom-script {label} is world-writable ({oct(mode & 0o777)}): {path}. "
+                f"Refusing to execute a script anyone on the host can modify."
+            )
+        if mode & 0o020:
+            logger.warning(
+                f"custom-script {label} {path} is group-writable "
+                f"({oct(mode & 0o777)}); consider chmod 755 or stricter."
+            )
+        return str(path)
+
+    def create_config_file(self, config_data: Dict[str, Any]) -> Optional[Path]:
+        # The "credentials" are the hook paths themselves; validate them and
+        # keep them on the instance for configure_certbot_arguments. No temp
+        # credentials file is needed.
+        self._auth_hook = self._validated_hook_path(config_data.get('auth_hook'), 'auth hook')
+        if not self._auth_hook:
+            raise ValueError(
+                "custom-script DNS provider requires an 'auth_hook' script path"
+            )
+        self._cleanup_hook = self._validated_hook_path(config_data.get('cleanup_hook'), 'cleanup hook')
+        return None
+
+    @property
+    def plugin_name(self) -> str:
+        # 'manual' is a certbot core feature, not an installable plugin —
+        # the plugin-installed preflight skips it (see certificates.py).
+        return 'manual'
+
+    @property
+    def supports_propagation_seconds_flag(self) -> bool:
+        # --manual has no propagation flag; waiting is the auth hook's job.
+        return False
+
+    def configure_certbot_arguments(self, cmd: list, credentials_file: Optional[Path], domain_alias: Optional[str] = None) -> None:
+        if not self._auth_hook:
+            raise ValueError(
+                "CustomScriptStrategy.configure_certbot_arguments called "
+                "before create_config_file validated the hook paths"
+            )
+        # The validated paths are shell-safe by construction (validation
+        # rejects anything shlex.quote would alter), so raw emission is
+        # safe for certbot's shell-based hook execution AND survives its
+        # whitespace-splitting hook validation, which a quoted spaced path
+        # would not.
+        cmd.extend([
+            '--manual',
+            '--preferred-challenges', 'dns',
+            '--manual-auth-hook', self._auth_hook,
+        ])
+        if self._cleanup_hook:
+            cmd.extend(['--manual-cleanup-hook', self._cleanup_hook])
+
+    def prepare_environment(self, env: Dict[str, str], config_data: Dict[str, Any]) -> None:
+        # Optional hint for scripts that prefer a configurable sleep over
+        # polling their DNS API: surfaces the account-level setting.
+        propagation = config_data.get('propagation_seconds')
+        if propagation:
+            env['CERTMATE_DNS_PROPAGATION_SECONDS'] = str(propagation)
+
+def acme_webroot_dir() -> Path:
+    """Absolute filesystem root for HTTP-01 webroot challenges.
+
+    Single source of truth for the three call sites that must agree or
+    issuance silently fails: the certbot ``--webroot`` argument (where certbot
+    writes the token), the challenge-directory pre-creation in
+    ``CertificateManager``, and the Flask route that serves
+    ``/.well-known/acme-challenge/<token>`` (see ``modules/web/routes.py`` and
+    ``modules/core/factory.py``). Override the location with the
+    ``ACME_CHALLENGES_DIR`` environment variable; the default keeps the
+    historical ``<cwd>/data/acme-challenges`` path.
+    """
+    return Path(os.environ.get('ACME_CHALLENGES_DIR', 'data/acme-challenges')).resolve()
+
+
 class HTTP01Strategy(DNSProviderStrategy):
     """HTTP-01 challenge using certbot --webroot plugin.
 
     No DNS credentials needed. CertMate serves challenge files
     via /.well-known/acme-challenge/<token> and certbot writes
-    them to the webroot directory.
+    them to the webroot directory (see ``acme_webroot_dir``).
     """
-
-    WEBROOT_DIR = 'data/acme-challenges'
 
     @property
     def plugin_name(self) -> str:
@@ -467,8 +635,7 @@ class HTTP01Strategy(DNSProviderStrategy):
         return None  # No credentials needed
 
     def configure_certbot_arguments(self, cmd: list, credentials_file: Optional[Path], domain_alias: Optional[str] = None) -> None:
-        webroot = str(Path(self.WEBROOT_DIR).resolve())
-        cmd.extend(['--webroot', '-w', webroot])
+        cmd.extend(['--webroot', '-w', str(acme_webroot_dir())])
 
     def prepare_environment(self, env: Dict[str, str], config_data: Dict[str, Any]) -> None:
         pass  # No env vars needed
@@ -476,6 +643,39 @@ class HTTP01Strategy(DNSProviderStrategy):
     @property
     def default_propagation_seconds(self) -> int:
         return 0  # No propagation needed for HTTP-01
+
+
+class SolidServerStrategy(DNSProviderStrategy):
+    """EfficientIP SOLIDserver DNS strategy using custom hook script."""
+
+    def create_config_file(self, config_data: Dict[str, Any]) -> Optional[Path]:
+        return None
+
+    @property
+    def plugin_name(self) -> str:
+        return 'manual'
+
+    @property
+    def supports_propagation_seconds_flag(self) -> bool:
+        return False
+
+    def configure_certbot_arguments(self, cmd: list, credentials_file: Optional[Path], domain_alias: Optional[str] = None) -> None:
+        script_path = str(Path('scripts/solidserver_hook.py').resolve())
+        cmd.extend([
+            '--manual',
+            '--preferred-challenges', 'dns',
+            '--manual-auth-hook', f'{sys.executable} {script_path} auth',
+            '--manual-cleanup-hook', f'{sys.executable} {script_path} cleanup'
+        ])
+
+    def prepare_environment(self, env: Dict[str, str], config_data: Dict[str, Any]) -> None:
+        env['SOLIDSERVER_HOST'] = config_data.get('host', '')
+        env['SOLIDSERVER_USERNAME'] = config_data.get('username', '')
+        env['SOLIDSERVER_PASSWORD'] = config_data.get('password', '')
+        env['SOLIDSERVER_DNS_NAME'] = config_data.get('dns_name', '')
+        env['SOLIDSERVER_DNSVIEW_NAME'] = config_data.get('dnsview_name', '')
+        if config_data.get('propagation_seconds'):
+            env['CERTMATE_DNS_PROPAGATION_SECONDS'] = str(config_data.get('propagation_seconds'))
 
 
 class DNSStrategyFactory:
@@ -497,6 +697,8 @@ class DNSStrategyFactory:
         'infomaniak': InfomaniakStrategy,
         'acme-dns': AcmeDNSStrategy,
         'duckdns': DuckDNSStrategy,
+        'solidserver': SolidServerStrategy,
+        'custom-script': CustomScriptStrategy,
         'http-01': HTTP01Strategy,
     }
     

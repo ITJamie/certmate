@@ -4,13 +4,19 @@ Handles loading/saving settings, migrations, and configuration management
 """
 
 import os
+import re
 import threading
 import logging
+from collections import deque
 from pathlib import Path
 
+from modules import __version__ as _CERTMATE_VERSION
 from .constants import iter_cert_domain_dirs
 from .file_operations import FileOperations
-from .utils import generate_secure_token, validate_email, validate_api_token, validate_domain
+from .utils import (
+    generate_secure_token, validate_email, validate_api_token, validate_domain,
+    validate_key_options,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +40,15 @@ PUBLIC_SETTINGS_WRITABLE_KEYS = frozenset({
     'renewal_threshold_days',
     'challenge_type',
     'certificate_storage',
+    'backup_storage',          # off-site backup target (S3-compatible)
     'notifications',
+    'rate_limits',             # configurable API rate limits (#319); no side-effects
     'setup_completed',
+    # Per-install "stop nagging me with the first-run wizard" flag. Distinct
+    # from setup_completed, which must stay truthful for recovery/downgrade
+    # detection: a user can dismiss the wizard without having completed setup
+    # through it. Boolean, no side effects.
+    'wizard_dismissed',
     'cloudflare_token',         # legacy single-provider token
     'ca_providers',             # CA provider configuration
     'default_ca',               # selected CA provider
@@ -43,6 +56,16 @@ PUBLIC_SETTINGS_WRITABLE_KEYS = frozenset({
     'default_accounts',         # per-DNS-provider default accounts
     'dns_propagation_seconds',
     'cache_ttl',
+    # Configurable certificate key type/size globals.
+    # These are not secrets — they only carry values like 'rsa', '2048',
+    # 'secp256r1'.  The settings UI POSTs them to general settings.
+    'default_key_type',
+    'default_key_size',
+    'default_elliptic_curve',
+    # Password used to encrypt the on-disk Windows .pfx export (issue #230).
+    # Empty/unset disables the export. Masked on GET and preserved on POST by
+    # the generic secret machinery (name matches the secret regex).
+    'pfx_password',
 })
 
 # Keys whose mutation via the bulk settings endpoint would create a privilege
@@ -60,14 +83,113 @@ SETTINGS_REJECT_KEYS = frozenset({
     'users',
     'api_keys',
     'local_auth_enabled',
+    # OIDC config contains client_secret + identity-source rules. Mutated
+    # via the dedicated /api/auth/oidc/settings endpoint with its own
+    # validation + audit. Bulk POST would skip both.
+    'oidc',
 })
 
 
 SECRET_MASK_SENTINEL = '********'
 
+# Field-name pattern identifying secret-like keys. Must stay in sync with
+# the masking regex in modules/web/settings_routes.py so a value masked on
+# GET is also recognised on POST. An empty string in one of these fields
+# means "keep the existing on-disk value" — same semantics as the sentinel.
+# This is what protects storage-backend credentials when the user saves
+# settings without re-entering a secret the UI deliberately does not
+# repopulate (see loadStorageBackendSettings in static/js/settings.js).
+_SECRET_KEY_RE = re.compile(
+    r'(token|secret|password|key|credential|hmac)',
+    re.IGNORECASE,
+)
+# Keys whose name matches the secret regex but whose value is NOT a secret.
+# Mirrors _NON_SECRET_KEYS in modules/web/settings_routes.py: these carry
+# the global default key-options ('rsa', 2048, 'secp256r1'), not credentials,
+# so empty values must NOT be treated as "preserve".
+_NON_SECRET_KEY_NAMES = frozenset({
+    'default_key_type',
+    'default_key_size',
+    'default_elliptic_curve',
+})
+
+
+def _is_secret_key(name: str) -> bool:
+    if name in _NON_SECRET_KEY_NAMES:
+        return False
+    return bool(_SECRET_KEY_RE.search(name))
+
+
+# Provider-specific secret fields whose names do NOT match the generic
+# regex but ARE credential material in their nesting context. Keyed by
+# the immediate parent key — masking is applied only when walking into
+# that parent, so a generic ``username`` (e.g. SMTP login email) is
+# NOT inadvertently masked.
+#
+# Audit M2: ``acme-dns`` provider stores its shared secret as a pair
+# of ``username`` (UUID) + ``subdomain`` (corresponding ACME-DNS
+# delegation host). Together they authorise TXT record updates on
+# behalf of the user's domain. Both must be masked.
+_PROVIDER_SPECIFIC_SECRET_FIELDS = {
+    'acme-dns': frozenset({'username', 'subdomain'}),
+}
+
+
+def mask_secrets_in_settings(settings_dict):
+    """Return a deep-copied settings dict with every credential-bearing
+    value replaced by ``SECRET_MASK_SENTINEL``.
+
+    Two passes coexist in the same walk:
+
+    1. Generic regex: any field whose name matches the project's
+       secret-name pattern (``token|secret|password|key|credential|hmac``)
+       — excluding the documented non-secret allowlist
+       (``default_key_type`` etc.) — gets masked.
+    2. Provider-specific: when the immediate parent key is one of the
+       providers in ``_PROVIDER_SPECIFIC_SECRET_FIELDS``, any listed
+       field name on that level gets masked even if the regex would
+       not match it. Today this covers ``acme-dns`` ``username`` +
+       ``subdomain``; future providers with similarly named shared-
+       secret fields can extend the registry without re-touching the
+       walker.
+
+    Used by:
+
+    - ``modules/web/settings_routes.py::api_settings_get`` — masked
+      response for ``/api/web/settings`` GET.
+    - ``modules/web/misc_routes.py::api_notifications_config`` —
+      masked response for the notifications subtree (audit H5).
+    - ``modules/core/file_operations.py::create_unified_backup`` —
+      share-safe default for backup ZIPs (audit C1).
+    """
+    def _walk(node, parent_key=None):
+        if isinstance(node, dict):
+            provider_extras = _PROVIDER_SPECIFIC_SECRET_FIELDS.get(parent_key, frozenset())
+            out = {}
+            for key, value in node.items():
+                if isinstance(value, str) and value and (
+                    _is_secret_key(key) or key in provider_extras
+                ):
+                    out[key] = SECRET_MASK_SENTINEL
+                else:
+                    # For list values, propagate the CURRENT dict's
+                    # parent_key down so list items inherit the
+                    # provider context (e.g. ``acme-dns.accounts[*]``
+                    # is still acme-dns-context). For dict values,
+                    # the new parent is the key we are descending
+                    # into.
+                    next_parent = parent_key if isinstance(value, list) else key
+                    out[key] = _walk(value, parent_key=next_parent)
+            return out
+        if isinstance(node, list):
+            return [_walk(item, parent_key=parent_key) for item in node]
+        return node
+    return _walk(settings_dict)
+
 
 def _strip_masked_values(payload):
-    """Recursively strip keys whose value equals the masking sentinel.
+    """Recursively strip keys whose value equals the masking sentinel — or,
+    for secret-named fields, whose value is an empty string.
 
     GET /api/web/settings masks secret-named fields with '********' so the
     UI can render the form without leaking the real values. A round-trip
@@ -76,6 +198,13 @@ def _strip_masked_values(payload):
     secret with the literal string '********'. Stripping these placeholders
     pre-validation makes the round-trip a no-op for the masked fields
     while leaving every other key untouched.
+
+    Empty strings get the same treatment for secret-named keys: the storage
+    UI deliberately does not repopulate fields like ``client_secret`` /
+    ``vault_token`` / ``secret_access_key`` when loading settings, so a
+    submit that didn't re-type them arrives with ``''``. Treating that as
+    "preserve existing" is the only interpretation that doesn't silently
+    drop credentials on every settings save.
 
     Operates on dicts of arbitrary depth. Lists and non-dict values are
     returned unchanged. A key whose value is a dict that was originally
@@ -91,6 +220,9 @@ def _strip_masked_values(payload):
     for key, value in payload.items():
         if value == SECRET_MASK_SENTINEL:
             continue
+        if value == '' and _is_secret_key(key):
+            # Blank-on-save for a secret field => preserve existing.
+            continue
         if isinstance(value, dict):
             original_size = len(value)
             cleaned = _strip_masked_values(value)
@@ -102,6 +234,122 @@ def _strip_masked_values(payload):
         else:
             out[key] = value
     return out
+
+
+def _restore_masked_list_secrets(old_list, new_list):
+    """Restore masked secrets inside a list-of-dicts replaced wholesale on save.
+
+    ``_strip_masked_values`` + ``_deep_merge_dict`` preserve masked secrets only
+    inside *dict* subtrees; a list (e.g. ``notifications.channels.webhooks``) is
+    replaced as a unit, so a secret-named field the UI rendered as
+    ``SECRET_MASK_SENTINEL`` and the user left untouched would be written back as
+    the literal sentinel — clobbering the real token/secret on disk.
+
+    For every dict in ``new_list``, any secret-named field still equal to the
+    sentinel is restored from the matching dict in ``old_list`` — matched first
+    by identity ``(type, url, name)`` (robust to reordering/deletion), then by
+    position. Each prior dict is consumed at most once, so two webhooks sharing
+    an identity keep their own distinct secrets (the Nth new maps to the Nth
+    prior) instead of both collapsing onto the first. With no prior match the
+    masked field is dropped (no value to keep). A blank secret is left as-is, so
+    a deliberately cleared field stays cleared. Mutates and returns ``new_list``.
+    """
+    if not isinstance(new_list, list):
+        return new_list
+    old_list = old_list if isinstance(old_list, list) else []
+
+    def _identity(d):
+        return (d.get('type'), d.get('url'), d.get('name'))
+
+    # Queue prior dicts per identity so duplicate-identity webhooks are matched
+    # one-to-one rather than every duplicate resolving to the first.
+    by_identity = {}
+    for old in old_list:
+        if isinstance(old, dict):
+            by_identity.setdefault(_identity(old), deque()).append(old)
+
+    for i, item in enumerate(new_list):
+        if not isinstance(item, dict):
+            continue
+        queue = by_identity.get(_identity(item))
+        if queue:
+            prior = queue.popleft()
+        elif i < len(old_list) and isinstance(old_list[i], dict):
+            prior = old_list[i]
+        else:
+            prior = {}
+        for key in list(item.keys()):
+            if _is_secret_key(key) and item.get(key) == SECRET_MASK_SENTINEL:
+                if key in prior:
+                    item[key] = prior[key]
+                else:
+                    item.pop(key, None)
+    return new_list
+
+
+def _restore_masked_list_secrets_deep(old_subtree, new_subtree):
+    """Recursively apply ``_restore_masked_list_secrets`` across a merged
+    settings subtree.
+
+    ``_deep_merge_dict`` replaces lists wholesale, so a secret the UI masked
+    inside a list-of-dicts (e.g. ``notifications.channels.webhooks``) survives
+    the merge only as the sentinel. Walking the merged subtree in lockstep with
+    the on-disk one and restoring every list lets the *generic* settings POST
+    path preserve list-nested secrets exactly like the dedicated notifications
+    route already does. Mutates and returns ``new_subtree``.
+    """
+    if not isinstance(new_subtree, dict) or not isinstance(old_subtree, dict):
+        return new_subtree
+    for key, value in new_subtree.items():
+        old_value = old_subtree.get(key)
+        if isinstance(value, list):
+            _restore_masked_list_secrets(old_value, value)
+        elif isinstance(value, dict):
+            _restore_masked_list_secrets_deep(old_value, value)
+    return new_subtree
+
+
+# Top-level settings keys whose value is a nested dict that should be
+# deep-merged rather than wholesale-replaced on save. Each of these stores
+# multiple secret-bearing subtrees (per-backend storage credentials, per-CA
+# EAB credentials, per-channel notification credentials), so the user
+# editing one field in the UI must not blow away the others or the
+# previously-saved secret for the same field.
+#
+# Audit finding M3 (May 2026): `notifications` was originally absent
+# from this list. The dedicated notifications POST route in
+# `modules/web/misc_routes.py` wholesale-replaced the subtree, so the
+# masked-sentinel + sibling-preservation logic that PR #215 added for
+# `certificate_storage` / `ca_providers` did not protect SMTP and
+# webhook credentials. Including `notifications` here AND routing the
+# misc_routes POST through `_strip_masked_values` + `_deep_merge_dict`
+# (the same shape as the settings POST path) closes the gap.
+_DEEP_MERGE_SETTINGS_KEYS = frozenset({
+    'certificate_storage',
+    'backup_storage',
+    'ca_providers',
+    'notifications',
+    'rate_limits',
+})
+
+
+def _deep_merge_dict(base, overlay):
+    """Return a copy of ``base`` with ``overlay`` merged on top, recursing
+    into nested dicts. Lists and scalars in ``overlay`` replace those in
+    ``base``. Used for the storage/ca_providers subtrees where a partial
+    POST (e.g. masked secrets stripped out) must preserve the on-disk
+    values for sibling and child keys."""
+    if not isinstance(base, dict):
+        return overlay
+    if not isinstance(overlay, dict):
+        return overlay
+    merged = dict(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge_dict(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
 
 
 def validate_settings_post(payload, current=None):
@@ -148,6 +396,21 @@ def validate_settings_post(payload, current=None):
             filtered[key] = value
         else:
             unknown.append(key)
+
+    # Reject a malformed renewal threshold at the door rather than letting
+    # it persist and silently break renewal. A 0/negative/non-numeric value
+    # would make `days_left <= threshold` permanently False (no cert ever
+    # renews) — the worst possible failure for a cert manager. Only a
+    # genuinely changed value reaches here (no-op echoes were dropped above).
+    if 'renewal_threshold_days' in filtered:
+        try:
+            coerced = int(filtered['renewal_threshold_days'])
+        except (TypeError, ValueError):
+            raise ValueError("renewal_threshold_days must be an integer between 1 and 365")
+        if not 1 <= coerced <= 365:
+            raise ValueError("renewal_threshold_days must be between 1 and 365")
+        filtered['renewal_threshold_days'] = coerced
+
     return filtered, rejected, unknown
 
 
@@ -229,6 +492,53 @@ class SettingsManager:
         # Wired by the factory after AuthManager is constructed.
         self._token_hasher = None
 
+    # ------------------------------------------------------------------
+    # Request-scoped settings cache
+    # ------------------------------------------------------------------
+    # load_settings() is called 15+ times per typical /api/certificates
+    # request (once at the top, then again from get_certificate_info and
+    # _parse_certificate_info for every domain). Each call hit the disk,
+    # parsed JSON, ran the migration/default-fill logic, and acquired the
+    # write lock. With 50 certs the same request fired ~100 redundant
+    # full settings loads.
+    #
+    # We cache the parsed result on `flask.g` for the duration of one HTTP
+    # request. Outside a request context (scheduler, deploy worker, tests)
+    # the cache no-ops and behaviour is identical to before.
+    #
+    # save_settings/atomic_update clear the cache after a successful write
+    # so a route that loads → mutates via settings_manager → reads again
+    # sees the new values.
+    _CACHE_ATTR = '_certmate_settings_cache'
+
+    @classmethod
+    def _request_cache_get(cls):
+        try:
+            from flask import g, has_request_context
+            if has_request_context():
+                return getattr(g, cls._CACHE_ATTR, None)
+        except (ImportError, RuntimeError):
+            return None
+        return None
+
+    @classmethod
+    def _request_cache_set(cls, value):
+        try:
+            from flask import g, has_request_context
+            if has_request_context():
+                setattr(g, cls._CACHE_ATTR, value)
+        except (ImportError, RuntimeError):
+            pass
+
+    @classmethod
+    def _request_cache_clear(cls):
+        try:
+            from flask import g, has_request_context
+            if has_request_context() and hasattr(g, cls._CACHE_ATTR):
+                delattr(g, cls._CACHE_ATTR)
+        except (ImportError, RuntimeError):
+            pass
+
     def set_token_hasher(self, hasher):
         """Inject the hasher used to migrate legacy api_bearer_token to its
         hashed form on the next save. None disables migration."""
@@ -257,10 +567,30 @@ class SettingsManager:
         Loads the current on-disk settings, merges *incoming* on top, restores
         any *protected_keys* from the on-disk copy, then saves — all under a
         re-entrant lock so concurrent requests cannot race.
+
+        Keys listed in ``_DEEP_MERGE_SETTINGS_KEYS`` (currently
+        ``certificate_storage`` and ``ca_providers``) are merged recursively
+        with the on-disk value instead of being replaced wholesale. That
+        keeps a partial UI submit — e.g. one where masked/empty secret
+        fields have been stripped — from clobbering the previously-saved
+        credential for the same backend or CA provider.
         """
         with self._lock:
             existing = self.load_settings()
             merged = {**existing, **incoming}
+            for key, value in incoming.items():
+                if (key in _DEEP_MERGE_SETTINGS_KEYS
+                        and isinstance(existing.get(key), dict)
+                        and isinstance(value, dict)):
+                    merged_subtree = _deep_merge_dict(existing[key], value)
+                    # _deep_merge_dict replaces lists wholesale, so a secret the
+                    # UI masked inside a list-of-dicts (e.g.
+                    # notifications.channels.webhooks) would otherwise be written
+                    # back as the sentinel. Restore those from the on-disk
+                    # subtree so the generic settings POST path preserves them
+                    # like the dedicated notifications route does.
+                    _restore_masked_list_secrets_deep(existing[key], merged_subtree)
+                    merged[key] = merged_subtree
             for key in protected_keys:
                 if key in existing:
                     merged[key] = existing[key]
@@ -271,14 +601,25 @@ class SettingsManager:
     def _try_restore_from_backup(self):
         """Attempt to restore settings from the most recent unified backup."""
         try:
-            import zipfile, json
+            import io, zipfile, json
+            from .file_operations import (
+                _BACKUP_ENC_SUFFIX, _backup_passphrase, _decrypt_backup_payload,
+            )
             backup_dir = self.file_ops.backup_dir / "unified"
             if not backup_dir.exists():
                 return None
-            backups = sorted(backup_dir.glob("backup_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+            backups = sorted(backup_dir.glob("backup_*.zip*"), key=lambda p: p.stat().st_mtime, reverse=True)
             for backup_path in backups[:5]:  # try the 5 most recent
                 try:
-                    with zipfile.ZipFile(backup_path, 'r') as zf:
+                    if backup_path.name.endswith(_BACKUP_ENC_SUFFIX):
+                        passphrase = _backup_passphrase()
+                        if not passphrase:
+                            logger.debug(f"Skipping encrypted backup {backup_path.name}: no passphrase set")
+                            continue
+                        zip_source = io.BytesIO(_decrypt_backup_payload(backup_path.read_bytes(), passphrase))
+                    else:
+                        zip_source = backup_path
+                    with zipfile.ZipFile(zip_source, 'r') as zf:
                         if "settings.json" not in zf.namelist():
                             continue
                         raw = json.loads(zf.read("settings.json").decode('utf-8'))
@@ -297,7 +638,20 @@ class SettingsManager:
 
         Acquires the re-entrant lock so concurrent saves cannot observe a
         half-written file or race with the migration write below.
+
+        Within a Flask request, the first call hits disk; subsequent calls
+        return a deepcopy of the cached parsed dict. The cache is cleared
+        on any successful save (atomic_update / save_settings) and lives
+        only for the current request. See `_request_cache_*` above.
         """
+        cached = self._request_cache_get()
+        if cached is not None:
+            # Deepcopy so callers that mutate the returned dict (load →
+            # mutate in place → save) don't pollute the request-scoped
+            # cache for the next reader within the same request.
+            import copy as _copy
+            return _copy.deepcopy(cached)
+
         with self._lock:
             default_settings = {
                 'cloudflare_token': '',
@@ -307,8 +661,17 @@ class SettingsManager:
                 'renewal_threshold_days': 30,  # Configurable certificate expiry threshold (days)
                 'api_bearer_token': _bearer_token_from_env_or_generate(),
                 'setup_completed': False,  # Track if initial setup is done
+                'wizard_dismissed': False,  # First-run wizard dismissed by the user (durable across browsers)
                 'dns_provider': 'cloudflare',
                 'challenge_type': 'dns-01',  # 'dns-01' or 'http-01'
+                # Default certificate key shape applied to any cert that does
+                # not carry a per-domain override. 'rsa'/2048 mirrors the
+                # implicit certbot default that CertMate emitted before this
+                # setting existed, so upgraded installs see no change.
+                'default_key_type': 'rsa',
+                'default_key_size': 2048,
+                'default_elliptic_curve': 'secp256r1',
+                'pfx_password': '',  # Encrypts the on-disk .pfx export; empty = disabled (#230)
                 'dns_providers': {},  # Start with empty DNS providers - only add what's actually configured
                 'certificate_storage': {  # New storage backend configuration
                     'backend': 'local_filesystem',  # Default to local filesystem for backward compatibility
@@ -317,7 +680,8 @@ class SettingsManager:
                         'vault_url': '',
                         'client_id': '',
                         'client_secret': '',
-                        'tenant_id': ''
+                        'tenant_id': '',
+                        'storage_mode': 'secrets'
                     },
                     'aws_secrets_manager': {
                         'region': 'us-east-1',
@@ -336,7 +700,47 @@ class SettingsManager:
                         'client_secret': '',
                         'project_id': '',
                         'environment': 'prod'
+                    },
+                    's3_compatible': {
+                        'endpoint_url': '',
+                        'bucket': '',
+                        'access_key_id': '',
+                        'secret_access_key': '',
+                        'region': 'us-east-1',
+                        'prefix': 'certmate/certificates'
                     }
+                },
+                'backup_storage': {  # Optional off-site copy of unified backups (best-effort)
+                    'backend': 'none',
+                    's3_compatible': {
+                        'endpoint_url': '',
+                        'bucket': '',
+                        'access_key_id': '',
+                        'secret_access_key': '',
+                        'region': 'us-east-1',
+                        'prefix': 'certmate/backups'
+                    }
+                },
+                # OIDC/SSO identity source. Disabled by default; opt-in via
+                # the Settings → SSO tab. Coexists with local auth and API
+                # keys — never replaces them. See modules/core/oidc.py for
+                # the consumer.
+                'oidc': {
+                    'enabled': False,
+                    'provider_name': 'SSO',
+                    'issuer_url': '',
+                    'client_id': '',
+                    'client_secret': '',
+                    'scopes': ['openid', 'email', 'profile', 'groups'],
+                    'redirect_uri_override': '',
+                    'username_claim': 'preferred_username',
+                    'email_claim': 'email',
+                    'role_claim': 'groups',
+                    'role_mappings': [],
+                    'default_role': 'viewer',
+                    'auto_create_users': True,
+                    'link_by_email': True,
+                    'post_logout_redirect_uri': '',
                 }
             }
 
@@ -351,6 +755,10 @@ class SettingsManager:
                 'setup_completed': False,
                 'dns_provider': 'cloudflare',
                 'challenge_type': 'dns-01',
+                'default_key_type': 'rsa',
+                'default_key_size': 2048,
+                'default_elliptic_curve': 'secp256r1',
+                'pfx_password': '',  # Encrypts the on-disk .pfx export; empty = disabled (#230)
                 'dns_providers': {
                     'cloudflare': {'api_token': ''},
                     'route53': {'access_key_id': '', 'secret_access_key': '', 'region': 'us-east-1'},
@@ -369,7 +777,8 @@ class SettingsManager:
                     'duckdns': {'api_token': ''},
                     'hetzner-cloud': {'api_token': ''}
                 },
-                'certificate_storage': default_settings['certificate_storage']
+                'certificate_storage': default_settings['certificate_storage'],
+                'oidc': default_settings['oidc'],
             }
 
             if not self.settings_file.exists():
@@ -380,7 +789,7 @@ class SettingsManager:
 
             try:
                 settings = self.file_ops.safe_file_read(self.settings_file, is_json=True)
-                if settings is None:
+                if not isinstance(settings, dict):
                     logger.warning("Settings file exists but is empty or corrupted, attempting backup restore")
                     settings = self._try_restore_from_backup()
                     if settings is None:
@@ -389,11 +798,50 @@ class SettingsManager:
                         return first_time_template
                     logger.info("Settings restored successfully from backup")
 
+                # Downgrade detection: warn loudly if settings.json was saved
+                # by a newer version than the one currently running.
+                disk_version = settings.get('certmate_version')
+                if disk_version and disk_version != _CERTMATE_VERSION:
+                    try:
+                        disk_parts = [int(p) for p in str(disk_version).split('.')[:2]]
+                        curr_parts = [int(p) for p in str(_CERTMATE_VERSION).split('.')[:2]]
+                        if tuple(disk_parts) > tuple(curr_parts):
+                            logger.error(
+                                "DOWNGRADE DETECTED: settings.json was written by "
+                                "CertMate %s but this process is %s. The on-disk "
+                                "format may be incompatible. If authentication or "
+                                "certificates are missing, restore the latest backup "
+                                "from %s and restart.",
+                                disk_version, _CERTMATE_VERSION,
+                                self.file_ops.backup_dir / 'unified'
+                            )
+                        else:
+                            logger.info(
+                                "settings.json version %s vs running %s — "
+                                "continuing normally.",
+                                disk_version, _CERTMATE_VERSION
+                            )
+                    except Exception:
+                        logger.warning(
+                            "settings.json has unexpected certmate_version %s "
+                            "(running %s).",
+                            disk_version, _CERTMATE_VERSION
+                        )
+
                 # Apply migrations for backward compatibility
                 settings, was_migrated = self._migrate_settings_format(settings)
 
-                # Only merge essential missing keys, NOT the full dns_providers template
-                essential_keys = ['cloudflare_token', 'domains', 'email', 'auto_renew', 'renewal_threshold_days', 'api_bearer_token', 'setup_completed', 'dns_provider', 'challenge_type']
+                # Only merge essential missing keys, NOT the full dns_providers template.
+                # ``default_key_*`` are listed here so an upgraded install picks up
+                # rsa/2048 (matching the implicit certbot default that CertMate
+                # used before the setting existed) without requiring manual edit.
+                essential_keys = [
+                    'cloudflare_token', 'domains', 'email', 'auto_renew',
+                    'renewal_threshold_days', 'api_bearer_token', 'setup_completed',
+                    'dns_provider', 'challenge_type',
+                    'default_key_type', 'default_key_size', 'default_elliptic_curve',
+                    'oidc',
+                ]
                 for key in essential_keys:
                     if key not in settings:
                         # Don't regenerate api_bearer_token if its hash is already
@@ -427,6 +875,20 @@ class SettingsManager:
                             settings['certificate_storage'][key] = value
                             was_migrated = True
 
+                    # Backfill nested defaults inside per-backend dicts (e.g.
+                    # azure_keyvault.storage_mode introduced after the initial
+                    # storage backend feature). Without this, instances upgraded
+                    # from older versions would keep the per-backend dict but
+                    # miss the new nested keys, and the backend would default
+                    # silently — making the new feature invisible from the UI.
+                    azure_kv_defaults = default_settings['certificate_storage'].get('azure_keyvault', {})
+                    azure_kv_settings = settings['certificate_storage'].get('azure_keyvault')
+                    if isinstance(azure_kv_settings, dict):
+                        for nested_key, nested_value in azure_kv_defaults.items():
+                            if nested_key not in azure_kv_settings:
+                                azure_kv_settings[nested_key] = nested_value
+                                was_migrated = True
+
                 # Validate critical settings — only regenerate if no hash is
                 # already stored (otherwise we've intentionally stripped the
                 # plaintext and authentication uses api_bearer_token_hash).
@@ -437,6 +899,13 @@ class SettingsManager:
                     was_migrated = True
 
                 # Save migrated settings if any changes were made.
+                # Stamp the current version so downgrade detection can fire
+                # on the next boot if the operator rolls back, but only trigger
+                # a write when the version actually changed.
+                if settings.get('certmate_version') != _CERTMATE_VERSION:
+                    settings['certmate_version'] = _CERTMATE_VERSION
+                    was_migrated = True
+
                 # If the save fails (disk full, permission denied, validation
                 # rejection of a field migrated up from an older format),
                 # the in-memory copy diverges from disk: callers receive the
@@ -452,6 +921,55 @@ class SettingsManager:
                             "now ahead of settings.json on disk. The next "
                             "save will retry; check earlier log lines for "
                             "the validation or I/O error that blocked it."
+                        )
+
+                # Defensive logging when critical fields are unexpectedly
+                # missing from an existing settings file. This happens after
+                # a destructive downgrade or partial corruption and gives
+                # operators a concrete next step before the wizard overwrites
+                # state.
+                if not settings.get('users'):
+                    backups = []
+                    try:
+                        unified = self.file_ops.backup_dir / 'unified'
+                        if unified.exists():
+                            backups = sorted(
+                                [b.name for b in unified.iterdir() if b.suffix == '.zip'],
+                                reverse=True
+                            )[:3]
+                            # Exclude migration-created backups: they were
+                            # produced seconds ago by this boot and don't help
+                            # the operator recover from pre-existing data loss.
+                            backups = [b for b in backups if '_migration' not in b]
+                    except Exception:
+                        pass
+                    if backups:
+                        logger.error(
+                            "CRITICAL: settings.json has no users. If this is "
+                            "unexpected, restore a backup before using the UI: %s",
+                            backups
+                        )
+                    else:
+                        logger.error(
+                            "CRITICAL: settings.json has no users and no backups "
+                            "were found. If this is unexpected, check that the "
+                            "data volume is mounted correctly."
+                        )
+
+                if not settings.get('domains'):
+                    cert_dir = getattr(self.file_ops, 'cert_dir', None)
+                    cert_domains = []
+                    if cert_dir and cert_dir.exists():
+                        try:
+                            cert_domains = [d.name for d in iter_cert_domain_dirs(cert_dir)]
+                        except Exception:
+                            pass
+                    if cert_domains:
+                        logger.warning(
+                            "settings.json has no domains but certificates exist "
+                            "on disk: %s. Use the API or the 'Add Domain' UI flow "
+                            "to re-register them.",
+                            cert_domains
                         )
 
                 # Override settings with environment variables.
@@ -483,11 +1001,23 @@ class SettingsManager:
                         accounts['default'] = default_account
                     default_account['api_token'] = os.getenv('CLOUDFLARE_TOKEN')
 
+                # Cache the canonical version. Return a deepcopy so the
+                # caller's in-place mutations cannot pollute the cache for
+                # subsequent readers in the same request. (See the cache-hit
+                # branch at the top of this method for the symmetric copy.)
+                self._request_cache_set(settings)
+                if self._request_cache_get() is not None:
+                    import copy as _copy
+                    return _copy.deepcopy(settings)
                 return settings
 
             except Exception as e:
                 logger.error(f"Error loading settings: {e}")
                 logger.warning("Returning default settings in-memory (existing file preserved on disk)")
+                # Don't cache the fallback default — if the next reader is
+                # called after the underlying file becomes readable, we want
+                # them to hit disk again rather than serve defaults all
+                # request long.
                 return default_settings
 
     def save_settings(self, settings, backup_reason="auto_save"):
@@ -562,10 +1092,37 @@ class SettingsManager:
                 # Validate dns_provider against supported set.
                 # IMPORTANT: when adding a provider, also update tests/test_provider_wiring_consistency.py
                 # which extracts this literal via inspect.getsource.
-                supported_providers = {'cloudflare','route53','azure','google','powerdns','digitalocean','linode','edgedns','gandi','ovh','namecheap','vultr','dnsmadeeasy','nsone','rfc2136','hetzner','hetzner-cloud','porkbun','godaddy','he-ddns','dynudns','arvancloud','infomaniak','acme-dns','duckdns'}
+                supported_providers = {'cloudflare','route53','azure','google','powerdns','digitalocean','linode','edgedns','gandi','ovh','namecheap','vultr','dnsmadeeasy','nsone','rfc2136','hetzner','hetzner-cloud','porkbun','godaddy','he-ddns','dynudns','arvancloud','infomaniak','acme-dns','duckdns','desec','scaleway','solidserver','custom-script'}
                 if 'dns_provider' in settings and settings['dns_provider'] not in supported_providers:
                     logger.error(f"Invalid dns_provider: {settings['dns_provider']}")
                     return False
+
+                # Validate the global certificate-key defaults if any of them
+                # are present. The shape is enforced as a triple so a payload
+                # that would silently disagree (e.g. key_type=rsa with an
+                # elliptic_curve set) is rejected before it can poison cert
+                # creation. The migration path above guarantees all three keys
+                # exist for upgraded installs, so the only callers that hit
+                # this branch with a partial set are POSTs from the UI/API.
+                key_type = settings.get('default_key_type')
+                key_size = settings.get('default_key_size')
+                elliptic_curve = settings.get('default_elliptic_curve')
+                if key_type is not None or key_size is not None or elliptic_curve is not None:
+                    # Save-time validation only checks the active branch
+                    # (RSA → key_size; ECDSA → elliptic_curve). The unused
+                    # field on the inactive branch is allowed to keep its
+                    # default value (so toggling RSA↔ECDSA via the UI does
+                    # not require both to be wiped on every switch).
+                    if key_type == 'rsa':
+                        check = validate_key_options(key_type, key_size, None)
+                    elif key_type == 'ecdsa':
+                        check = validate_key_options(key_type, None, elliptic_curve)
+                    else:
+                        check = validate_key_options(key_type, key_size, elliptic_curve)
+                    is_valid, err = check
+                    if not is_valid:
+                        logger.error(f"Invalid certificate key defaults: {err}")
+                        return False
 
                 # Validate domains
                 if 'domains' in settings:
@@ -612,7 +1169,10 @@ class SettingsManager:
                     'acme-dns': 30,
                     'duckdns': 60,
                     'edgedns': 90,
-                    'hetzner-cloud': 120
+                    'hetzner-cloud': 120,
+                    'desec': 80,
+                    'scaleway': 60,
+                    'custom-script': 120
                 }
                 if 'dns_propagation_seconds' not in settings or not isinstance(settings['dns_propagation_seconds'], dict):
                     settings['dns_propagation_seconds'] = defaults
@@ -624,6 +1184,10 @@ class SettingsManager:
                 # Save settings
                 if self.file_ops.safe_file_write(self.settings_file, settings, is_json=True):
                     logger.info("Settings saved successfully")
+                    # Invalidate the request-scoped cache: a caller in the
+                    # same request that loads again must see the new values
+                    # rather than the pre-write copy stashed on flask.g.
+                    self._request_cache_clear()
                     return True
                 else:
                     logger.error("Failed to save settings")
@@ -700,7 +1264,8 @@ class SettingsManager:
                 'infomaniak': ['api_token'],
                 'acme-dns': ['api_url', 'username', 'password', 'subdomain'],
                 'duckdns': ['api_token'],
-                'edgedns': ['client_token', 'client_secret', 'access_token', 'host']
+                'edgedns': ['client_token', 'client_secret', 'access_token', 'host'],
+                'custom-script': ['auth_hook', 'cleanup_hook']
             }
 
             # Check if migration is needed
@@ -847,17 +1412,49 @@ class SettingsManager:
                 settings['domains'] = new_domains
                 migrated = True
 
+        # Migration 4 (#279): the letsencrypt 'environment' field is retired —
+        # staging is now the letsencrypt_staging CA entry. The field never
+        # affected issuance (certificates were always production), so it is
+        # dropped without flipping default_ca; users who want staging select
+        # the new entry explicitly. This must stay idempotent and permanent:
+        # a stale settings tab POSTing the old payload shape or a pre-#279
+        # backup restore can reintroduce the field at any time.
+        ca_providers = settings.get('ca_providers')
+        if isinstance(ca_providers, dict):
+            le_config = ca_providers.get('letsencrypt')
+            if isinstance(le_config, dict):
+                if le_config.pop('environment', None) is not None:
+                    logger.info("Migrating settings: dropping retired letsencrypt 'environment' field (#279)")
+                    migrated = True
+                accounts = le_config.get('accounts')
+                if isinstance(accounts, dict):
+                    for account in accounts.values():
+                        if isinstance(account, dict) and account.pop('environment', None) is not None:
+                            migrated = True
+
         # Migration 3: Ensure metadata exists for existing certificates
         if migrated:
-            self._ensure_certificate_metadata()
+            # Pass the in-memory dict: the migrated settings are not on disk
+            # yet (load_settings saves them after this returns), so a nested
+            # load_settings() here would re-read the dirty file, re-fire the
+            # migration and recurse without bound — a RecursionError storm
+            # with hundreds of redundant saves whose '_migration' backups
+            # evict every pre-upgrade restore point from retention.
+            self._ensure_certificate_metadata(settings)
 
         return settings, migrated
 
-    def _ensure_certificate_metadata(self):
-        """Ensure all existing certificates have metadata.json files"""
+    def _ensure_certificate_metadata(self, settings=None):
+        """Ensure all existing certificates have metadata.json files.
+
+        ``settings`` lets migration-time callers supply the in-memory dict;
+        calling load_settings() from inside the migration path re-enters the
+        still-unmigrated file and recurses (see _migrate_settings_format).
+        """
         try:
             cert_dir = self.file_ops.cert_dir
-            settings = self.load_settings()
+            if settings is None:
+                settings = self.load_settings()
 
             # iter_cert_domain_dirs already requires a cert.pem, so we never
             # try to write metadata into lost+found or other non-cert dirs.

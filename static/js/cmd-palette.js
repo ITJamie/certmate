@@ -11,7 +11,9 @@
     var resultsEl = null;
     var selectedIndex = 0;
     var currentResults = [];
-    var certCache = null;
+    var certCache = null;        // server certificates (lazy-fetched)
+    var clientCertCache = null;  // client certificates (lazy-fetched)
+    var lastFocusedBeforeOpen = null;
 
     // Static searchable items
     var staticItems = [
@@ -25,9 +27,15 @@
         { type: 'settings', icon: 'fa-shield-alt', label: 'CA Settings', desc: 'Certificate authority configuration', url: '/settings#ca' },
         { type: 'settings', icon: 'fa-sliders-h', label: 'General Settings', desc: 'Notifications, defaults', url: '/settings#general' },
         { type: 'settings', icon: 'fa-database', label: 'Storage Settings', desc: 'Certificate storage paths', url: '/settings#storage' },
+        { type: 'settings', icon: 'fa-bell', label: 'Notification Settings', desc: 'Email, webhooks, weekly digest', url: '/settings#notifications' },
+        { type: 'settings', icon: 'fa-rocket', label: 'Deploy Hooks', desc: 'Post-issuance deploy automation', url: '/settings#deploy' },
+        { type: 'settings', icon: 'fa-network-wired', label: 'Deployment Probes', desc: 'Probe certificate deployment status', url: '/settings#probe' },
         { type: 'settings', icon: 'fa-users', label: 'User Management', desc: 'Manage user accounts', url: '/settings#users' },
+        { type: 'settings', icon: 'fa-key', label: 'API Keys', desc: 'Manage API keys and rate limits', url: '/settings#apikeys' },
+        { type: 'settings', icon: 'fa-id-badge', label: 'SSO / OIDC', desc: 'Single sign-on configuration', url: '/settings#oidc' },
         { type: 'settings', icon: 'fa-archive', label: 'Backup & Restore', desc: 'Backup configuration and certificates', url: '/settings#backup' },
-        { type: 'action', icon: 'fa-plus-circle', label: 'Create Certificate', desc: 'Issue a new SSL certificate', url: '/', action: 'focusCreate' },
+        { type: 'action', icon: 'fa-plus-circle', label: 'New Server Certificate', desc: 'Issue an SSL/TLS server certificate', action: 'openServerDrawer' },
+        { type: 'action', icon: 'fa-id-card', label: 'New Client Certificate', desc: 'Issue an mTLS / client identity certificate', action: 'openClientDrawer' },
         { type: 'action', icon: 'fa-moon', label: 'Toggle Dark Mode', desc: 'Switch theme', action: 'toggleTheme' },
         { type: 'action', icon: 'fa-bell', label: 'Notifications', desc: 'Check certificate alerts', action: 'toggleNotifs' }
     ];
@@ -38,17 +46,17 @@
         div.className = 'fixed inset-0 z-[100] hidden';
         div.innerHTML =
             '<div class="fixed inset-0 bg-black/50 backdrop-blur-sm" id="cmdPaletteOverlay"></div>' +
-            '<div class="fixed inset-x-4 top-[15vh] sm:inset-x-auto sm:left-1/2 sm:-translate-x-1/2 sm:w-full sm:max-w-lg bg-white dark:bg-gray-800 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 overflow-hidden">' +
-                '<div class="flex items-center px-4 border-b border-gray-200 dark:border-gray-700">' +
-                    '<i class="fas fa-search text-gray-400 mr-3"></i>' +
-                    '<input id="cmdPaletteInput" type="text" placeholder="Search pages, settings, certificates..." ' +
-                           'class="flex-1 py-3 bg-transparent text-gray-900 dark:text-white placeholder-gray-400 outline-none text-sm">' +
-                    '<kbd class="hidden sm:inline-flex items-center px-2 py-0.5 text-xs text-gray-400 bg-gray-100 dark:bg-gray-700 rounded">ESC</kbd>' +
+            '<div role="dialog" aria-modal="true" aria-label="Command palette" class="fixed inset-x-4 top-[15vh] sm:inset-x-auto sm:left-1/2 sm:-translate-x-1/2 sm:w-full sm:max-w-lg bg-surface border-border rounded-xl shadow-2xl border overflow-hidden">' +
+                '<div class="flex items-center px-4 border-b border-border">' +
+                    '<i class="fas fa-search text-gray-400 mr-3" aria-hidden="true"></i>' +
+                    '<input id="cmdPaletteInput" type="text" aria-label="Search pages, settings, certificates" placeholder="Search pages, settings, certificates..." ' +
+                           'class="flex-1 py-3 bg-transparent text-foreground placeholder-gray-400 outline-none text-sm">' +
+                    '<kbd class="hidden sm:inline-flex items-center px-2 py-0.5 text-xs text-gray-400 bg-surface-2 rounded">ESC</kbd>' +
                 '</div>' +
-                '<div id="cmdPaletteResults" class="max-h-72 overflow-y-auto py-2"></div>' +
-                '<div class="px-4 py-2 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between text-xs text-gray-400">' +
-                    '<div><kbd class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded mr-1">&uarr;&darr;</kbd> navigate <kbd class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded mx-1">&crarr;</kbd> select</div>' +
-                    '<div><kbd class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded">esc</kbd> close</div>' +
+                '<div id="cmdPaletteResults" class="overflow-y-auto py-2"></div>' +
+                '<div class="px-4 py-2 border-t border-border flex items-center justify-between text-xs text-gray-400">' +
+                    '<div><kbd class="px-1.5 py-0.5 bg-surface-2 rounded mr-1">&uarr;&darr;</kbd> navigate <kbd class="px-1.5 py-0.5 bg-surface-2 rounded mx-1">&crarr;</kbd> select</div>' +
+                    '<div><kbd class="px-1.5 py-0.5 bg-surface-2 rounded">esc</kbd> close</div>' +
                 '</div>' +
             '</div>';
         document.body.appendChild(div);
@@ -60,22 +68,46 @@
         document.getElementById('cmdPaletteOverlay').addEventListener('click', closePalette);
         inputEl.addEventListener('input', onSearch);
         inputEl.addEventListener('keydown', onKeyDown);
+        // Re-size the results pane on viewport changes while open.
+        window.addEventListener('resize', function() {
+            if (isOpen()) sizeResults();
+        });
+    }
+
+    // Size the results pane to fit the viewport without overflowing.
+    // Panel sits at top-[15vh] with ~82px of chrome (input + footer +
+    // borders); we leave a 20px breathing margin at the bottom. On tall
+    // viewports this means no scrollbar at all; on short ones we floor
+    // to 180px so the user still sees ~3 rows.
+    function sizeResults() {
+        if (!resultsEl) return;
+        var max = Math.max(180, Math.round(window.innerHeight * 0.85) - 102);
+        resultsEl.style.maxHeight = max + 'px';
     }
 
     function openPalette() {
         if (!paletteEl) createPaletteHTML();
+        // Remember what had focus so we can restore it on close (a11y).
+        lastFocusedBeforeOpen = document.activeElement;
         paletteEl.classList.remove('hidden');
         inputEl.value = '';
         selectedIndex = 0;
+        sizeResults();
         onSearch();
         // Delay focus to ensure visible
         setTimeout(function() { inputEl.focus(); }, 50);
         // Prefetch certs if not cached
-        if (!certCache) fetchCerts();
+        if (!certCache || !clientCertCache) fetchCerts();
     }
 
     function closePalette() {
         if (paletteEl) paletteEl.classList.add('hidden');
+        // Restore focus to the element that was active before opening, unless
+        // a result handler intentionally moved focus elsewhere (navigation).
+        if (lastFocusedBeforeOpen && typeof lastFocusedBeforeOpen.focus === 'function') {
+            try { lastFocusedBeforeOpen.focus(); } catch (e) { /* element gone */ }
+        }
+        lastFocusedBeforeOpen = null;
     }
 
     function isOpen() {
@@ -83,28 +115,47 @@
     }
 
     function fetchCerts() {
+        // Server certificates.
         fetch('/api/certificates', { credentials: 'same-origin' })
             .then(function(r) { return r.ok ? r.json() : []; })
             .then(function(certs) {
-                if (!Array.isArray(certs)) { certCache = []; return; }
-                certCache = certs.map(function(c) {
+                certCache = Array.isArray(certs) ? certs.map(function(c) {
                     return {
                         type: 'cert',
                         icon: 'fa-lock',
                         label: c.domain,
                         desc: (c.exists ? (c.days_until_expiry > 0 ? c.days_until_expiry + ' days left' : 'Expired') : 'Not found'),
-                        url: '/',
                         domain: c.domain
                     };
-                });
+                }) : [];
+                if (isOpen()) onSearch();
             })
             .catch(function() { certCache = []; });
+
+        // Client certificates (cross-type search — closes the D1 "triple search").
+        fetch('/api/client-certs', { credentials: 'same-origin' })
+            .then(function(r) { return r.ok ? r.json() : {}; })
+            .then(function(data) {
+                var list = (data && data.certificates) || [];
+                clientCertCache = Array.isArray(list) ? list.map(function(c) {
+                    return {
+                        type: 'clientcert',
+                        icon: 'fa-id-card',
+                        label: c.common_name || '(no CN)',
+                        desc: (c.revoked ? 'Revoked' : (c.cert_usage || 'Client certificate')) + (c.email ? ' · ' + c.email : ''),
+                        cn: c.common_name
+                    };
+                }) : [];
+                if (isOpen()) onSearch();
+            })
+            .catch(function() { clientCertCache = []; });
     }
 
     function onSearch() {
         var query = (inputEl.value || '').toLowerCase().trim();
         var allItems = staticItems.slice();
         if (certCache) allItems = allItems.concat(certCache);
+        if (clientCertCache) allItems = allItems.concat(clientCertCache);
 
         if (!query) {
             currentResults = allItems.slice(0, 8);
@@ -121,11 +172,11 @@
 
     function renderResults() {
         if (currentResults.length === 0) {
-            resultsEl.innerHTML = '<div class="px-4 py-6 text-center text-sm text-gray-500 dark:text-gray-400"><i class="fas fa-search mr-2"></i>No results found</div>';
+            resultsEl.innerHTML = '<div class="px-4 py-6 text-center text-sm text-muted"><i class="fas fa-search mr-2"></i>No results found</div>';
             return;
         }
 
-        var typeLabels = { nav: 'Navigation', settings: 'Settings', action: 'Actions', cert: 'Certificates' };
+        var typeLabels = { nav: 'Navigation', settings: 'Settings', action: 'Actions', cert: 'Server Certificates', clientcert: 'Client Certificates' };
         var lastType = '';
         var html = '';
 
@@ -136,7 +187,7 @@
             }
             var isSelected = i === selectedIndex;
             html += '<div class="cmd-result flex items-center px-4 py-2 cursor-pointer ' +
-                (isSelected ? 'bg-primary/10 text-primary' : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/50') +
+                (isSelected ? 'bg-primary/10 text-primary' : 'text-label hover:bg-gray-100 dark:hover:bg-gray-700/50') +
                 '" data-index="' + i + '">' +
                 '<i class="fas ' + escapeHtml(item.icon) + ' w-5 text-center mr-3 ' + (isSelected ? 'text-primary' : 'text-gray-400') + '"></i>' +
                 '<div class="flex-1 min-w-0">' +
@@ -167,19 +218,70 @@
             return;
         }
         if (item.action === 'toggleNotifs') {
-            if (typeof toggleNotifications === 'function') toggleNotifications();
+            window.location.href = '/notifications';
             return;
         }
-        if (item.action === 'focusCreate') {
-            window.location.href = item.url;
-            setTimeout(function() {
-                var el = document.getElementById('domain');
-                if (el) el.focus();
-            }, 300);
+        // focusCreate kept for back-compat; both open the server creation drawer.
+        if (item.action === 'openServerDrawer' || item.action === 'focusCreate') {
+            openDrawerAction('server');
+            return;
+        }
+        if (item.action === 'openClientDrawer') {
+            openDrawerAction('client');
+            return;
+        }
+        if (item.type === 'cert') {
+            jumpToServerCert(item.domain);
+            return;
+        }
+        if (item.type === 'clientcert') {
+            jumpToClientCert(item.cn);
             return;
         }
         if (item.url) {
             window.location.href = item.url;
+        }
+    }
+
+    // Open the creation drawer to the given type. On the dashboard openCertDrawer
+    // is in scope, so open directly; elsewhere stash the intent and navigate
+    // there (index.html reads cm_open_drawer on load).
+    function openDrawerAction(type) {
+        if (typeof window.openCertDrawer === 'function') {
+            window.openCertDrawer(type);
+        } else {
+            try { sessionStorage.setItem('cm_open_drawer', type); } catch (e) { /* storage off */ }
+            window.location.href = '/';
+        }
+    }
+
+    // Jump-and-flash to a server cert: on the dashboard, ensure the server view
+    // is showing and pulse the row in place; otherwise navigate to the dashboard
+    // with ?flash= so it pulses once the list has loaded.
+    function jumpToServerCert(domain) {
+        if (!domain) return;
+        if (window.location.pathname === '/') {
+            var sBtn = document.getElementById('certViewServerBtn');
+            if (sBtn) sBtn.click();
+            setTimeout(function() {
+                if (!(typeof window.flashCertRow === 'function' && window.flashCertRow(domain))) {
+                    window.location.href = '/?flash=' + encodeURIComponent(domain);
+                }
+            }, 60);
+        } else {
+            window.location.href = '/?flash=' + encodeURIComponent(domain);
+        }
+    }
+
+    // Client certs live in the client view; switch to it. (Row-level flash for
+    // client certs lands with the real client table in a later phase.)
+    function jumpToClientCert(cn) {
+        var cBtn = document.getElementById('certViewClientBtn');
+        if (cBtn) {
+            cBtn.click();
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        } else {
+            window.location.href = '/#client';
         }
     }
 

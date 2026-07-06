@@ -7,6 +7,7 @@ depend on the Flask application context or global configuration variables.
 """
 import dataclasses
 import json
+import os
 import re
 import secrets
 import string
@@ -14,7 +15,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 
@@ -69,7 +70,13 @@ _DNS_PROVIDER_CREDENTIALS = {
     'godaddy': ['api_key', 'secret'],
     'he-ddns': ['username', 'password'],
     'dynudns': ['token'],
-    'edgedns': ['client_token', 'client_secret', 'access_token', 'host']
+    'edgedns': ['client_token', 'client_secret', 'access_token', 'host'],
+    'desec': ['api_token'],
+    'scaleway': ['application_token'],
+    'solidserver': ['host', 'username', 'password', 'dns_name'],
+    # Admin-supplied hook scripts (#286): the auth hook is the only hard
+    # requirement; the cleanup hook is optional.
+    'custom-script': ['auth_hook']
 }
 
 # A mapping of multi-provider names to their certbot plugin .ini filename.
@@ -77,7 +84,7 @@ _MULTI_PROVIDER_PLUGIN_FILES = {
     'vultr': 'vultr.ini', 'dnsmadeeasy': 'dnsmadeeasy.ini', 'nsone': 'nsone.ini',
     'rfc2136': 'rfc2136.ini', 'hetzner': 'hetzner.ini', 'hetzner-cloud': 'hetzner-cloud.ini',
     'porkbun': 'porkbun.ini', 'godaddy': 'godaddy.ini', 'he-ddns': 'he-ddns.ini',
-    'dynudns': 'dynudns.ini'
+    'dynudns': 'dynudns.ini', 'desec': 'desec.ini', 'scaleway': 'scaleway.ini'
 }
 
 # A data-driven template for building multi-provider config files.
@@ -99,6 +106,8 @@ _MULTI_PROVIDER_TEMPLATE_MAP = {
     'godaddy': {'dns_godaddy_key': 'api_key', 'dns_godaddy_secret': 'secret'},
     'he-ddns': {'dns_he_ddns_username': 'username', 'dns_he_ddns_password': 'password'},
     'dynudns': {'dns_dynudns_token': 'token'},
+    'desec': {'dns_desec_token': 'api_token'},
+    'scaleway': {'dns_scaleway_application_token': 'application_token'},
 }
 
 
@@ -181,6 +190,57 @@ def validate_domain(domain: str) -> Tuple[bool, str]:
     return True, domain
 
 
+def find_covering_zone(fqdn: str, zones: List[str]) -> Optional[str]:
+    """Return the longest zone in *zones* that covers *fqdn*, or None.
+
+    Used by providers that need an explicit DNS-zone identity at cert
+    issuance time (Azure DNS is the only one today; the certbot plugins
+    for Cloudflare, Route53, Google etc. walk parent labels themselves
+    so CertMate does not pre-resolve a zone for them).
+
+    Semantics:
+
+    * Leading ``*.`` is stripped from the FQDN — the ACME TXT challenge
+      for a wildcard lives under the bare apex, not the wildcard form.
+    * Comparison is case-insensitive and tolerant of trailing dots.
+    * Longest-match wins. For ``api.staging.example.com`` with zones
+      ``staging.example.com`` and ``example.com`` both present, the
+      result is ``staging.example.com`` — the operator's intent is the
+      most specific zone the IdP actually hosts.
+    * **TLD guard**: candidate zones with fewer than two labels (e.g.
+      ``com``, ``tv``) are silently skipped. Discovery layers never
+      surface a bare TLD because providers don't host the root, but the
+      guard is defence-in-depth so a misconfigured zone list cannot
+      lead CertMate to attempt a TLD-wide match. Multi-label public
+      suffixes (``co.uk``, ``com.br``) are NOT special-cased — they
+      pass the gate and are matched structurally like any other
+      ≥2-label zone. An operator who legitimately runs a hosted zone
+      at that level still gets the correct longest match.
+    """
+    if not fqdn or not zones:
+        return None
+    name = fqdn.strip().lower().rstrip('.')
+    if name.startswith('*.'):
+        name = name[2:]
+    if not name:
+        return None
+
+    best: Optional[str] = None
+    best_len = -1
+    for raw in zones:
+        if not raw or not isinstance(raw, str):
+            continue
+        zone = raw.strip().lower().rstrip('.')
+        if not zone or zone.count('.') < 1:
+            # <2 labels — TLD guard
+            continue
+        if name == zone or name.endswith('.' + zone):
+            if len(zone) > best_len:
+                best = zone
+                best_len = len(zone)
+    return best
+
+
 def validate_api_token(token: str) -> Tuple[bool, str]:
     """
     Validate an API token for strength, format, and complexity.
@@ -224,6 +284,170 @@ def validate_api_token(token: str) -> Tuple[bool, str]:
         return False, "API token must contain at least 2 character types (uppercase, lowercase, digits)."
     
     return True, token
+
+
+# =============================================
+# CERTIFICATE KEY OPTIONS
+# =============================================
+
+# RSA key sizes accepted by certbot's --rsa-key-size; matches LE/ZeroSSL
+# guidance and the upstream cryptography defaults. 1024 is excluded
+# (insecure) and 8192 is excluded (no real-world need, slow handshakes).
+KEY_TYPE_RSA = 'rsa'
+KEY_TYPE_ECDSA = 'ecdsa'
+VALID_KEY_TYPES = frozenset({KEY_TYPE_RSA, KEY_TYPE_ECDSA})
+VALID_RSA_KEY_SIZES = frozenset({2048, 3072, 4096})
+# secp521r1 is intentionally excluded: certbot accepts it but Let's Encrypt
+# rejects it as of 2026, and most consumers (browsers, load balancers) only
+# implement secp256r1/secp384r1.
+VALID_ELLIPTIC_CURVES = frozenset({'secp256r1', 'secp384r1'})
+
+
+def validate_key_options(
+    key_type: Optional[str],
+    key_size: Optional[int],
+    elliptic_curve: Optional[str],
+) -> Tuple[bool, str]:
+    """Validate the cert key-shape inputs that flow from API/UI to certbot.
+
+    Returns ``(True, '')`` on success and ``(False, message)`` on failure.
+
+    All three inputs may be ``None`` to mean "use the default" — this function
+    treats ``None`` for ``key_type`` as a request to skip validation entirely
+    so callers can hand it untouched API payloads. When ``key_type`` is set,
+    ``key_size`` and ``elliptic_curve`` are mutually exclusive (one applies to
+    RSA, the other to ECDSA).
+    """
+    if key_type is None:
+        # Caller hasn't picked a type; size/curve must also be absent or we
+        # have an inconsistent shape (e.g. {'key_size': 4096} with no type).
+        if key_size is not None or elliptic_curve is not None:
+            return False, "key_size/elliptic_curve require key_type to be set"
+        return True, ''
+
+    if key_type not in VALID_KEY_TYPES:
+        return False, f"key_type must be one of {sorted(VALID_KEY_TYPES)}, got {key_type!r}"
+
+    if key_type == KEY_TYPE_RSA:
+        if elliptic_curve is not None:
+            return False, "elliptic_curve is not valid for key_type='rsa'"
+        if key_size is None:
+            return False, "key_size is required when key_type='rsa'"
+        if key_size not in VALID_RSA_KEY_SIZES:
+            return False, f"key_size must be one of {sorted(VALID_RSA_KEY_SIZES)}, got {key_size!r}"
+        return True, ''
+
+    # key_type == 'ecdsa'
+    if key_size is not None:
+        return False, "key_size is not valid for key_type='ecdsa'"
+    if elliptic_curve is None:
+        return False, "elliptic_curve is required when key_type='ecdsa'"
+    if elliptic_curve not in VALID_ELLIPTIC_CURVES:
+        return False, f"elliptic_curve must be one of {sorted(VALID_ELLIPTIC_CURVES)}, got {elliptic_curve!r}"
+    return True, ''
+
+
+# =============================================
+# CERTBOT STDERR SANITIZER
+# =============================================
+
+# Matches a single line of the form `key = value` where `key` carries a
+# credential-bearing name fragment. certbot-dns-azure and a few other
+# plugins echo the credentials file line-by-line on parse error, so the
+# offending value would otherwise round-trip into a 422 JSON response.
+# Anchored on word-start so substrings like "monkeysecret" don't fire
+# but `dns_azure_sp_client_secret = ...` does.
+_CERTBOT_STDERR_CREDENTIAL_LINE_RE = re.compile(
+    # NB: digits in the character class — provider names like
+    # ``route53`` carry digits, and stripping them from the alphabet
+    # would skip ``dns_route53_access_key_id`` entirely.
+    r'(?im)^\s*([A-Za-z0-9_]*(?:secret|token|password|key|credential|hmac|api_bearer)[A-Za-z0-9_]*)\s*=\s*.+$'
+)
+
+# Matches absolute paths to per-provider credential .ini files
+# (letsencrypt/config/<provider>.ini and friends). The path itself is
+# not a credential, but operator-side troubleshooting hints already
+# point operators at the path via the log, and stripping it from the
+# client-facing error message is consistent with the general policy of
+# not echoing internal paths.
+_CERTBOT_CONFIG_PATH_RE = re.compile(
+    r'(?i)(?:[\w\-./]+/)?letsencrypt/config/[A-Za-z0-9_\-.]+\.ini'
+)
+
+# Hard cap on the sanitized stderr we surface to API clients. Certbot's
+# verbose mode can emit several KB; the client doesn't need the full
+# trace (which is in the application log), and a huge payload is its
+# own DoS shape.
+_CERTBOT_STDERR_MAX_BYTES = 4096
+
+
+def classify_renewal_error(reason: str) -> tuple:
+    """Map a renewal failure reason to a (user_message, code) pair.
+
+    The renew endpoints used to return an opaque ``"Certificate renewal failed"``
+    with HTTP 500, hiding diagnosable conditions. The most common one is a
+    *broken renewal configuration*: certbot's ``renewal/<domain>.conf`` bakes
+    absolute paths and expects the ``live/`` cert to be a symlink, so after the
+    data directory moves (e.g. a cert created on the host then mounted into the
+    container, or a relocated volume) certbot reports a ``parsefail`` and skips
+    the lineage. That is not a server fault — it is actionable: reissue.
+
+    Returns the clean broken-config message (no host paths leaked) with code
+    ``RENEWAL_CONFIG_BROKEN`` for that case, else a generic pair the caller can
+    pad with the sanitized reason.
+    """
+    low = (reason or '').lower()
+    broken_markers = ('parsefail', 'renewal configuration', 'is broken', 'to be a symlink')
+    if any(marker in low for marker in broken_markers):
+        return (
+            "This certificate's renewal configuration is broken: its certbot "
+            "config references paths that no longer exist. Use Edit & Reissue "
+            "to regenerate the certificate.",
+            'RENEWAL_CONFIG_BROKEN',
+        )
+    if 'not configured' in low and ('account' in low or 'dns provider' in low):
+        return (
+            "The DNS provider account this certificate uses is no longer "
+            "configured. Re-add it in Settings → DNS, then retry the renewal.",
+            'DNS_ACCOUNT_NOT_CONFIGURED',
+        )
+    return ('Certificate renewal failed', 'RENEWAL_FAILED')
+
+
+def sanitize_certbot_stderr(stderr_text: str) -> str:
+    """Strip credential material from a certbot stderr blob before it
+    is sent to an API client.
+
+    What gets stripped:
+
+    * Lines of the form ``<name>_secret = ...``, ``<name>_token = ...``,
+      ``<name>_password = ...``, ``<name>_key = ...``, ``<name>_credential = ...``,
+      ``<name>_hmac = ...`` and ``api_bearer = ...``. Some certbot plugins
+      (notably ``certbot-dns-azure``) echo the offending config line
+      verbatim when they fail to parse, which round-tripped the secret
+      value into the API response.
+    * Credential file paths (``letsencrypt/config/<provider>.ini``) are
+      replaced with ``<credential file>``. Not secret per se but
+      consistent with not echoing internal paths to API consumers.
+
+    What is preserved:
+
+    * ACME server errors, plugin error narration, DNS verification
+      failures, hint URLs, exit codes — everything an operator needs
+      to figure out why a renewal failed.
+
+    The full unredacted stderr is still written to the application log
+    (``logger.error``) at the call site; this helper only sanitises the
+    copy that flows into the API response.
+    """
+    if not stderr_text:
+        return ''
+    text = str(stderr_text)
+    text = _CERTBOT_STDERR_CREDENTIAL_LINE_RE.sub(lambda m: f'{m.group(1)} = [REDACTED]', text)
+    text = _CERTBOT_CONFIG_PATH_RE.sub('<credential file>', text)
+    if len(text) > _CERTBOT_STDERR_MAX_BYTES:
+        text = text[:_CERTBOT_STDERR_MAX_BYTES] + '\n[…truncated — see application log for full output]'
+    return text
 
 
 # =============================================
@@ -279,15 +503,26 @@ def generate_secure_token(length: int = 40) -> str:
 # =============================================
 
 def _create_config_file(plugin_name: str, content: str) -> Path:
-    """Generic helper to create a config file in the right directory."""
+    """Generic helper to create a per-operation credentials file.
+
+    The filename carries a random suffix so two concurrent operations on the
+    SAME provider (e.g. renewing a.com and b.com, both Cloudflare) no longer
+    write — and then delete in their ``finally`` — the same shared
+    ``<plugin>.ini``, which raced one certbot run's credentials out from under
+    another. Each caller deletes its own unique file. The directory is
+    unchanged so the certbot-stderr path sanitizer still redacts these paths.
+    """
     config_dir = Path("letsencrypt/config")
     config_dir.mkdir(parents=True, exist_ok=True)
-    
-    config_file = config_dir / f"{plugin_name}.ini"
-    with open(config_file, 'w', encoding='utf-8') as f:
+
+    config_file = config_dir / f"{plugin_name}-{secrets.token_hex(8)}.ini"
+    # Create the file 0600 ATOMICALLY: O_EXCL never follows a pre-planted
+    # symlink at this (world-writable-dir) path, and the mode is set at open()
+    # so the DNS-provider secret is never briefly world-readable under the
+    # process umask (the old open()+chmod left a 0644 window).
+    fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write(content)
-    
-    config_file.chmod(0o600)
     return config_file
 
 def create_cloudflare_config(token: str) -> Path:
@@ -299,29 +534,95 @@ def create_route53_config(access_key_id: str, secret_access_key: str) -> Path:
     content = f"dns_route53_access_key_id = {access_key_id}\ndns_route53_secret_access_key = {secret_access_key}\n"
     return _create_config_file("route53", content)
 
-def create_azure_config(subscription_id: str, resource_group: str, tenant_id: str, client_id: str, client_secret: str) -> Path:
-    """Create Azure DNS credentials file."""
+def create_azure_config(subscription_id: str, resource_group: str, tenant_id: str, client_id: str, client_secret: str, zone_domain: Union[str, List[str]]) -> Path:
+    """Create Azure DNS credentials file for certbot-dns-azure (terrycain).
+
+    The plugin (certbot-dns-azure >= 2.x) expects:
+
+    * ``dns_azure_sp_client_id`` / ``dns_azure_sp_client_secret`` /
+      ``dns_azure_tenant_id`` — service principal credentials. Note the
+      ``sp_`` prefix; the older bare ``dns_azure_client_id`` keys that
+      certmate used previously are ignored and the plugin reports
+      "No authentication methods have been configured for Azure DNS".
+    * ``dns_azure_zoneN = <zone>:<azure-resource-id>`` — at least one
+      zone mapping. ``subscription_id`` and ``resource_group`` are NOT
+      top-level keys; they live inside the resource id of the zone line.
+
+    See ``certbot_dns_azure/_internal/dns_azure.py:_validate_credentials``
+    in v2.5.0 for the validation that drives this format.
+
+    ``zone_domain`` accepts two shapes:
+
+    * **str** — legacy single-zone usage. Writes one ``dns_azure_zone1``
+      line. Kept for callers (and tests) that haven't migrated to the
+      list form.
+    * **list[str]** — one ``dns_azure_zoneN`` per entry, in the order
+      given. The cert-issuance path passes the deduplicated longest-first
+      list returned by ``resolve_zones_for_domains`` so the plugin's
+      longest-prefix match selects the most specific hosted zone per
+      ACME challenge — that's what enables nested-subdomain wildcards
+      against a parent hosted zone (e.g. ``*.example2.example.com``
+      issued under hosted zone ``example.com``).
+    """
+    zone_resource_id = f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
+    if isinstance(zone_domain, str):
+        zone_list = [zone_domain]
+    else:
+        zone_list = [z for z in (zone_domain or []) if z]
+    if not zone_list:
+        raise ValueError(
+            "create_azure_config requires at least one zone (received empty list)"
+        )
+    zone_lines = ''.join(
+        f"dns_azure_zone{idx} = {zone}:{zone_resource_id}\n"
+        for idx, zone in enumerate(zone_list, start=1)
+    )
     content = (
-        f"dns_azure_subscription_id = {subscription_id}\n"
-        f"dns_azure_resource_group = {resource_group}\n"
+        f"dns_azure_sp_client_id = {client_id}\n"
+        f"dns_azure_sp_client_secret = {client_secret}\n"
         f"dns_azure_tenant_id = {tenant_id}\n"
-        f"dns_azure_client_id = {client_id}\n"
-        f"dns_azure_client_secret = {client_secret}\n"
+        f"dns_azure_environment = AzurePublicCloud\n"
+        f"{zone_lines}"
     )
     return _create_config_file("azure", content)
 
 def create_google_config(project_id: str, service_account_key: str) -> Path:
-    """Create Google Cloud DNS credentials file."""
+    """Create Google Cloud DNS credentials file.
+
+    The service-account JSON is a live GCP private key. It previously landed at
+    a FIXED path (``google-service-account.json``), written 0644-then-chmod, and
+    was NEVER deleted — so a full cloud credential sat on disk indefinitely at a
+    predictable location, and two concurrent Google issuances clobbered each
+    other's key. Now: a per-operation random name, created 0600 atomically
+    (O_EXCL), plus a best-effort sweep of orphaned key files from crashed or
+    older runs (anything older than the certbot timeout is dead)."""
     config_dir = Path("letsencrypt/config")
     config_dir.mkdir(parents=True, exist_ok=True)
-    
-    sa_file = config_dir / "google-service-account.json"
-    with open(sa_file, 'w', encoding='utf-8') as f:
+    _sweep_orphaned_files(config_dir, "google-sa-*.json")
+
+    sa_file = config_dir / f"google-sa-{secrets.token_hex(8)}.json"
+    fd = os.open(str(sa_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write(service_account_key)
-    sa_file.chmod(0o600)
-    
+
     content = f"dns_google_project_id = {project_id}\ndns_google_service_account_key = {str(sa_file)}\n"
     return _create_config_file("google", content)
+
+
+def _sweep_orphaned_files(directory: Path, pattern: str, max_age_seconds: int = 3600) -> None:
+    """Best-effort deletion of files matching *pattern* older than
+    *max_age_seconds*. A live issuance cannot outlast the 1800s certbot timeout,
+    so anything older is an orphan (crashed run, killed worker). Never raises."""
+    try:
+        cutoff = time.time() - max_age_seconds
+        for p in directory.glob(pattern):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 def create_powerdns_config(api_url: str, api_key: str) -> Path:
     """Create PowerDNS credentials file."""
@@ -516,7 +817,15 @@ class DeploymentStatusCache:
             cleared_count = len(self._cache)
             self._cache.clear()
         return cleared_count
-    
+
+    def clear_prefix(self, prefix: str) -> int:
+        """Remove every entry whose key starts with ``prefix``, returning the count removed."""
+        with self._lock:
+            matching_keys = [k for k in self._cache if k.startswith(prefix)]
+            for key in matching_keys:
+                del self._cache[key]
+        return len(matching_keys)
+
     def _clean_expired(self) -> None:
         """Internal method to remove all expired entries. Assumes lock is already held."""
         current_time = time.time()

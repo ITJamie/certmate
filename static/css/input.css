@@ -32,6 +32,79 @@
     font-variant-numeric: tabular-nums slashed-zero;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    /* Avoid typographic orphans in running text without forcing line
+       breaks — degrades gracefully where text-wrap: pretty is unsupported. */
+    text-wrap: pretty;
+  }
+
+  /* ── Heading refinement ──────────────────────────────────────────
+     Inter's display sizes read tighter and more intentional with a
+     hair of negative tracking; text-wrap: balance evens out multi-line
+     titles so the last line is never a lonely word. Tag-scoped, so it
+     reaches every heading with zero call-site churn. Both properties
+     no-op safely on browsers that don't support them. */
+  h1, h2, h3 {
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+  h4, h5, h6 {
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  /* ── Theme tokens (single source of truth) ──────────────────────
+     Values are bare HSL channels ("H S% L%") with no hsl() wrapper,
+     so Tailwind's color config can interpolate <alpha-value> for the
+     /opacity utilities (see tailwind.config.js). Light theme lives on
+     :root, dark overrides on .dark — flip a theme by editing this
+     block, not the call sites.
+
+     ADDITIVE for now: these tokens are introduced alongside the legacy
+     palette; templates are migrated onto them phase by phase
+     (docs/THEME_MIGRATION.md). The existing primary/success/etc.
+     colors are intentionally left untouched until later phases. */
+  :root {
+    --ease-premium: cubic-bezier(0.16, 1, 0.3, 1);  /* shared motion curve */
+    --color-background: 220 20% 97%;   /* page            (surface.light) */
+    --color-surface:      0  0% 100%;  /* card / panel    (was bg-white)  */
+    --color-surface-2:  220 14% 96%;   /* elevated / sunken              */
+    --color-foreground: 222 47% 11%;   /* primary text    (~gray-900)     */
+    --color-muted:      220  9% 46%;   /* secondary text  (~gray-500)     */
+    --color-label:      217 19% 27%;   /* label / mid body (~gray-700)    */
+    --color-border:     220 13% 91%;   /* hairlines       (~gray-200)     */
+    --color-input:        0  0% 100%;  /* form field fill (was bg-white)  */
+    --color-sunken:     210 20% 98%;   /* gray-50  — recessed fill        */
+    --color-hover:      220 14% 96%;   /* gray-100 — interactive hover    */
+    --color-border-strong: 216 12% 84%;/* gray-300 — hover/emphasis border*/
+    --color-accent:     221 83% 53%;   /* blue-600 — on-surface accent (nav/links) */
+
+    /* Status callouts — surface / line / fg (body) / strong (heading).
+       Phase 6: tokenize the green/red/amber/blue info-boxes that earlier
+       phases left literal, normalising the 50-vs-100 / 700-vs-800 drift. */
+    --color-info-surface:    214 100% 97%;  --color-info-line:    213 97% 87%;  --color-info-fg:    224 76% 48%;  --color-info-strong:    226 71% 40%;
+    --color-success-surface: 138 76% 97%;   --color-success-line: 141 79% 85%;  --color-success-fg: 142 72% 29%;  --color-success-strong: 143 64% 24%;
+    --color-warning-surface:  48 100% 96%;  --color-warning-line:  48 97% 77%;  --color-warning-fg:  26 90% 37%;  --color-warning-strong:  23 82% 31%;
+    --color-danger-surface:    0 86% 97%;   --color-danger-line:   0 96% 89%;   --color-danger-fg:   0 74% 42%;   --color-danger-strong:   0 70% 35%;
+  }
+  .dark {
+    --color-background: 222 32%  8%;   /* surface.dark */
+    --color-surface:    222 24% 13%;   /* surface.card */
+    --color-surface-2:  222 20% 17%;   /* surface.elevated */
+    --color-foreground:   0  0% 100%;  /* white */
+    --color-muted:      220  9% 65%;   /* ~gray-400 */
+    --color-label:      216 12% 84%;   /* ~gray-300 */
+    --color-border:     222 20% 22%;   /* ~white/5 equivalent */
+    --color-input:      217 19% 27%;   /* gray-700 — inputs read lighter than the card */
+    --color-sunken:     217 19% 27%;   /* gray-700 */
+    --color-hover:      217 19% 27%;   /* gray-700 */
+    --color-border-strong: 220 9% 46%; /* gray-500 */
+    --color-accent:     213 94% 68%;   /* blue-400 — lighter accent on dark */
+
+    /* Status callouts — dark tints blended over the card surface. */
+    --color-info-surface:    223 41% 17%;  --color-info-line:    225 58% 25%;  --color-info-fg:    212 96% 78%;  --color-info-strong:    213 97% 87%;
+    --color-success-surface: 180 27% 13%;  --color-success-line: 155 44% 17%;  --color-success-fg: 142 77% 73%;  --color-success-strong: 141 79% 85%;
+    --color-warning-surface:   0 14% 16%;  --color-warning-line:  19 46% 21%;  --color-warning-fg:  46 97% 65%;  --color-warning-strong:  48 97% 77%;
+    --color-danger-surface:  332 22% 15%;  --color-danger-line:  353 48% 22%;  --color-danger-fg:    0 94% 82%;  --color-danger-strong:    0 96% 89%;
   }
 }
 
@@ -46,6 +119,42 @@ html.dark {
 /* #12: Branded selection color for data copy/paste UX          */
 ::selection { background: hsla(214, 80%, 52%, 0.3); }
 .dark ::selection { background: hsla(214, 80%, 52%, 0.35); }
+
+/* ── Keyboard focus floor for links & bare buttons ───────────────
+   Inputs carry their own focus rings, and .btn uses focus-visible.
+   Inline links, <summary>, and ICON-ONLY chrome buttons (the top-bar
+   search / shortcuts / logout, which are bare <button>s, not .btn)
+   did not — they fell back to the UA's default outline, inconsistent
+   and off-brand (and suppressed entirely in some themes). Give them a
+   single branded focus-visible ring, accent-tokened so it flips with
+   the theme. :not(.btn) keeps .btn's own ring authoritative.
+   focus-visible (not :focus) means mouse clicks stay clean; the ring
+   shows only on keyboard navigation. */
+a:focus-visible,
+summary:focus-visible,
+button:not(.btn):focus-visible,
+[role="button"]:not(.btn):focus-visible {
+  outline: 2px solid hsl(var(--color-accent));
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* ── Horizontal scroll affordance ────────────────────────────────
+   overflow-x-auto hides its scrollbar on overlay-scrollbar platforms
+   (macOS) until you actively scroll, so a clipped strip — e.g. the 11
+   Settings tabs at tablet width — gives no hint that more is hidden.
+   Force a thin, always-present scrollbar once the content overflows. */
+.scroll-x-affordance { scrollbar-width: thin; scrollbar-color: rgba(120, 120, 120, .45) transparent; }
+.scroll-x-affordance::-webkit-scrollbar { height: 6px; }
+.scroll-x-affordance::-webkit-scrollbar-thumb { background: rgba(120, 120, 120, .45); border-radius: 3px; }
+.scroll-x-affordance::-webkit-scrollbar-track { background: transparent; }
+
+/* ── Help: prose reading measure ─────────────────────────────────
+   Long-form help prose ran the full card width (~150+ chars/line).
+   Cap paragraphs inside help sections to a ~65ch reading measure;
+   tables, code blocks and the API grid are not <p>, so they keep
+   their full width. */
+[data-help-section] p { max-width: 65ch; }
 
 /* ── Table readability ───────────────────────────────────────── */
 /* #8:  Impercettible zebra striping for horizontal eye-tracking */
@@ -76,17 +185,147 @@ html.dark {
   to   { opacity: 1; transform: translateY(0); }
 }
 .page-enter {
-  animation: pageEnter 250ms ease-out;
+  animation: pageEnter 250ms var(--ease-premium);
 }
 
 /* ── Button press feedback ───────────────────────────────────── */
 @layer components {
   .btn-press {
     @apply transition-all duration-150;
+    transition-timing-function: var(--ease-premium);
   }
   .btn-press:active {
     transform: scale(0.97);
     filter: brightness(0.92);
+  }
+
+  /* ── R-3 Component system ──────────────────────────────────
+     Canonical componentized versions of the button / card /
+     badge / form patterns currently inlined across the
+     templates. Use as:
+       <button class="btn btn-primary">…</button>
+       <button class="btn btn-secondary btn-sm">…</button>
+       <button class="btn btn-ghost" aria-label="Close">…</button>
+       <div class="card p-6">…</div>
+       <span class="badge badge-success">Valid</span>
+       <input class="form-input" />
+       <select class="form-select">…</select>
+       <label class="form-label">…</label>
+     Migration of existing call sites is incremental; the inline
+     Tailwind classes still render until each site is converted.
+     ─────────────────────────────────────────────────────────── */
+
+  /* Buttons ─────────────────────────────────────────────────── */
+  /* `.btn` carries shape / sizing / focus; pair with a variant
+     for color. Default size matches the px-4 py-2 used in the
+     bulk of the existing forms (Add Account, Save Settings). */
+  .btn {
+    @apply inline-flex items-center justify-center
+           px-4 py-2 text-sm font-medium rounded-md
+           border border-transparent
+           focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           transition-colors duration-150
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply bg-primary text-white hover:bg-secondary
+           focus:ring-primary focus:ring-offset-white
+           dark:focus:ring-offset-gray-800;
+  }
+  /* Page-level call-to-action — the gradient pill used for the single most
+     important action on a page (Create New Certificate on the dashboard,
+     Create Unified Backup on the backup tab). Self-contained: use bare, not
+     paired with .btn. One per view so the primary action reads the same
+     everywhere. */
+  .btn-cta {
+    @apply inline-flex items-center justify-center
+           px-5 py-2.5 text-sm font-medium rounded-lg shadow-sm
+           border border-transparent text-white
+           bg-gradient-to-r from-primary to-secondary
+           hover:from-secondary hover:to-primary
+           focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-primary
+           transition-all duration-200
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply bg-input
+           text-label
+           border-border-strong
+           hover:bg-sunken
+           focus:ring-border-strong;
+  }
+  .btn-danger {
+    @apply bg-red-600 text-white hover:bg-red-700
+           focus:ring-red-500 focus:ring-offset-white
+           dark:focus:ring-offset-gray-800;
+  }
+  /* Icon-only / minimal-chrome button (modal close X, refresh
+     icon in a header). Inherits .btn's focus ring but skips
+     the heavy border / coloured background. */
+  .btn-ghost {
+    @apply text-muted hover:text-foreground
+           bg-transparent hover:bg-hover
+           border-transparent
+           focus:ring-border-strong;
+  }
+  /* Size overrides — combine with .btn and a variant: */
+  .btn-sm { @apply px-3 py-1.5 text-xs; }
+  .btn-lg { @apply px-6 py-3 text-base; }
+
+  /* Card ────────────────────────────────────────────────────── */
+  /* Canonical surface for grouped content: same shadow / radius
+     used by index.html top-level panels, settings sections, and
+     the activity log. Pair with .p-6 (or similar) at the call
+     site for inner padding — kept out of .card so a card with
+     a header-band + body can split padding across rows. */
+  .card {
+    @apply bg-surface
+           border border-border
+           shadow-card rounded-xl;
+  }
+
+  /* Badges ──────────────────────────────────────────────────── */
+  /* Pair `.badge` (shape) with a `.badge-*` color variant. */
+  .badge {
+    @apply inline-flex items-center
+           px-2 py-0.5 rounded-full
+           text-xs font-medium
+           ring-1 ring-inset;
+  }
+  .badge-success {
+    @apply bg-green-500/10 text-green-700 dark:text-green-400
+           ring-green-500/20;
+  }
+  .badge-warning {
+    @apply bg-yellow-500/10 text-yellow-700 dark:text-yellow-400
+           ring-yellow-500/20;
+  }
+  .badge-error {
+    @apply bg-red-500/10 text-red-700 dark:text-red-400
+           ring-red-500/20;
+  }
+  .badge-info {
+    @apply bg-blue-500/10 text-blue-700 dark:text-blue-400
+           ring-blue-500/20;
+  }
+
+  /* Forms ───────────────────────────────────────────────────── */
+  /* `.form-input` / `.form-select` mirror the literal class set
+     used by the add-account / edit-account / settings forms. */
+  .form-input,
+  .form-select {
+    @apply block w-full
+           border border-border-strong
+           bg-input
+           text-foreground
+           placeholder-muted
+           rounded-md shadow-sm py-2 px-3
+           focus:outline-none focus:ring-primary focus:border-primary
+           disabled:opacity-60 disabled:cursor-not-allowed;
+  }
+  .form-label {
+    @apply block text-sm font-medium
+           text-label;
   }
 }
 /* Global press feedback for all primary-colored buttons */
@@ -99,10 +338,14 @@ button[class*="bg-red-6"]:active {
 }
 
 /* ── Table row health strip ──────────────────────────────────── */
-.health-valid   { border-left: 3px solid #22c55e; }
-.health-warning { border-left: 3px solid #f59e0b; }
-.health-expired { border-left: 3px solid #ef4444; }
-.health-unknown { border-left: 3px solid #6b7280; }
+/* Target the row's first cell rather than the <tr> itself: with
+   border-collapse: separate (Tailwind default), borders on <tr>
+   render inconsistently — Chrome paints only the first row, so
+   rows 2+ silently lose their strip (issue #189). */
+.health-valid   > td:first-child { border-left: 3px solid #22c55e; }
+.health-warning > td:first-child { border-left: 3px solid #f59e0b; }
+.health-expired > td:first-child { border-left: 3px solid #ef4444; }
+.health-unknown > td:first-child { border-left: 3px solid #6b7280; }
 
 /* ── Row stagger entrance ────────────────────────────────────── */
 @keyframes rowSlideIn {
@@ -110,7 +353,7 @@ button[class*="bg-red-6"]:active {
   to   { opacity: 1; transform: translateX(0); }
 }
 .row-enter {
-  animation: rowSlideIn 180ms ease-out backwards;
+  animation: rowSlideIn 180ms var(--ease-premium) backwards;
 }
 
 /* ── Skeleton shimmer ────────────────────────────────────────── */
@@ -161,6 +404,50 @@ button[class*="bg-red-6"]:active {
   animation: badgePulse 2s ease-in-out infinite;
 }
 
+/* ── ⌘K jump-and-flash ───────────────────────────────────────── */
+/* Briefly highlights the table row the command palette jumped to.   */
+/* primary brand is theme-independent (hsl(216,76%,43%)), so a single */
+/* translucent value reads on both light and dark backgrounds.       */
+@keyframes cmdFlash {
+  0%   { background-color: hsla(216, 76%, 43%, 0.30); }
+  25%  { background-color: hsla(216, 76%, 43%, 0.07); }
+  50%  { background-color: hsla(216, 76%, 43%, 0.30); }
+  100% { background-color: transparent; }
+}
+.cmd-flash { animation: cmdFlash 1.8s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  /* No fade — a static ring while the JS holds the class, then removed. */
+  .cmd-flash { animation: none; box-shadow: inset 0 0 0 2px hsl(216, 76%, 43%); }
+}
+
+/* ── Machine-value type (redesign phase 6) ───────────────────── */
+/* Identifiers — domains, client CNs, serials — read better in the mono
+   stack: even glyph widths make hostnames easy to scan and compare. tnum
+   keeps embedded digits aligned. One semantic hook so the treatment can be
+   tuned in a single place. */
+.cm-mono {
+  font-family: 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+  font-feature-settings: 'tnum';
+}
+
+/* Defined in @layer components so single-utility overrides (e.g. `hidden`)
+   still win over the component's own `display`. */
+@layer components {
+  /* ── Quick-action icon button ───────────────────────────────── */
+  /* Shared by the table-header action groups (Check all, Export, Refresh) so
+     the action vocabulary looks identical on the server and client lists. */
+  .cm-icon-btn {
+    @apply inline-flex items-center justify-center w-10 h-10 rounded-lg border border-border bg-input text-muted hover:text-foreground hover:bg-hover hover:border-border-strong transition;
+  }
+
+  /* ── Filter chip ────────────────────────────────────────────── */
+  /* Base chrome for the status/usage filter chips (active colours are applied
+     per-chip via aria-pressed: utilities). Matches the server status chips. */
+  .cm-chip {
+    @apply inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors text-muted hover:text-foreground;
+  }
+}
+
 /* ── Login page ambient background ───────────────────────────── */
 .login-ambient {
   background:
@@ -208,10 +495,24 @@ button[class*="bg-red-6"]:active {
     0 10px 40px rgba(0,0,0,0.5),
     0 0 0 1px rgba(255,255,255,0.05);
 }
+/* Tier 3 — overlays that float above everything: modals, command
+   palette, the notification popover. Completes the resting (card) →
+   raised (elevated) → overlay ramp so floating surfaces stop reaching
+   for ad-hoc shadow-xl/2xl. */
+.shadow-overlay {
+  box-shadow:
+    0 20px 60px -12px rgba(0,0,0,0.18),
+    0 8px 24px -8px rgba(0,0,0,0.10);
+}
+.dark .shadow-overlay {
+  box-shadow:
+    0 24px 70px -12px rgba(0,0,0,0.65),
+    0 0 0 1px rgba(255,255,255,0.06);
+}
 
 /* ── Detail panel entrance ───────────────────────────────────── */
 .panel-slide {
-  transition: transform 300ms cubic-bezier(0.16, 1, 0.3, 1),
+  transition: transform 300ms var(--ease-premium),
               opacity 200ms ease;
 }
 
@@ -244,10 +545,25 @@ button[class*="bg-red-6"]:active {
 
 /* ── Nav active indicator ────────────────────────────────────── */
 .nav-active {
-  @apply text-blue-600 dark:text-blue-400 font-semibold border-b-2 border-blue-500 dark:border-blue-400;
+  @apply text-accent font-semibold border-b-2 border-accent;
 }
 .nav-inactive {
-  @apply text-gray-500 dark:text-gray-400 font-medium border-b-2 border-transparent
-         hover:text-gray-700 dark:hover:text-gray-200 hover:border-gray-300 dark:hover:border-gray-600
+  @apply text-muted font-medium border-b-2 border-transparent
+         hover:text-foreground hover:border-border-strong
          transition-colors duration-150;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────── */
+/* Honour the OS "reduce motion" setting. Collapses every animation
+   and transition to near-zero — including the infinite shimmer /
+   badge-pulse and the page/row entrances — without disabling final
+   state (iteration-count:1 lets one-shot keyframes settle on their
+   end frame). scroll-behavior is reset so anchor jumps are instant. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

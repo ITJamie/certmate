@@ -9,6 +9,8 @@ import os
 import smtplib
 import hashlib
 import hmac
+import ipaddress
+import socket
 import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -16,8 +18,40 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _webhook_url_is_internal(url: str) -> bool:
+    """Return True if *url*'s host resolves to a loopback / private / link-local
+    / reserved address.
+
+    Used to block SSRF to internal services or the cloud metadata endpoint
+    (169.254.169.254) via an admin-supplied webhook URL — including the
+    interactive "Test" button, which would otherwise turn CertMate into a
+    confused deputy on its own network segment. Checks every resolved address so
+    a dual A-record can't smuggle one private IP past the guard. Hosts that do
+    not resolve are NOT treated as internal (they aren't a reachable internal
+    target — urlopen will just fail), so transient-DNS / placeholder hosts are
+    left to the normal request path.
+    """
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return False
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
 
 
 class Notifier:
@@ -62,7 +96,7 @@ class Notifier:
         # SMTP email
         smtp_cfg = channels.get('smtp', {})
         if smtp_cfg.get('enabled', False):
-            results['smtp'] = self._send_email(smtp_cfg, title, message, details)
+            results['smtp'] = self._send_email_with_retry(smtp_cfg, event, title, message, details)
 
         # Webhooks (generic, Slack, Discord)
         for wh in channels.get('webhooks', []):
@@ -136,6 +170,35 @@ class Notifier:
         except Exception as e:
             logger.error(f"Email notification failed: {e}")
             return {'error': str(e)}
+
+    def _send_email_with_retry(self, cfg: dict, event: str, title: str,
+                               message: str, details: Optional[dict] = None,
+                               max_retries: int = 3) -> dict:
+        """Send SMTP email with the same retry/backoff and delivery-log
+        contract as webhooks. Configuration errors are not retried —
+        only actual send failures (DNS, connect, auth-flap, 4xx greylisting)
+        get the 1s/2s backoff."""
+        start_ms = int(time.time() * 1000)
+        result = {}
+        attempts = 0
+        for attempt in range(max_retries):
+            attempts = attempt + 1
+            result = self._send_email(cfg, title, message, details)
+            if result.get('success'):
+                break
+            if result.get('error') == 'SMTP not fully configured':
+                break  # static config problem — retrying cannot help
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                time.sleep(delay)
+                logger.debug(f"SMTP retry {attempt + 2}/{max_retries}")
+
+        duration_ms = int(time.time() * 1000) - start_ms
+        self._log_delivery(
+            {'name': 'smtp', 'type': 'smtp', 'url': cfg.get('host', '')},
+            event, result, attempts, duration_ms,
+        )
+        return result
 
     def _send_webhook_with_retry(self, cfg: dict, event: str, title: str,
                                 message: str, details: Optional[dict] = None,
@@ -221,18 +284,25 @@ class Notifier:
 
     def _send_webhook(self, cfg: dict, event: str, title: str,
                       message: str, details: Optional[dict] = None) -> dict:
-        """Send webhook notification (generic, Slack, or Discord format)."""
+        """Send a notification to a webhook-style channel.
+
+        Supported ``type`` values: ``generic`` (signed JSON), ``slack``,
+        ``discord``, ``telegram``, ``ntfy``, ``gotify``. Each formats the
+        request (URL, body, headers) for its target service. Microsoft Teams
+        is covered by the SMTP channel via a Teams channel email address — no
+        dedicated adapter.
+        """
         try:
-            url = cfg.get('url', '')
-            if not url:
-                return {'error': 'Webhook URL not configured'}
-
-            # Only allow http/https schemes to prevent file:// or other attacks
-            if not url.startswith(('https://', 'http://')):
-                return {'error': 'Webhook URL must use http or https scheme'}
-
             wh_type = cfg.get('type', 'generic')
+            url = (cfg.get('url') or '').strip()
             secret = cfg.get('secret', '')
+            headers = {'User-Agent': 'CertMate-Webhook/2.0'}
+            content_type = 'application/json'
+
+            def _detail_lines():
+                if not details:
+                    return ''
+                return '\n' + '\n'.join(f'{k}: {v}' for k, v in details.items())
 
             if wh_type == 'slack':
                 payload = {
@@ -243,50 +313,96 @@ class Notifier:
                     ]
                 }
                 if details:
-                    fields = [{'type': 'mrkdwn', 'text': f'*{k}:* {v}'}
-                              for k, v in details.items()]
-                    payload['blocks'].append({'type': 'section', 'fields': fields})
+                    payload['blocks'].append({'type': 'section', 'fields': [
+                        {'type': 'mrkdwn', 'text': f'*{k}:* {v}'} for k, v in details.items()]})
+                body = json.dumps(payload).encode('utf-8')
 
             elif wh_type == 'discord':
-                embed = {
-                    'title': title,
-                    'description': message,
-                    'color': 2067276,  # CertMate blue
-                }
+                embed = {'title': title, 'description': message, 'color': 2067276}
                 if details:
                     embed['fields'] = [{'name': k, 'value': str(v), 'inline': True}
                                        for k, v in details.items()]
-                payload = {'embeds': [embed]}
+                body = json.dumps({'embeds': [embed]}).encode('utf-8')
 
-            else:  # generic
+            elif wh_type == 'telegram':
+                # Bot API: the token is in the URL path, chat_id in the body.
+                # Send PLAIN TEXT (no parse_mode). Titles/messages/details carry
+                # certbot error strings and wildcard '*' / '_acme-challenge'
+                # metacharacters; with parse_mode='Markdown' those unbalanced
+                # entities make the Bot API reject the message with HTTP 400
+                # "can't parse entities" and the alert is silently dropped —
+                # precisely on the failure events that matter most.
+                token = (cfg.get('token') or '').strip()
+                chat_id = str(cfg.get('chat_id') or '').strip()
+                if not (token and chat_id):
+                    return {'error': 'Telegram channel requires token and chat_id'}
+                url = f'https://api.telegram.org/bot{token}/sendMessage'
+                body = json.dumps({
+                    'chat_id': chat_id,
+                    'text': f'{title}\n{message}{_detail_lines()}',
+                }).encode('utf-8')
+
+            elif wh_type == 'ntfy':
+                # url is the topic URL, e.g. https://ntfy.sh/my-topic
+                body = (message + _detail_lines()).encode('utf-8')
+                content_type = 'text/plain; charset=utf-8'
+                headers['Title'] = title
+                headers['Priority'] = str(cfg.get('priority') or 'default')
+                if cfg.get('token'):
+                    headers['Authorization'] = f"Bearer {cfg['token']}"
+
+            elif wh_type == 'gotify':
+                token = (cfg.get('token') or '').strip()
+                if not (url and token):
+                    return {'error': 'Gotify channel requires url and token'}
+                url = url.rstrip('/') + '/message'
+                headers['X-Gotify-Key'] = token
+                try:
+                    priority = int(cfg.get('priority', 5))
+                except (TypeError, ValueError):
+                    priority = 5
+                body = json.dumps({'title': title, 'message': message + _detail_lines(),
+                                   'priority': priority}).encode('utf-8')
+
+            else:  # generic — signed JSON with optional custom headers
                 payload = {
-                    'event': event,
-                    'title': title,
-                    'message': message,
+                    'event': event, 'title': title, 'message': message,
                     'details': details or {},
-                    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 }
-
-            body = json.dumps(payload).encode('utf-8')
-            req = Request(url, data=body, method='POST')
-            req.add_header('Content-Type', 'application/json')
-            req.add_header('User-Agent', 'CertMate-Webhook/2.0')
-
-            # Custom headers for generic webhooks
-            if wh_type == 'generic':
+                body = json.dumps(payload).encode('utf-8')
                 for hdr_name, hdr_value in cfg.get('headers', {}).items():
-                    req.add_header(hdr_name, hdr_value)
+                    headers[hdr_name] = hdr_value
+                # HMAC-SHA256 signature with timestamp for replay protection.
+                if secret:
+                    timestamp = str(int(time.time()))
+                    sig = hmac.new(secret.encode(), f'{timestamp}.'.encode() + body,
+                                   hashlib.sha256).hexdigest()
+                    headers['X-CertMate-Signature'] = f't={timestamp},v1={sig}'
 
-            # HMAC-SHA256 signature with timestamp for replay protection
-            if secret and wh_type == 'generic':
-                timestamp = str(int(time.time()))
-                signed_payload = f'{timestamp}.'.encode() + body
-                sig = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
-                req.add_header('X-CertMate-Signature', f't={timestamp},v1={sig}')
+            if not url:
+                return {'error': 'Webhook URL not configured'}
+            # Only allow http/https schemes to prevent file:// or other attacks.
+            if not url.startswith(('https://', 'http://')):
+                return {'error': 'Webhook URL must use http or https scheme'}
+            # SSRF guard: refuse targets that resolve to internal/loopback/
+            # metadata addresses unless an operator explicitly allows them.
+            if _webhook_url_is_internal(url) and \
+                    os.getenv('CERTMATE_ALLOW_INTERNAL_WEBHOOKS', '').lower() not in ('true', '1', 'yes'):
+                logger.warning("Refused webhook to internal/loopback target: %s",
+                               urlparse(url).hostname)
+                return {'error': 'Webhook target resolves to an internal/loopback address; '
+                                 'refused (SSRF guard). Set CERTMATE_ALLOW_INTERNAL_WEBHOOKS=true '
+                                 'to permit internal targets.'}
+
+            req = Request(url, data=body, method='POST')
+            req.add_header('Content-Type', content_type)
+            for hdr_name, hdr_value in headers.items():
+                req.add_header(hdr_name, hdr_value)
 
             with urlopen(req, timeout=10) as resp:  # nosec B310
                 status = resp.status
-                logger.info(f"Webhook '{cfg.get('name', 'webhook')}' sent: HTTP {status}")
+                logger.info(f"Webhook '{cfg.get('name', 'webhook')}' ({wh_type}) sent: HTTP {status}")
                 return {'success': True, 'status': status}
 
         except URLError as e:

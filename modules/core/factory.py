@@ -4,11 +4,12 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from flask import Flask, request
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_restx import Api, Namespace
 
@@ -33,6 +34,11 @@ from modules.web import register_web_routes
 logger = get_certmate_logger('factory')
 request_logger = get_certmate_logger('request-watchdog')
 
+# APScheduler jobs run in background threads where Flask's thread-local
+# current_app proxy is unbound.  We keep a module-level reference so we
+# can explicitly push an app context inside those jobs.
+_flask_app = None
+
 
 class AppContainer:
     """DI Container holding all managers and application state"""
@@ -40,6 +46,11 @@ class AppContainer:
         self.app = None
         self.api = None
         self.scheduler = None
+        # Snapshot of the scheduler's startup outcome. Consumed by /health so
+        # operators can detect a silent setup failure without grepping logs.
+        # Shape: {"state": "uninitialized" | "running" | "failed",
+        #         "error": str | None, "timestamp": iso-utc-str | None}
+        self.scheduler_status = {"state": "uninitialized", "error": None, "timestamp": None}
         self.managers = {}
         self.cert_dir = None
         self.data_dir = None
@@ -321,8 +332,14 @@ def _secret_key_from_env_or_generate(data_dir: Path) -> str:
 
     key = secrets.token_hex(32)
     try:
-        implicit_key_file.write_text(key)
-        implicit_key_file.chmod(0o600)
+        # Create the file 0600 race-free (O_CREAT|O_EXCL-less O_TRUNC with an
+        # explicit mode) so the key is never briefly world-readable between a
+        # write and a follow-up chmod — matches audit_signing / file_operations.
+        fd = os.open(str(implicit_key_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, key.encode('utf-8'))
+        finally:
+            os.close(fd)
     except OSError as e:
         logger.warning(f"Could not persist SECRET_KEY to {implicit_key_file}: {e}. Sessions will not survive restarts.")
     return key
@@ -330,6 +347,35 @@ def _secret_key_from_env_or_generate(data_dir: Path) -> str:
 def configure_app(container: AppContainer, app, test_config=None):
     app.secret_key = _secret_key_from_env_or_generate(container.data_dir)
     app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+    # Harden the Flask session cookie. It carries the OIDC PKCE transients
+    # (state / nonce / code_verifier) and the post-login `next` URL. HttpOnly is
+    # already Flask's default; SameSite=Lax (not Strict — the OIDC callback is a
+    # cross-site top-level GET, and Strict would drop the cookie on return).
+    # Mark it Secure only when an HTTPS deployment is signalled, so plain-HTTP
+    # local/dev installs still receive the cookie (and OIDC login keeps working).
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    app.config['SESSION_COOKIE_SECURE'] = (
+        os.getenv('PREFERRED_URL_SCHEME', '').lower() == 'https'
+        or os.getenv('CERTMATE_ENABLE_HSTS', '').lower() == 'true'
+    )
+
+    # HTTP-01 webroot: certbot writes challenge tokens here and the Flask route
+    # in modules/web/routes.py serves them. Both sides resolve the path through
+    # the same acme_webroot_dir() helper (overridable via ACME_CHALLENGES_DIR)
+    # so they cannot drift; expose it on the app config for the route.
+    from .dns_strategies import acme_webroot_dir
+    app.config['ACME_CHALLENGES_DIR'] = str(acme_webroot_dir())
+    challenge_dir = os.path.join(
+        app.config['ACME_CHALLENGES_DIR'], '.well-known', 'acme-challenge')
+    try:
+        os.makedirs(challenge_dir, exist_ok=True)
+    except OSError as e:
+        # Non-fatal at boot; HTTP-01 issuance would fail later with a clear
+        # error if the directory is genuinely unwritable.
+        logger.warning("Could not create ACME challenge directory %s: %s",
+                       challenge_dir, e)
 
     if test_config:
         app.config.update(test_config)
@@ -394,12 +440,33 @@ def initialize_managers(container: AppContainer, app):
     )
 
     audit_dir = container.logs_dir / "audit"
-    audit_logger = AuditLogger(audit_dir)
+    # The tamper-evident hash chain lives under the persistent data tree
+    # (not the ephemeral logs/ tree) so it is the durable, verifiable artifact.
+    audit_chain_dir = container.data_dir / "audit"
+    # Ed25519 signer for signed checkpoints + the signed export bundle (Phase 3).
+    # The key persists under data/ like the Flask secret key; off-box via
+    # AUDIT_SIGNING_KEY_FILE. Best-effort: if it can't be set up, the unsigned
+    # hash chain still works.
+    from .audit_signing import AuditSigner
+    audit_signer = AuditSigner(container.data_dir)
+    audit_logger = AuditLogger(audit_dir, chain_dir=audit_chain_dir, signer=audit_signer)
     # Let AuthManager emit RBAC + scope denials through the same audit
     # surface the rest of the app uses (2026-05-12 API auth audit, F-2).
     auth_manager.set_audit_logger(audit_logger)
+    # Let unattended (scheduler-driven) renewals produce an attributed audit
+    # record — the headline agentic-audit-trail case where no request actor
+    # exists. Optional setter so standalone/test contexts stay decoupled.
+    certificate_manager.set_audit_logger(audit_logger)
+    client_cert_manager.set_audit_logger(audit_logger)
 
-    rate_limit_config = RateLimitConfig()
+    # OIDC manager — additive identity source. Disabled by default; the
+    # admin opts in via Settings → SSO. Lives alongside AuthManager so
+    # the cookie session it mints is indistinguishable to the
+    # @require_auth / @require_role decorators.
+    from .oidc import OIDCManager
+    oidc_manager = OIDCManager(settings_manager, auth_manager, audit_logger)
+
+    rate_limit_config = RateLimitConfig(settings_manager=settings_manager)
     rate_limiter = SimpleRateLimiter(rate_limit_config)
 
     notifier = Notifier(settings_manager, data_dir=str(container.data_dir))
@@ -410,12 +477,21 @@ def initialize_managers(container: AppContainer, app):
             'certificate_created': 'Certificate Created',
             'certificate_renewed': 'Certificate Renewed',
             'certificate_failed': 'Certificate Failed',
+            'deploy_hook_failed': 'Deploy Hook Failed',
         }
         title = event_titles.get(event)
         if not title:
             return
         domain = data.get('domain', 'unknown')
         message = f"{title}: {domain}"
+        # Deploy-hook failures carry the hook name and the error; surface both
+        # so the alert is actionable without opening the audit log.
+        hook_name = data.get('hook_name')
+        if hook_name:
+            message += f" (hook: {hook_name})"
+        err = data.get('error')
+        if err:
+            message += f" — {err}"
         notifier.notify(event, title, message, details=data)
 
     event_bus.add_listener(_on_event)
@@ -429,6 +505,11 @@ def initialize_managers(container: AppContainer, app):
         data_dir=str(container.data_dir),
     )
     event_bus.add_listener(deploy_manager.on_certificate_event)
+    # Let unattended (scheduler-driven) renewals publish 'certificate_renewed'
+    # so deploy hooks fire for background renewals, not just manual/API ones
+    # (#329). The manual path publishes via the IssuanceExecutor; the scheduler
+    # calls certificate_manager.renew_certificate() directly.
+    certificate_manager.set_event_bus(event_bus)
     app.config['EVENT_BUS'] = event_bus
     # DATA_DIR is the partition the DiagnosticsSnapshot endpoint queries
     # for disk_free / disk_total. Stored on the Flask app config so the
@@ -436,11 +517,21 @@ def initialize_managers(container: AppContainer, app):
     # reference to the container.
     app.config['DATA_DIR'] = str(container.data_dir)
 
+    from .cert_service import CertificateService
+    cert_service = CertificateService(
+        certificate_manager, settings_manager, auth_manager,
+        audit_logger=audit_logger,
+    )
+    from .cert_jobs import IssuanceExecutor
+    cert_executor = IssuanceExecutor(app, event_bus=event_bus)
+
     container.managers = {
         'file_ops': file_ops,
         'settings': settings_manager,
         'auth': auth_manager,
         'certificates': certificate_manager,
+        'cert_service': cert_service,
+        'cert_executor': cert_executor,
         'client_certificates': client_cert_manager,
         'dns': dns_manager,
         'cache': cache_manager,
@@ -460,35 +551,121 @@ def initialize_managers(container: AppContainer, app):
             audit_logger, notifier, settings_manager
         ),
         'deployer': deploy_manager,
+        'oidc': oidc_manager,
     }
 
 
-def _certificate_renewal_job():
-    """Picklable wrapper for certificate renewal check"""
+def _run_manager_job(manager_key: str, method_name: str):
+    """Execute a manager method inside a Flask app context.
+
+    APScheduler jobs run in background threads where the thread-local
+    `current_app` proxy is unbound.  We keep a module-level reference to
+    the app instance so we can push an explicit app context before
+    touching any Flask-bound code.
+    """
+    if _flask_app is None:
+        logger.warning(
+            "Background job skipped: Flask app not yet initialised",
+            manager_key=manager_key,
+            method_name=method_name,
+        )
+        return
     from flask import current_app
-    managers = current_app.config.get('MANAGERS')
-    if managers and 'certificates' in managers:
-        managers['certificates'].check_renewals()
+    with _flask_app.app_context():
+        managers = current_app.config.get('MANAGERS')
+        manager = managers.get(manager_key) if managers else None
+        if manager is None:
+            logger.warning(
+                "Background job skipped: manager not found",
+                manager_key=manager_key,
+            )
+            return
+        try:
+            getattr(manager, method_name)()
+        except Exception:
+            logger.exception(
+                "Background job failed",
+                manager_key=manager_key,
+                method_name=method_name,
+            )
+
+
+@contextmanager
+def _renewal_process_lock():
+    """Best-effort, host-local cross-process lock for scheduled renewal.
+
+    The APScheduler renewal jobs fire in EVERY process. CertMate ships as a
+    single process (Dockerfile: gunicorn --workers 1), but if an operator
+    raises the worker count or runs multiple containers sharing the SAME data
+    dir, each process would run check_renewals concurrently — issuing duplicate
+    ACME orders and burning the CA's duplicate-certificate rate limit. This
+    flock lets exactly one holder proceed; the others skip this tick.
+
+    Advisory + host-local: flock does NOT coordinate replicas on SEPARATE
+    filesystems (e.g. k8s pods without a shared volume) — that needs external
+    coordination; see the deployment docs. Yields True when the caller may run,
+    False when another process already holds the lock. On any error (no data
+    dir, platform without fcntl) it yields True: the single-process default is
+    correct and must never be blocked by the guard itself."""
+    lock_file = None
+    acquired = False
+    try:
+        data_dir = _flask_app.config.get('DATA_DIR') if _flask_app is not None else None
+        if not data_dir:
+            yield True
+            return
+        try:
+            import fcntl
+        except ImportError:
+            yield True  # non-POSIX host; single-process assumption holds
+            return
+        lock_file = open(Path(data_dir) / '.renewal.lock', 'w')
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError:
+            acquired = False
+        yield acquired
+    finally:
+        if lock_file is not None:
+            try:
+                if acquired:
+                    import fcntl
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
+
+
+def _certificate_renewal_job():
+    """Picklable wrapper for certificate renewal check, guarded so only one
+    process runs it when several share a data dir (see _renewal_process_lock)."""
+    with _renewal_process_lock() as may_run:
+        if not may_run:
+            logger.info("Scheduled certificate renewal skipped: another process "
+                        "holds the renewal lock (multiple workers/containers on a "
+                        "shared data dir); one process renews.")
+            return
+        _run_manager_job('certificates', 'check_renewals')
 
 
 def _client_certificate_renewal_job():
-    """Picklable wrapper for client certificate renewal check"""
-    from flask import current_app
-    managers = current_app.config.get('MANAGERS')
-    if managers and 'client_certificates' in managers:
-        managers['client_certificates'].check_renewals()
+    """Picklable wrapper for client certificate renewal check (same guard)."""
+    with _renewal_process_lock() as may_run:
+        if not may_run:
+            logger.info("Scheduled client-certificate renewal skipped: another "
+                        "process holds the renewal lock.")
+            return
+        _run_manager_job('client_certificates', 'check_renewals')
 
 
 def _weekly_digest_job():
     """Picklable wrapper for weekly digest"""
-    from flask import current_app
-    managers = current_app.config.get('MANAGERS')
-    if managers and 'digest' in managers:
-        managers['digest'].send()
+    _run_manager_job('digest', 'send')
 
 
 def setup_scheduler(container: AppContainer):
     """Set up APScheduler for background tasks with persistent store."""
+    assert _flask_app is not None, "setup_scheduler called before _flask_app was set"
     try:
         from sqlalchemy import create_engine, event as _sa_event
         _db_path = container.data_dir / 'scheduler_jobs.sqlite'
@@ -496,13 +673,47 @@ def setup_scheduler(container: AppContainer):
 
         @_sa_event.listens_for(_engine, 'connect')
         def _set_wal_mode(dbapi_conn, _record):
+            # `PRAGMA journal_mode=WAL` does NOT raise when the filesystem
+            # doesn't support WAL (NFS, some network mounts, old FAT). SQLite
+            # silently falls back to the previous journal mode, which still
+            # works but has worse concurrency. Verify the mode took effect
+            # and log a warning if not — otherwise the only signal would be
+            # "scheduler feels slow" with no clue why.
             dbapi_conn.execute('PRAGMA journal_mode=WAL')
+            try:
+                cur = dbapi_conn.execute('PRAGMA journal_mode')
+                row = cur.fetchone()
+                effective = row[0] if row else None
+                if effective and str(effective).lower() != 'wal':
+                    logger.warning(
+                        f"Scheduler SQLite store could not enter WAL mode; "
+                        f"running in journal_mode={effective!r}. The filesystem "
+                        f"may not support WAL (NFS, network mounts). Renewal "
+                        f"correctness is unaffected; concurrency will be lower."
+                    )
+            except Exception as e:
+                # Diagnostic only — don't break connection if PRAGMA readback fails.
+                logger.debug(f"Could not verify SQLite journal_mode: {e}")
             dbapi_conn.execute('PRAGMA synchronous=NORMAL')
 
         jobstores = {
             'default': SQLAlchemyJobStore(engine=_engine)
         }
-        scheduler = BackgroundScheduler(jobstores=jobstores)
+        # Job-default hardening for the renewal cron jobs:
+        #  - misfire_grace_time: APScheduler's default is 1 second, so a fire
+        #    that the scheduler can't service within 1s of its scheduled time
+        #    (thread starvation, a prior run overrunning, brief unavailability)
+        #    is silently DROPPED, not run late. A 6-hour grace lets a delayed
+        #    02:00 renewal check still run instead of skipping the day.
+        #  - coalesce: if several fires were missed while unavailable, run the
+        #    check once on catch-up rather than back-to-back.
+        #  - max_instances: never let two renewal runs overlap.
+        job_defaults = {
+            'coalesce': True,
+            'misfire_grace_time': 21600,  # 6 hours
+            'max_instances': 1,
+        }
+        scheduler = BackgroundScheduler(jobstores=jobstores, job_defaults=job_defaults)
         scheduler.start()
 
         scheduler.add_job(
@@ -522,14 +733,28 @@ def setup_scheduler(container: AppContainer):
         )
         container.scheduler = scheduler
         container.managers['scheduler'] = scheduler
+        from .utils import utc_now_iso
+        container.scheduler_status = {
+            "state": "running", "error": None, "timestamp": utc_now_iso(),
+        }
+        container.managers['scheduler_status'] = container.scheduler_status
     except Exception as e:
-        logger.error(f"Scheduler setup failed — automatic certificate renewal will NOT run: {e}")
+        logger.critical(f"Scheduler setup failed — automatic certificate renewal will NOT run: {e}")
         import warnings
         warnings.warn(
             f"CertMate scheduler failed to start: {e}. "
             "Automatic certificate renewal is DISABLED.",
             RuntimeWarning, stacklevel=2,
         )
+        # Record the failure so /health surfaces it. Without this the only
+        # signal of a broken scheduler was a single ERROR line in the logs;
+        # operators that don't tail logs would never know automatic renewal
+        # had silently stopped working.
+        from .utils import utc_now_iso
+        container.scheduler_status = {
+            "state": "failed", "error": str(e), "timestamp": utc_now_iso(),
+        }
+        container.managers['scheduler_status'] = container.scheduler_status
 
 
 def setup_api(container: AppContainer, app):
@@ -573,11 +798,17 @@ def setup_api(container: AppContainer, app):
     ns_cache.add_resource(api_resources['CacheClear'], '/clear')
     ns_certificates.add_resource(api_resources['CertificateList'], '')
     ns_certificates.add_resource(api_resources['CreateCertificate'], '/create')
+    ns_certificates.add_resource(api_resources['ZombieScan'], '/zombies/scan')
     ns_certificates.add_resource(api_resources['CheckDNSAlias'], '/check-dns-alias')
     ns_certificates.add_resource(api_resources['CertificateDetail'], '/<string:domain>')
+    ns_certificates.add_resource(api_resources['CertificateDeploymentStatus'], '/<string:domain>/deployment-status')
+    ns_certificates.add_resource(api_resources['CertificateDeploymentBrowserReports'], '/deployment-status/browser')
     ns_certificates.add_resource(api_resources['CertificateDNSAliasCheck'], '/<string:domain>/dns-alias-check')
     ns_certificates.add_resource(api_resources['DownloadCertificate'], '/<string:domain>/download')
+    ns_certificates.add_resource(api_resources['DownloadCertificateFile'], '/<string:domain>/download/<string:file_type>')
     ns_certificates.add_resource(api_resources['RenewCertificate'], '/<string:domain>/renew')
+    ns_certificates.add_resource(api_resources['CertificateReissue'], '/<string:domain>/reissue')
+    ns_certificates.add_resource(api_resources['CertificateJob'], '/jobs/<string:job_id>')
     ns_certificates.add_resource(api_resources['CertificateAutoRenew'], '/<string:domain>/auto-renew')
     ns_certificates.add_resource(api_resources['CertificateRunDeploy'], '/<string:domain>/deploy')
     ns_backups.add_resource(api_resources['BackupList'], '')
@@ -664,6 +895,44 @@ def setup_csrf_protection(app):
         return None
 
 
+def setup_error_handlers(app):
+    """Force JSON responses for unhandled errors on /api/* paths.
+
+    Without these handlers, Werkzeug serves its HTML default page when a
+    request fails to match a registered route (e.g. a trailing slash that
+    no rule covers) or when an unhandled exception escapes a view function.
+    Frontends that pipe the response through `r.json()` then surface
+    "Unexpected token '<'" / NETWORK_ERROR — the symptom reported in #164.
+    Non-API paths keep Flask's default behaviour.
+    """
+    from werkzeug.exceptions import HTTPException
+
+    @app.errorhandler(HTTPException)
+    def _api_http_exception(e):
+        if request.path.startswith('/api/'):
+            return jsonify({
+                'error': e.name,
+                'message': e.description,
+                'code': e.code,
+            }), e.code
+        return e
+
+    @app.errorhandler(Exception)
+    def _api_unhandled_exception(e):
+        if not request.path.startswith('/api/'):
+            raise e
+        logger.exception(
+            "Unhandled exception in API request",
+            path=request.path,
+            method=request.method,
+        )
+        return jsonify({
+            'error': 'Internal Server Error',
+            'message': 'An unexpected error occurred. Check the server logs for details.',
+            'code': 500,
+        }), 500
+
+
 def setup_security_headers(app):
     @app.after_request
     def add_security_headers(response):
@@ -723,8 +992,25 @@ def setup_rate_limiting(app, container: AppContainer):
         # Only skip rate limiting for auth endpoints (login needs its own limiter)
         if path.startswith('/api/auth/'):
             return None
+        # Admin can turn API rate limiting off entirely from settings (#319),
+        # e.g. when a trusted automation fleet behind one IP would otherwise
+        # trip a shared bucket. Defaults to on.
+        if not rate_limiter.config.is_enabled():
+            return None
 
         client_ip = flask_request.remote_addr or '0.0.0.0'  # nosec B104
+        # Rate-limit bucket: prefer a per-API-key bucket so many clients behind
+        # one NAT/proxy IP don't share a single limit (false positives), and an
+        # abusive key is throttled independently of its source IP. The bearer
+        # token is hashed so it is never used as a cleartext bucket key.
+        # Cookie/session and anonymous requests fall back to the IP bucket.
+        auth_header = flask_request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            import hashlib
+            token = auth_header[7:].strip()
+            identifier = 'key:' + hashlib.sha256(token.encode()).hexdigest()[:32]
+        else:
+            identifier = 'ip:' + client_ip
         endpoint = 'default'
         if 'certificates' in path and 'create' in path:
             endpoint = 'certificate_create'
@@ -741,7 +1027,7 @@ def setup_rate_limiting(app, container: AppContainer):
         elif 'crl' in path:
             endpoint = 'crl_download'
 
-        if not rate_limiter.is_allowed(client_ip, endpoint):
+        if not rate_limiter.is_allowed(identifier, endpoint):
             return flask_jsonify({
                 'error': 'Rate limit exceeded',
                 'message': 'Too many requests.',
@@ -751,6 +1037,7 @@ def setup_rate_limiting(app, container: AppContainer):
 
 def create_app(test_config=None):
     """Application Factory for CertMate"""
+    global _flask_app
     container = AppContainer()
     setup_directories(container, test_config)
 
@@ -775,12 +1062,37 @@ def create_app(test_config=None):
 
     configure_app(container, app, test_config)
     initialize_managers(container, app)
+    app.config['MANAGERS'] = container.managers
+
+    # Loud, once-at-startup warning when the instance will serve every request
+    # as admin because nothing is configured yet. An operator who exposes
+    # CertMate before completing setup — or who never set API_BEARER_TOKEN —
+    # otherwise has no signal that the whole API is wide open.
+    try:
+        _auth = container.managers.get('auth')
+        if _auth is not None and _auth.is_setup_mode():
+            logger.warning(
+                "CertMate is running UNAUTHENTICATED: no local-auth user and no "
+                "operator-provided API bearer token, so EVERY request is served "
+                "as admin. Anyone who can reach this instance has full control "
+                "of all certificates and private keys. Complete setup (create an "
+                "admin and enable local auth) or set API_BEARER_TOKEN before "
+                "exposing it."
+            )
+    except Exception as e:
+        logger.debug(f"Setup-mode startup check failed: {e}")
+
     setup_api(container, app)
     register_web_routes(app, container.managers)
     setup_csrf_protection(app)
+    setup_error_handlers(app)
     setup_security_headers(app)
     setup_rate_limiting(app, container)
     setup_slow_request_logging(app, container)
+
+    # Make the app instance available to background APScheduler jobs before
+    # starting the scheduler so recovered misfired jobs can push an app context.
+    _flask_app = app
     setup_scheduler(container)
 
     return app, container

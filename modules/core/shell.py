@@ -11,7 +11,12 @@ logger = logging.getLogger(__name__)
 
 class ShellExecutor:
     """Interface for executing shell commands"""
-    
+
+    # A real execution runs certbot, which materialises certificate files on
+    # disk. Callers can key post-execution filesystem assertions on this so a
+    # non-executing double (MockShellExecutor) doesn't trip them.
+    produces_artifacts = True
+
     def run(self, cmd: List[str], check: bool = False, capture_output: bool = True, 
             text: bool = True, timeout: Optional[int] = None, **kwargs) -> subprocess.CompletedProcess:
         """
@@ -47,9 +52,14 @@ class ShellExecutor:
 
 class MockShellExecutor(ShellExecutor):
     """Mock implementation for testing"""
-    
+
+    # The mock returns canned results without running certbot, so no
+    # certificate files appear on disk; skip artifact-existence checks.
+    produces_artifacts = False
+
     def __init__(self):
         self.commands_executed = []
+        self.envs_executed = []  # env dict passed alongside each command
         self.responses = {}  # Map cmd_substring -> (returncode, stdout, stderr)
         self.response_queue = []  # Queue of responses for sequential calls
         self.call_count = 0
@@ -70,6 +80,7 @@ class MockShellExecutor(ShellExecutor):
     def run(self, cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
         cmd_str = " ".join(cmd)
         self.commands_executed.append(cmd_str)
+        self.envs_executed.append(kwargs.get('env'))
         self.call_count += 1
         logger.info(f"Mock Executing: {cmd_str}")
         

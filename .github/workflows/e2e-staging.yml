@@ -1,0 +1,95 @@
+name: E2E (staging)
+
+# Real-certificate end-to-end: issue + force-renew a cert against Let's
+# Encrypt STAGING via Cloudflare DNS-01, on the real built image. This is the
+# regression net for the DNS / provider / ACME wiring that the mocked unit
+# suite cannot exercise (the class of bug behind most recent cert churn).
+#
+# HONEST GATING (see the job-level `if` below). Real ACME + DNS propagation are
+# slow, externally flaky, and need a Cloudflare token, so this is opt-in and is
+# NOT a required PR check. It runs only when EXPLICITLY enabled, and when it is
+# not enabled the job is SKIPPED (neutral) rather than reporting a green no-op —
+# a gate must never claim success without actually issuing a certificate.
+#
+# The authoritative real-cert gate is run LOCALLY before each release, with
+# credentials kept in .env (never in CI):
+#   set -a; . ./.env; set +a
+#   CERTMATE_E2E_CA_PROVIDER=letsencrypt_staging python -m pytest -v -m e2e \
+#     tests/test_health_ready_e2e.py tests/test_cert_lifecycle.py \
+#     tests/test_async_issuance_e2e.py
+#
+# To ALSO run it in CI (optional drift detection), set BOTH:
+#   - repository variable E2E_STAGING_ENABLED = true   (enables the scheduled run)
+#   - repository secrets:
+#       CLOUDFLARE_API_TOKEN  - token with Zone:DNS:Edit on the test zone (required)
+#       CERTMATE_TEST_DOMAIN  - the Cloudflare-managed zone, e.g. example.org (required)
+#       CERTMATE_TEST_EMAIL   - ACME account email (optional; a default is used)
+# Issuance defaults to Let's Encrypt STAGING (tests/e2e_support.py), so a run
+# never consumes a production rate limit or mints a publicly trusted cert.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 4 * * 1'  # Mondays 04:37 UTC
+
+permissions: read-all
+
+concurrency:
+  # Share the host-global container lock with the CI `test` job: both bind the
+  # fixed-name certmate-test-suite container on port 18888, so they must never
+  # run at once on the self-hosted host (see ci.yml / #295).
+  group: certmate-selfhosted-test-container
+  cancel-in-progress: false
+
+jobs:
+  e2e-staging:
+    name: e2e-staging
+    # Run only when explicitly enabled (scheduled drift detection) or on a
+    # manual dispatch. Otherwise the job is SKIPPED, not falsely green. `vars`
+    # is used for the switch because `secrets` is not available in job `if`.
+    if: ${{ vars.E2E_STAGING_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+    - name: Preflight - require Cloudflare secret
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      run: |
+        if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+          echo "::error::CLOUDFLARE_API_TOKEN is not configured, so the real-cert E2E cannot issue a certificate. Failing loudly instead of passing a no-op. Add the CLOUDFLARE_API_TOKEN / CERTMATE_TEST_DOMAIN repository secrets to run it in CI, or run the gate locally with credentials from .env (see the comment at the top of this workflow)."
+          exit 1
+        fi
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      with:
+        python-version: '3.12'
+
+    - name: Cache pip dependencies
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-test.txt
+
+    - name: Real-cert E2E against Let's Encrypt staging
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        CERTMATE_TEST_DOMAIN: ${{ secrets.CERTMATE_TEST_DOMAIN }}
+        CERTMATE_TEST_EMAIL: ${{ secrets.CERTMATE_TEST_EMAIL }}
+        # Belt-and-suspenders: the tests default to staging, pin it here too.
+        CERTMATE_E2E_CA_PROVIDER: letsencrypt_staging
+      run: |
+        python -m pytest -v -m e2e \
+          tests/test_health_ready_e2e.py \
+          tests/test_cert_lifecycle.py \
+          tests/test_async_issuance_e2e.py

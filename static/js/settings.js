@@ -26,7 +26,13 @@
     // Debug console functions
     // =============================================
 
-    function toggleDebugConsole() {
+    // Renamed from toggleDebugConsole / clearDebugConsole to avoid a
+    // naming collision with the identically-named helpers in
+    // dashboard.js — both files export to `window.*` and the two
+    // pages don't load together so there's no runtime breakage today,
+    // but a future bundle / a future page that includes both scripts
+    // would silently overwrite the binding (4.1 fix).
+    function toggleSettingsDebugConsole() {
         var consoleDiv = document.getElementById('settingsDebugConsole');
         if (consoleDiv.classList.contains('hidden')) {
             consoleDiv.classList.remove('hidden');
@@ -35,7 +41,7 @@
         }
     }
 
-    function clearDebugConsole() {
+    function clearSettingsDebugConsole() {
         document.getElementById('settingsDebugOutput').innerHTML = '<div class="text-gray-500">Debug console cleared. All settings actions will be logged here...</div>';
     }
 
@@ -45,13 +51,14 @@
 
     function toggleChallengeType() {
         var selected = document.querySelector('input[name="challenge_type"]:checked');
-        var dnsSection = document.getElementById('dns-provider-section');
-        if (!dnsSection) return;
-        if (selected && selected.value === 'http-01') {
-            dnsSection.style.display = 'none';
-        } else {
-            dnsSection.style.display = '';
-        }
+        var isHttp = selected && selected.value === 'http-01';
+        // Hide both the provider picker and the per-provider config panels.
+        // The config panels are siblings of the picker, so hiding the picker
+        // alone left a stale DNS panel visible under HTTP-01 (issue #226).
+        ['dns-provider-section', 'dns-config-section'].forEach(function (id) {
+            var el = document.getElementById(id);
+            if (el) el.style.display = isHttp ? 'none' : '';
+        });
     }
 
     // =============================================
@@ -162,12 +169,17 @@
             var email = '';
             if (defaultCA === 'letsencrypt') {
                 email = (caProviders.letsencrypt && caProviders.letsencrypt.email) || '';
+            } else if (defaultCA === 'letsencrypt_staging') {
+                // Staging shares the LE account shape; fall back to the
+                // production LE email when its own field is empty.
+                email = (caProviders.letsencrypt_staging && caProviders.letsencrypt_staging.email) ||
+                    (caProviders.letsencrypt && caProviders.letsencrypt.email) || '';
             } else if (defaultCA === 'zerossl') {
                 email = (caProviders.zerossl && caProviders.zerossl.email) || '';
             } else if (defaultCA === 'google') {
                 email = (caProviders.google && caProviders.google.email) || '';
-            } else if (defaultCA === 'buypass') {
-                email = (caProviders.buypass && caProviders.buypass.email) || '';
+            } else if (defaultCA === 'actalis') {
+                email = (caProviders.actalis && caProviders.actalis.email) || '';
             } else if (defaultCA === 'sslcom') {
                 email = (caProviders.sslcom && caProviders.sslcom.email) || '';
             } else if (defaultCA === 'digicert') {
@@ -182,6 +194,14 @@
             var tokenRaw = formData.get('api_bearer_token');
             var tokenValue = tokenRaw ? tokenRaw.trim() : undefined;
 
+            // Default certificate-key shape selectors. RSA always carries
+            // a key_size, ECDSA always a curve — the inactive branch is
+            // omitted from the payload so save_settings doesn't trip the
+            // mutual-exclusion validator.
+            var defaultKeyType = formData.get('default_key_type') || 'rsa';
+            var defaultKeySize = parseInt(formData.get('default_key_size'), 10);
+            var defaultEllipticCurve = formData.get('default_elliptic_curve') || 'secp256r1';
+
             var settings = {
                 email: email.trim(),
                 domains: domainsValue,
@@ -191,20 +211,34 @@
                 challenge_type: formData.get('challenge_type') || 'dns-01',
                 api_bearer_token: tokenValue,
                 cache_ttl: parseInt(formData.get('cache_ttl')) || 300,
-                storage_backend: formData.get('storage_backend'),
                 certificate_storage: collectStorageBackendSettings(),
                 default_ca: defaultCA,
-                ca_providers: caProviders
+                ca_providers: caProviders,
+                default_key_type: defaultKeyType,
+                default_key_size: defaultKeyType === 'rsa' ? (defaultKeySize || 2048) : 2048,
+                default_elliptic_curve: defaultEllipticCurve
             };
+
+            // PFX export password (#230). Secret field: only send when the
+            // user typed a value — a blank field means "keep existing", which
+            // the backend honours for secret-named keys. Sending the password
+            // empty would be treated the same way, but omitting it keeps the
+            // payload clean.
+            var pfxPasswordField = document.getElementById('pfx_password');
+            if (pfxPasswordField && pfxPasswordField.value) {
+                settings.pfx_password = pfxPasswordField.value;
+            }
 
             // Validate required fields - email comes from the selected CA provider
             if (!settings.email) {
                 var caDisplayName = defaultCA === 'letsencrypt' ? "Let's Encrypt" :
+                    defaultCA === 'letsencrypt_staging' ? "Let's Encrypt (Staging)" :
                     defaultCA === 'zerossl' ? 'ZeroSSL' :
                     defaultCA === 'google' ? 'Google Trust Services' :
-                    defaultCA === 'buypass' ? 'BuyPass Go' :
+                    defaultCA === 'actalis' ? 'Actalis' :
                     defaultCA === 'sslcom' ? 'SSL.com' :
-                    defaultCA === 'digicert' ? 'DigiCert' : 'Private CA';
+                    defaultCA === 'digicert' ? 'DigiCert' :
+                    defaultCA === 'private_ca' ? 'Private CA' : defaultCA;
                 throw new Error('Email address is required in the ' + caDisplayName + ' configuration section');
             }
 
@@ -212,13 +246,17 @@
                 throw new Error('DNS provider must be selected');
             }
 
-            // API Bearer Token is only required after initial setup
-            if (!settings.api_bearer_token && currentSettings.setup_completed) {
+            // API Bearer Token is only required after initial setup when the
+            // backend has no hashed token already. Post-2.4.8 settings.json
+            // stores only api_bearer_token_hash (the plaintext is intentionally
+            // absent from GET /api/web/settings), so an empty form field on
+            // save means "keep the existing hash", not "no token configured".
+            if (!settings.api_bearer_token && currentSettings.setup_completed && !currentSettings.api_bearer_token_hash) {
                 throw new Error('API Bearer Token is required');
             }
 
             // Auto-generate token for initial setup if not provided
-            if (!settings.api_bearer_token && !currentSettings.setup_completed) {
+            if (!settings.api_bearer_token && !currentSettings.setup_completed && !currentSettings.api_bearer_token_hash) {
                 settings.api_bearer_token = generateRandomToken();
                 var tokenField = document.getElementById('api_bearer_token');
                 if (tokenField) {
@@ -345,7 +383,15 @@
             'dynudns': ['dynudns_token'],
             'duckdns': ['duckdns_api_token'],
             'dnsmadeeasy': ['dnsmadeeasy_api_key', 'dnsmadeeasy_secret_key'],
-            'nsone': ['nsone_api_key']
+            'nsone': ['nsone_api_key'],
+            'arvancloud': ['arvancloud_api_key'],
+            'infomaniak': ['infomaniak_api_token'],
+            'acme-dns': ['acme-dns_api_url', 'acme-dns_username', 'acme-dns_password', 'acme-dns_subdomain'],
+            'hetzner-cloud': ['hetzner-cloud_api_token'],
+            'desec': ['desec_api_token'],
+            'scaleway': ['scaleway_application_token'],
+            'solidserver': ['solidserver_host', 'solidserver_username', 'solidserver_password', 'solidserver_dns_name', 'solidserver_dnsview_name', 'solidserver_propagation_seconds'],
+            'custom-script': ['custom-script_auth_hook', 'custom-script_cleanup_hook']
         };
 
         return fieldMappings[provider] || [];
@@ -380,30 +426,42 @@
     }
 
     function clearDeploymentCache() {
-        addDebugLog('Clearing deployment cache...', 'info');
+        // Mirror the confirm pattern used by the dashboard's invalidateAllCache.
+        // The clear itself is non-destructive (next dashboard load re-probes
+        // each domain) but a misclick still wastes a round of probes and
+        // momentarily flickers every cert's deployment badge — annoying enough
+        // to warrant the same two-step interaction.
+        return CertMate.confirm(
+            'Clear all server-side deployment status cache? The next dashboard render will re-probe every cert.',
+            'Clear Cache',
+            { danger: false }
+        ).then(function (confirmed) {
+            if (!confirmed) return Promise.resolve();
+            addDebugLog('Clearing deployment cache...', 'info');
 
-        return fetch('/api/web/cache/clear', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        })
-            .then(function (response) {
-                if (response.ok) {
-                    return response.json().then(function (result) {
-                        addDebugLog('Cache cleared successfully', 'info');
-                        showMessage('Cache cleared successfully', 'success');
-                        return refreshCacheStats();
-                    });
-                } else {
-                    addDebugLog('Failed to clear cache', 'warn');
-                    showMessage('Failed to clear cache', 'error');
+            return fetch('/api/web/cache/clear', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
                 }
             })
-            .catch(function (error) {
-                addDebugLog('Error clearing cache: ' + error.message, 'error');
-                showMessage('Error clearing cache', 'error');
-            });
+                .then(function (response) {
+                    if (response.ok) {
+                        return response.json().then(function (result) {
+                            addDebugLog('Cache cleared successfully', 'info');
+                            showMessage('Cache cleared successfully', 'success');
+                            return refreshCacheStats();
+                        });
+                    } else {
+                        addDebugLog('Failed to clear cache', 'warn');
+                        showMessage('Failed to clear cache', 'error');
+                    }
+                })
+                .catch(function (error) {
+                    addDebugLog('Error clearing cache: ' + error.message, 'error');
+                    showMessage('Error clearing cache', 'error');
+                });
+        });
     }
 
     // =============================================
@@ -537,8 +595,11 @@
         var providers = [
             'cloudflare', 'route53', 'azure', 'google', 'powerdns',
             'digitalocean', 'linode', 'edgedns', 'gandi', 'ovh', 'namecheap',
-            'vultr', 'dnsmadeeasy', 'nsone', 'rfc2136', 'hetzner',
-            'porkbun', 'godaddy', 'he-ddns', 'dynudns', 'duckdns'
+            'vultr', 'solidserver', 'dnsmadeeasy', 'nsone', 'rfc2136', 'hetzner',
+            'porkbun', 'godaddy', 'he-ddns', 'dynudns', 'duckdns',
+            'arvancloud', 'infomaniak', 'acme-dns', 'hetzner-cloud',
+            'desec', 'scaleway',
+            'custom-script'
         ];
 
         providers.forEach(function (provider) {
@@ -550,7 +611,7 @@
                 var providerData = dnsProviders[provider];
                 if (providerData && providerData.configured) {
                     statusEl.textContent = 'Configured';
-                    statusEl.className = 'text-xs text-green-600 dark:text-green-400 mt-1';
+                    statusEl.className = 'text-xs text-success-fg mt-1';
 
                     if (accountsEl && countEl) {
                         countEl.textContent = providerData.accounts.length;
@@ -558,7 +619,7 @@
                     }
                 } else {
                     statusEl.textContent = 'Not configured';
-                    statusEl.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1';
+                    statusEl.className = 'text-xs text-muted mt-1';
 
                     if (accountsEl) {
                         accountsEl.classList.add('hidden');
@@ -625,11 +686,42 @@
                 }
             }
 
+            // Default certificate-key shape — populate selectors from the
+            // loaded settings so the form reflects the persisted defaults
+            // (and the operator can edit them without losing the others).
+            if (data.default_key_type) {
+                var keyTypeField = document.getElementById('default_key_type');
+                if (keyTypeField) {
+                    keyTypeField.value = data.default_key_type;
+                }
+            }
+            if (data.default_key_size) {
+                var keySizeField = document.getElementById('default_key_size');
+                if (keySizeField) {
+                    keySizeField.value = String(data.default_key_size);
+                }
+            }
+            if (data.default_elliptic_curve) {
+                var curveField = document.getElementById('default_elliptic_curve');
+                if (curveField) {
+                    curveField.value = data.default_elliptic_curve;
+                }
+            }
+            if (typeof toggleDefaultKeyOptions === 'function') {
+                toggleDefaultKeyOptions();
+            }
+
             if (data.api_bearer_token) {
                 var populateTokenField = document.getElementById('api_bearer_token');
                 if (populateTokenField) {
                     populateTokenField.value = data.api_bearer_token;
                     addDebugLog('API bearer token field populated', 'info');
+                }
+            } else if (data.api_bearer_token_hash) {
+                var hashedTokenField = document.getElementById('api_bearer_token');
+                if (hashedTokenField) {
+                    hashedTokenField.placeholder = 'API token configured — leave empty to keep, or enter a new one to rotate';
+                    addDebugLog('API bearer token already configured (hash present)', 'info');
                 }
             }
 
@@ -728,6 +820,13 @@
                     { field: 'edgedns_client_secret', config: 'client_secret' },
                     { field: 'edgedns_access_token', config: 'access_token' },
                     { field: 'edgedns_host', config: 'host' }
+                ],
+                'nsone': [
+                    { field: 'nsone_api_key', config: 'api_key' }
+                ],
+                'dnsmadeeasy': [
+                    { field: 'dnsmadeeasy_api_key', config: 'api_key' },
+                    { field: 'dnsmadeeasy_secret_key', config: 'secret_key' }
                 ]
             };
 
@@ -748,11 +847,21 @@
     // Modal management functions
     // =============================================
 
+    // Stores the element that triggered the add-account modal so we can
+    // restore focus on close (B5 accessibility fix).
+    var _addAccountTriggerEl = null;
+
     function showAddAccountModal(provider) {
         addDebugLog('Opening add account modal for ' + provider, 'info');
 
+        // Remember trigger for focus restore on close
+        _addAccountTriggerEl = document.activeElement;
+
         var modal = document.getElementById('addAccountModal');
-        var modalTitle = document.getElementById('modal-title');
+        // R-2: macro emits `<h3 id="<modalId>-title">` for aria-labelledby
+        // wiring; the dynamic per-provider title still lands in the same
+        // <h3>, just renamed from the legacy "modal-title" id.
+        var modalTitle = document.getElementById('addAccountModal-title');
         var providerFields = document.getElementById('modal-provider-fields');
         var accountNameField = document.getElementById('account-name');
         var accountDescField = document.getElementById('account-description');
@@ -784,7 +893,8 @@
             'dynudns': 'Dynu',
             'dnsmadeeasy': 'DNS Made Easy',
             'nsone': 'NS1',
-            'duckdns': 'DuckDNS'
+            'duckdns': 'DuckDNS',
+            'custom-script': 'Custom Script'
         };
         modalTitle.textContent = 'Add ' + (providerNames[provider] || provider) + ' Account';
 
@@ -804,6 +914,18 @@
         // Show modal
         modal.classList.remove('hidden');
         document.body.style.overflow = 'hidden';
+
+        // Auto-focus the first input field
+        setTimeout(function () {
+            var firstInput = modal.querySelector('input, select, textarea');
+            if (firstInput) firstInput.focus();
+        }, 50);
+
+        // Escape key listener to close
+        modal._escHandler = function (e) {
+            if (e.key === 'Escape') closeAddAccountModal();
+        };
+        document.addEventListener('keydown', modal._escHandler);
     }
 
     function closeAddAccountModal() {
@@ -812,14 +934,33 @@
             modal.classList.add('hidden');
             document.body.style.overflow = '';
 
+            // Remove Escape key listener
+            if (modal._escHandler) {
+                document.removeEventListener('keydown', modal._escHandler);
+                modal._escHandler = null;
+            }
+
             // Clear form
             document.getElementById('addAccountForm').reset();
             document.getElementById('modal-provider-fields').innerHTML = '';
         }
+
+        // Restore focus to the element that triggered the modal
+        if (_addAccountTriggerEl && _addAccountTriggerEl.focus) {
+            _addAccountTriggerEl.focus();
+            _addAccountTriggerEl = null;
+        }
     }
+
+    // Stores the element that triggered the edit-account modal so we can
+    // restore focus on close (B5 accessibility fix).
+    var _editAccountTriggerEl = null;
 
     function showEditAccountModal(provider, accountId) {
         addDebugLog('Opening edit account modal for ' + provider + ':' + accountId, 'info');
+
+        // Remember trigger for focus restore on close
+        _editAccountTriggerEl = document.activeElement;
 
         var modal = document.getElementById('editAccountModal');
         var editAccountIdField = document.getElementById('edit-account-id');
@@ -862,6 +1003,18 @@
         // Show modal
         modal.classList.remove('hidden');
         document.body.style.overflow = 'hidden';
+
+        // Auto-focus the first input field
+        setTimeout(function () {
+            var firstInput = modal.querySelector('input, select, textarea');
+            if (firstInput) firstInput.focus();
+        }, 50);
+
+        // Escape key listener to close
+        modal._escHandler = function (e) {
+            if (e.key === 'Escape') closeEditAccountModal();
+        };
+        document.addEventListener('keydown', modal._escHandler);
     }
 
     function closeEditAccountModal() {
@@ -870,9 +1023,21 @@
             modal.classList.add('hidden');
             document.body.style.overflow = '';
 
+            // Remove Escape key listener
+            if (modal._escHandler) {
+                document.removeEventListener('keydown', modal._escHandler);
+                modal._escHandler = null;
+            }
+
             // Clear form
             document.getElementById('editAccountForm').reset();
             document.getElementById('edit-modal-provider-fields').innerHTML = '';
+        }
+
+        // Restore focus to the element that triggered the modal
+        if (_editAccountTriggerEl && _editAccountTriggerEl.focus) {
+            _editAccountTriggerEl.focus();
+            _editAccountTriggerEl = null;
         }
     }
 
@@ -976,13 +1141,29 @@
                 { name: 'token', label: 'API Token', type: 'password', placeholder: 'Your Dynu API token', required: true }
             ],
             'dnsmadeeasy': [
-                { name: 'api_token', label: 'API Token', type: 'password', placeholder: 'Your DNS Made Easy API token', required: true }
+                { name: 'api_key', label: 'API Key', type: 'password', placeholder: 'Your DNS Made Easy API key', required: true },
+                { name: 'secret_key', label: 'Secret Key', type: 'password', placeholder: 'Your DNS Made Easy secret key', required: true }
             ],
             'nsone': [
-                { name: 'api_token', label: 'API Token', type: 'password', placeholder: 'Your NS1 API token', required: true }
+                { name: 'api_key', label: 'API Key', type: 'password', placeholder: 'Your NS1 API key', required: true }
+            ],
+            'vultr': [
+                { name: 'api_key', label: 'API Key', type: 'password', placeholder: 'Your Vultr API key', required: true }
+            ],
+            'solidserver': [
+                { name: 'host', label: 'Host', type: 'text', placeholder: 'IP or hostname', required: true },
+                { name: 'username', label: 'Username', type: 'text', placeholder: 'API user', required: true },
+                { name: 'password', label: 'Password', type: 'password', placeholder: 'API password', required: true },
+                { name: 'dns_name', label: 'DNS Server Name', type: 'text', placeholder: 'SOLIDserver smart architecture DNS name', required: true },
+                { name: 'dnsview_name', label: 'DNS View Name', type: 'text', placeholder: 'External (optional)', required: false },
+                { name: 'propagation_seconds', label: 'Propagation Delay (s)', type: 'number', placeholder: '120', required: false }
             ],
             'duckdns': [
                 { name: 'api_token', label: 'Account Token', type: 'password', placeholder: 'UUID-format token from your DuckDNS account page', required: true }
+            ],
+            'custom-script': [
+                { name: 'auth_hook', label: 'Auth Hook Script Path', type: 'text', placeholder: '/usr/local/bin/certmate-dns-auth.sh', required: true },
+                { name: 'cleanup_hook', label: 'Cleanup Hook Script Path (optional)', type: 'text', placeholder: '/usr/local/bin/certmate-dns-cleanup.sh', required: false }
             ]
         };
 
@@ -994,12 +1175,12 @@
             var fieldId = 'modal-' + field.name;
 
             html += '<div class="mb-4">';
-            html += '<label for="' + fieldId + '" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">';
+            html += '<label for="' + fieldId + '" class="block text-sm font-medium text-label mb-1">';
             html += field.label + (field.required ? ' *' : '');
             html += '</label>';
 
             if (field.type === 'select') {
-                html += '<select id="' + fieldId + '" name="' + field.name + '" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-primary focus:border-primary" ' + (field.required ? 'required' : '') + '>';
+                html += '<select id="' + fieldId + '" name="' + field.name + '" class="mt-1 block w-full border border-border bg-input text-foreground rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-primary focus:border-primary" ' + (field.required ? 'required' : '') + '>';
                 if (!field.required) {
                     html += '<option value="">Select ' + field.label.toLowerCase() + '</option>';
                 }
@@ -1009,9 +1190,9 @@
                 });
                 html += '</select>';
             } else if (field.type === 'textarea') {
-                html += '<textarea id="' + fieldId + '" name="' + field.name + '" rows="4" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-primary focus:border-primary" placeholder="' + field.placeholder + '" ' + (field.required ? 'required' : '') + '>' + value + '</textarea>';
+                html += '<textarea id="' + fieldId + '" name="' + field.name + '" rows="4" class="mt-1 block w-full border border-border bg-input text-foreground rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-primary focus:border-primary" placeholder="' + field.placeholder + '" ' + (field.required ? 'required' : '') + '>' + value + '</textarea>';
             } else {
-                html += '<input type="' + field.type + '" id="' + fieldId + '" name="' + field.name + '" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-primary focus:border-primary" placeholder="' + field.placeholder + '" value="' + value + '" ' + (field.required ? 'required' : '') + '>';
+                html += '<input type="' + field.type + '" id="' + fieldId + '" name="' + field.name + '" class="mt-1 block w-full border border-border bg-input text-foreground rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-primary focus:border-primary" placeholder="' + field.placeholder + '" value="' + value + '" ' + (field.required ? 'required' : '') + '>';
             }
 
             html += '</div>';
@@ -1246,7 +1427,7 @@
                 }
             } else {
                 // Show legacy config for backward compatibility
-                accountsListContainer.innerHTML = '<div class="text-sm text-gray-500 dark:text-gray-400">No accounts configured yet.</div>';
+                accountsListContainer.innerHTML = '<div class="text-sm text-muted">No accounts configured yet.</div>';
                 if (legacyConfigContainer) {
                     legacyConfigContainer.style.display = 'block';
                 }
@@ -1260,21 +1441,21 @@
 
     function createAccountCard(provider, account, isDefault) {
         var card = document.createElement('div');
-        card.className = 'bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg p-4';
+        card.className = 'bg-input border border-border rounded-lg p-4';
 
         var safeName = escapeHtml(account.name);
         var safeDesc = escapeHtml(account.description);
         var safeId = escapeHtml(account.id);
         var safeProvider = escapeHtml(provider);
 
-        var descHtml = account.description ? '<p class="text-xs text-gray-500 dark:text-gray-400 mt-1">' + safeDesc + '</p>' : '';
-        var defaultBadge = isDefault ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400"><i class="fas fa-star mr-1"></i>Default</span>' : '';
+        var descHtml = account.description ? '<p class="text-xs text-muted mt-1">' + safeDesc + '</p>' : '';
+        var defaultBadge = isDefault ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-info-surface text-blue-800 dark:text-blue-400"><i class="fas fa-star mr-1"></i>Default</span>' : '';
 
         card.innerHTML =
             '<div class="flex items-center justify-between">' +
             '<div class="flex-1">' +
             '<div class="flex items-center space-x-2">' +
-            '<h5 class="text-sm font-medium text-gray-900 dark:text-white">' + safeName + '</h5>' +
+            '<h5 class="text-sm font-medium text-foreground">' + safeName + '</h5>' +
             defaultBadge +
             '</div>' +
             descHtml +
@@ -1282,7 +1463,7 @@
             '</div>' +
             '<div class="flex items-center space-x-2">' +
             '<button type="button" data-action="edit" data-provider="' + safeProvider + '" data-account-id="' + safeId + '"' +
-            ' class="inline-flex items-center px-2 py-1 border border-gray-300 dark:border-gray-600 shadow-sm text-xs font-medium rounded text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-600 hover:bg-gray-50 dark:hover:bg-gray-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary">' +
+            ' class="inline-flex items-center px-2 py-1 border border-border shadow-sm text-xs font-medium rounded text-label bg-white dark:bg-gray-600 hover:bg-gray-50 dark:hover:bg-gray-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary">' +
             '<i class="fas fa-edit mr-1"></i>' +
             'Edit' +
             '</button>' +
@@ -1438,75 +1619,80 @@
         // Update Unified Backups (only show unified backups)
         if (backups.unified && backups.unified.length === 0) {
             unifiedBackupList.innerHTML =
-                '<div class="p-4 text-center text-gray-500 dark:text-gray-400">' +
+                '<div class="p-4 text-center text-muted">' +
                 '<i class="fas fa-archive mr-2"></i>' +
                 'No backups yet' +
                 '<div class="text-xs mt-1">Create your first backup above!</div>' +
                 '</div>';
         } else if (backups.unified) {
-            var unifiedHtml = '';
-            backups.unified.slice(0, 10).forEach(function (backup) {
+            // Compact single-row layout on a neutral surface (the old per-row
+            // green fill made the list hard to scan). The whole list grows the
+            // page instead of scrolling inside a 256px box; a working "Show
+            // more" reveals the rest in batches rather than the old dead-end
+            // "N more backups available" label.
+            var all = backups.unified;
+            var visible = 8;
+
+            function backupRow(backup) {
                 var metadata = backup.metadata || {};
                 var createdDate = new Date(metadata.created || metadata.timestamp).toLocaleString();
                 var sizeMB = Math.round((metadata.size || 0) / (1024 * 1024) * 10) / 10;
                 var reason = metadata.backup_reason || metadata.reason || 'manual';
                 var domains = metadata.total_domains || (metadata.domains && metadata.domains.length) || 0;
-
                 var safeFilename = escapeHtml(backup.filename);
                 var safeReason = escapeHtml(reason);
-                unifiedHtml +=
-                    '<div class="flex items-center justify-between p-3 bg-green-50 dark:bg-green-900/20 rounded-lg border border-green-200 dark:border-green-700">' +
+                var iconBtn = 'p-1.5 rounded transition-colors';
+                return '<div class="flex items-center gap-3 px-3 py-2 rounded-lg border border-border hover:bg-hover transition-colors">' +
+                    '<i class="fas fa-file-zipper text-success-fg text-sm shrink-0" aria-hidden="true"></i>' +
                     '<div class="flex-1 min-w-0">' +
-                    '<div class="text-sm font-medium text-gray-900 dark:text-white truncate">' + safeFilename + '</div>' +
-                    '<div class="text-xs text-gray-500 dark:text-gray-400 mt-1">' + createdDate + '</div>' +
-                    '<div class="flex items-center space-x-3 text-xs text-gray-400 dark:text-gray-500 mt-1">' +
-                    '<span><i class="fas fa-weight mr-1"></i>' + sizeMB + 'MB</span>' +
-                    '<span><i class="fas fa-archive mr-1"></i>' + domains + ' domains</span>' +
-                    '<span><i class="fas fa-tag mr-1"></i>' + safeReason + '</span>' +
+                        '<div class="text-sm font-medium text-foreground truncate">' + safeFilename + '</div>' +
+                        '<div class="flex items-center flex-wrap gap-x-2 gap-y-0.5 text-xs text-muted mt-0.5">' +
+                            '<span>' + escapeHtml(createdDate) + '</span>' +
+                            '<span aria-hidden="true">·</span>' +
+                            '<span>' + sizeMB + ' MB</span>' +
+                            '<span aria-hidden="true">·</span>' +
+                            '<span>' + domains + ' domains</span>' +
+                            '<span aria-hidden="true">·</span>' +
+                            '<span class="px-1.5 py-0.5 rounded bg-surface-2 text-[11px]">' + safeReason + '</span>' +
+                        '</div>' +
                     '</div>' +
+                    '<div class="flex items-center gap-0.5 shrink-0">' +
+                        '<button data-action="download-backup" data-backup-type="unified" data-filename="' + safeFilename + '" class="' + iconBtn + ' text-info-fg hover:bg-blue-50 dark:hover:bg-blue-900/30" title="Download backup" aria-label="Download ' + safeFilename + '"><i class="fas fa-download text-sm"></i></button>' +
+                        '<button data-action="restore-backup" data-backup-type="unified" data-filename="' + safeFilename + '" class="' + iconBtn + ' text-success-fg hover:bg-green-50 dark:hover:bg-green-900/30" title="Restore backup" aria-label="Restore ' + safeFilename + '"><i class="fas fa-rotate-left text-sm"></i></button>' +
+                        '<button data-action="delete-backup" data-backup-type="unified" data-filename="' + safeFilename + '" class="' + iconBtn + ' text-danger-fg hover:bg-red-50 dark:hover:bg-red-900/30" title="Delete backup" aria-label="Delete ' + safeFilename + '"><i class="fas fa-trash text-sm"></i></button>' +
                     '</div>' +
-                    '<div class="flex space-x-1 ml-2">' +
-                    '<button data-action="download-backup" data-backup-type="unified" data-filename="' + safeFilename + '"' +
-                    ' class="p-2 text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded transition-colors"' +
-                    ' title="Download backup">' +
-                    '<i class="fas fa-download text-sm"></i>' +
-                    '</button>' +
-                    '<button data-action="restore-backup" data-backup-type="unified" data-filename="' + safeFilename + '"' +
-                    ' class="p-2 text-green-600 hover:text-green-800 dark:text-green-400 dark:hover:text-green-300 hover:bg-green-50 dark:hover:bg-green-900/30 rounded transition-colors"' +
-                    ' title="Restore backup">' +
-                    '<i class="fas fa-undo text-sm"></i>' +
-                    '</button>' +
-                    '<button data-action="delete-backup" data-backup-type="unified" data-filename="' + safeFilename + '"' +
-                    ' class="p-2 text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300 hover:bg-red-50 dark:hover:bg-red-900/30 rounded transition-colors"' +
-                    ' title="Delete backup">' +
-                    '<i class="fas fa-trash text-sm"></i>' +
-                    '</button>' +
-                    '</div>' +
-                    '</div>';
-            });
-
-            if (backups.unified.length > 10) {
-                unifiedHtml +=
-                    '<div class="text-xs text-gray-500 dark:text-gray-400 text-center p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">' +
-                    '<i class="fas fa-ellipsis-h mr-1"></i>' +
-                    (backups.unified.length - 10) + ' more backups available' +
-                    '</div>';
+                '</div>';
             }
 
-            unifiedBackupList.innerHTML = unifiedHtml;
-
-            // Bind backup action buttons via event delegation
-            unifiedBackupList.querySelectorAll('button[data-action]').forEach(function (btn) {
-                btn.addEventListener('click', function () {
-                    var bType = btn.dataset.backupType;
-                    var filename = btn.dataset.filename;
-                    switch (btn.dataset.action) {
-                        case 'download-backup': downloadBackup(bType, filename); break;
-                        case 'restore-backup': restoreBackup(bType, filename); break;
-                        case 'delete-backup': deleteBackup(bType, filename); break;
-                    }
+            function bindActions() {
+                unifiedBackupList.querySelectorAll('button[data-action]').forEach(function (btn) {
+                    btn.addEventListener('click', function () {
+                        var bType = btn.dataset.backupType;
+                        var filename = btn.dataset.filename;
+                        switch (btn.dataset.action) {
+                            case 'download-backup': downloadBackup(bType, filename); break;
+                            case 'restore-backup': restoreBackup(bType, filename); break;
+                            case 'delete-backup': deleteBackup(bType, filename); break;
+                        }
+                    });
                 });
-            });
+            }
+
+            function renderUnified() {
+                var html = all.slice(0, visible).map(backupRow).join('');
+                var remaining = all.length - visible;
+                if (remaining > 0) {
+                    html += '<button type="button" id="backup-show-more" class="w-full mt-1 px-3 py-2 text-xs font-medium text-info-fg border border-border rounded-lg hover:bg-hover transition-colors">' +
+                        '<i class="fas fa-chevron-down mr-1.5"></i>Show ' + Math.min(8, remaining) + ' more (' + remaining + ' hidden)' +
+                    '</button>';
+                }
+                unifiedBackupList.innerHTML = html;
+                bindActions();
+                var more = document.getElementById('backup-show-more');
+                if (more) more.addEventListener('click', function () { visible += 8; renderUnified(); });
+            }
+
+            renderUnified();
         }
     }
 
@@ -1688,22 +1874,68 @@
     // CA PROVIDER MANAGEMENT FUNCTIONS
     // =============================================
 
+    // Public ACME CAs usable through the generic Private CA entry.
+    // Adding a new one (e.g. another European CA exposing ACME) is a
+    // single entry here plus an <option> in settings_ca.html.
+    var PRIVATE_CA_PRESETS = {
+        'actalis': {
+            acme_url: 'https://acme-api.actalis.com/acme/directory',
+            hint: 'Actalis enforces External Account Binding: fill in the EAB Key ID and HMAC Key from your Actalis customer area (Manage with ACME). Leave the CA Certificate empty - Actalis roots are publicly trusted. Tip: Actalis also has a dedicated entry in the CA dropdown above.'
+        }
+    };
+
+    function applyPrivateCaPreset() {
+        var select = document.getElementById('private-ca-preset');
+        if (!select) return;
+        var preset = PRIVATE_CA_PRESETS[select.value];
+        var urlField = document.getElementById('private-ca-acme-url');
+        if (preset && urlField) {
+            urlField.value = preset.acme_url;
+        }
+        var hintElement = document.getElementById('private-ca-preset-hint');
+        if (hintElement) {
+            hintElement.textContent = preset ? preset.hint : '';
+        }
+    }
+
+    // Reflect a saved directory URL back onto the preset select so the
+    // form reopens showing "Actalis" instead of a bare URL.
+    function syncPrivateCaPresetFromUrl(acmeUrl) {
+        var select = document.getElementById('private-ca-preset');
+        if (!select) return;
+        var matched = '';
+        Object.keys(PRIVATE_CA_PRESETS).forEach(function (key) {
+            if (PRIVATE_CA_PRESETS[key].acme_url === acmeUrl) {
+                matched = key;
+            }
+        });
+        select.value = matched;
+        var hintElement = document.getElementById('private-ca-preset-hint');
+        if (hintElement) {
+            hintElement.textContent = matched ? PRIVATE_CA_PRESETS[matched].hint : '';
+        }
+    }
+
     function toggleCAProviderConfig() {
         var caProvider = document.getElementById('default-ca').value;
 
         // Map CA provider values to config IDs
         var caProviderToConfigId = {
             'letsencrypt': 'letsencrypt-config',
+            'letsencrypt_staging': 'letsencrypt-staging-config',
             'zerossl': 'zerossl-config',
-            'google': 'google-config',
-            'buypass': 'buypass-config',
+            // The DNS tab already owns id="google-config" for the Google DNS
+            // provider; the CA panel uses a distinct id so getElementById does
+            // not collide and leave the CA panel hidden (issue #226).
+            'google': 'google-ca-config',
+            'actalis': 'actalis-config',
             'digicert': 'digicert-config',
             'sslcom': 'sslcom-config',
             'private_ca': 'private-ca-config'
         };
 
         // Hide all CA configuration panels and disable their required fields
-        var caConfigs = ['letsencrypt-config', 'zerossl-config', 'google-config', 'buypass-config', 'digicert-config', 'sslcom-config', 'private-ca-config'];
+        var caConfigs = ['letsencrypt-config', 'letsencrypt-staging-config', 'zerossl-config', 'google-ca-config', 'actalis-config', 'digicert-config', 'sslcom-config', 'private-ca-config'];
         caConfigs.forEach(function (configId) {
             var element = document.getElementById(configId);
             if (element) {
@@ -1736,14 +1968,17 @@
                 case 'letsencrypt':
                     hintElement.textContent = 'Enter your email address and test Let\'s Encrypt connection';
                     break;
+                case 'letsencrypt_staging':
+                    hintElement.textContent = 'Staging issues untrusted test certificates. Email falls back to the Let\'s Encrypt one when left empty';
+                    break;
                 case 'zerossl':
                     hintElement.textContent = 'Enter EAB credentials and email, then test ZeroSSL connection';
                     break;
                 case 'google':
                     hintElement.textContent = 'Enter EAB credentials and email, then test Google Trust Services connection';
                     break;
-                case 'buypass':
-                    hintElement.textContent = 'Enter your email address and test BuyPass Go connection';
+                case 'actalis':
+                    hintElement.textContent = 'Enter EAB credentials and email, then test Actalis connection';
                     break;
                 case 'digicert':
                     hintElement.textContent = 'Enter ACME URL, EAB credentials, and email, then test DigiCert connection';
@@ -1775,8 +2010,18 @@
                 missingFields.push('Email');
             }
             config = {
-                environment: document.getElementById('letsencrypt-environment').value,
                 email: leEmail
+            };
+        } else if (caProvider === 'letsencrypt_staging') {
+            // Mirror the backend aliasing: staging falls back to the
+            // Let's Encrypt account email when its own field is empty.
+            var lsEmail = document.getElementById('letsencrypt-staging-email').value ||
+                document.getElementById('letsencrypt-email').value;
+            if (!lsEmail.trim()) {
+                missingFields.push('Email');
+            }
+            config = {
+                email: lsEmail
             };
         } else if (caProvider === 'zerossl') {
             var zsEabKid = document.getElementById('zerossl-eab-kid').value;
@@ -1794,10 +2039,14 @@
             if (!gEabHmac.trim()) missingFields.push('EAB HMAC Key');
             if (!gEmail.trim()) missingFields.push('Email');
             config = { eab_key_id: gEabKid, eab_hmac_key: gEabHmac, email: gEmail };
-        } else if (caProvider === 'buypass') {
-            var bpEmail = document.getElementById('buypass-email').value;
-            if (!bpEmail.trim()) missingFields.push('Email');
-            config = { email: bpEmail };
+        } else if (caProvider === 'actalis') {
+            var acEabKid = document.getElementById('actalis-eab-kid').value;
+            var acEabHmac = document.getElementById('actalis-eab-hmac').value;
+            var acEmail = document.getElementById('actalis-email').value;
+            if (!acEabKid.trim()) missingFields.push('EAB Key ID');
+            if (!acEabHmac.trim()) missingFields.push('EAB HMAC Key');
+            if (!acEmail.trim()) missingFields.push('Email');
+            config = { eab_kid: acEabKid, eab_hmac: acEabHmac, email: acEmail };
         } else if (caProvider === 'sslcom') {
             var sEabKid = document.getElementById('sslcom-eab-kid').value;
             var sEabHmac = document.getElementById('sslcom-eab-hmac').value;
@@ -1847,6 +2096,7 @@
 
         // Show loading state
         var testButton = document.querySelector('button[onclick="testCAProvider()"]');
+        if (!testButton) return;
         var originalText = testButton.innerHTML;
         testButton.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Testing...';
         testButton.disabled = true;
@@ -1886,6 +2136,19 @@
     // STORAGE BACKEND MANAGEMENT FUNCTIONS
     // =============================================
 
+    // Mirror the cert-form behaviour for Settings → Default Certificate Key:
+    // show the RSA key-size picker only when the operator picked RSA, the
+    // ECDSA curve picker only when they picked ECDSA. Keeping both visible
+    // would let the form post a contradictory pair (e.g. type=rsa with a
+    // curve set), which save_settings would reject.
+    function toggleDefaultKeyOptions() {
+        var keyType = (document.getElementById('default_key_type') || {}).value;
+        var sizeEl = document.getElementById('default_key_size_container');
+        var curveEl = document.getElementById('default_elliptic_curve_container');
+        if (sizeEl) sizeEl.style.display = (keyType === 'ecdsa') ? 'none' : '';
+        if (curveEl) curveEl.style.display = (keyType === 'ecdsa') ? '' : 'none';
+    }
+
     function toggleStorageBackendConfig() {
         var backend = document.getElementById('storage-backend').value;
         var configs = document.querySelectorAll('.storage-config');
@@ -1901,7 +2164,8 @@
             'azure_keyvault': 'storage-azure-config',
             'aws_secrets_manager': 'storage-aws-config',
             'hashicorp_vault': 'storage-vault-config',
-            'infisical': 'storage-infisical-config'
+            'infisical': 'storage-infisical-config',
+            's3_compatible': 'storage-s3-config'
         };
 
         // Show the selected configuration panel
@@ -1911,6 +2175,10 @@
             if (selectedConfig) {
                 selectedConfig.style.display = 'block';
             }
+        }
+
+        if (typeof toggleAzureBackfillRow === 'function') {
+            toggleAzureBackfillRow();
         }
     }
 
@@ -1959,6 +2227,77 @@
             });
     }
 
+    function toggleAzureBackfillRow() {
+        var modeSelect = document.getElementById('azure-storage-mode');
+        var row = document.getElementById('azure-backfill-row');
+        var backendSelect = document.getElementById('storage-backend');
+        if (!row || !modeSelect) {
+            return;
+        }
+        // Backend rejects backfill outside 'both' mode (in 'certificate'
+        // mode list_certificates() never sees the legacy Secrets and the
+        // walk would silently no-op). Hide the button rather than letting
+        // the user click into a 400.
+        var visible = backendSelect && backendSelect.value === 'azure_keyvault'
+            && modeSelect.value === 'both';
+        row.style.display = visible ? '' : 'none';
+    }
+
+    function backfillAzureCertificateObjects() {
+        var btn = document.getElementById('azure-backfill-btn');
+        var output = document.getElementById('azure-backfill-output');
+        if (btn) {
+            btn.disabled = true;
+        }
+        if (output) {
+            output.classList.remove('hidden');
+            output.textContent = 'Running backfill...';
+        }
+        showMessage('Backfilling Certificate objects...', 'info');
+
+        fetch('/api/storage/azure-keyvault/backfill-certificates', {
+            method: 'POST',
+            headers: API_HEADERS
+        })
+            .then(function (response) { return response.json().then(function (data) { return { ok: response.ok, data: data }; }); })
+            .then(function (payload) {
+                var data = payload.data || {};
+                if (output) {
+                    var lines = [];
+                    lines.push((data.message || (payload.ok ? 'Backfill finished' : 'Backfill failed')));
+                    if (data.results) {
+                        Object.keys(data.results).sort().forEach(function (domain) {
+                            lines.push(domain + ': ' + data.results[domain]);
+                        });
+                    } else if (data.error) {
+                        lines.push('Error: ' + data.error);
+                    }
+                    output.textContent = lines.join('\n');
+                }
+                if (data.success) {
+                    showMessage(data.message || 'Backfill complete', 'success');
+                } else if (data.message) {
+                    showMessage(data.message, payload.ok ? 'warning' : 'error');
+                } else if (data.error) {
+                    showMessage(data.error, 'error');
+                } else {
+                    showMessage('Backfill failed', 'error');
+                }
+            })
+            .catch(function (error) {
+                console.error('Azure Key Vault backfill error:', error);
+                if (output) {
+                    output.textContent = 'Backfill failed: ' + error.message;
+                }
+                showMessage('Backfill request failed: ' + error.message, 'error');
+            })
+            .finally(function () {
+                if (btn) {
+                    btn.disabled = false;
+                }
+            });
+    }
+
     function getStorageBackendConfig(backend) {
         var config = {};
 
@@ -1972,6 +2311,8 @@
                 config.tenant_id = document.getElementById('azure-tenant-id').value;
                 config.client_id = document.getElementById('azure-client-id').value;
                 config.client_secret = document.getElementById('azure-client-secret').value;
+                var storageModeEl = document.getElementById('azure-storage-mode');
+                config.storage_mode = (storageModeEl && storageModeEl.value) || 'secrets';
                 break;
 
             case 'aws_secrets_manager':
@@ -1993,6 +2334,15 @@
                 config.client_secret = document.getElementById('infisical-client-secret').value;
                 config.project_id = document.getElementById('infisical-project-id').value;
                 config.environment = document.getElementById('infisical-environment').value || 'prod';
+                break;
+
+            case 's3_compatible':
+                config.endpoint_url = document.getElementById('s3-endpoint-url').value;
+                config.bucket = document.getElementById('s3-bucket').value;
+                config.access_key_id = document.getElementById('s3-access-key-id').value;
+                config.secret_access_key = document.getElementById('s3-secret-access-key').value;
+                config.region = document.getElementById('s3-region').value || 'us-east-1';
+                config.prefix = document.getElementById('s3-prefix').value || 'certmate/certificates';
                 break;
         }
 
@@ -2016,6 +2366,9 @@
             case 'infisical':
                 return config.client_id && config.client_secret && config.project_id;
 
+            case 's3_compatible':
+                return config.endpoint_url && config.bucket && config.access_key_id && config.secret_access_key;
+
             default:
                 return false;
         }
@@ -2028,17 +2381,28 @@
     function loadCAProviderSettings(settings) {
         // Set default CA provider
         var defaultCA = settings.default_ca || 'letsencrypt';
-        document.getElementById('default-ca').value = defaultCA;
+        var defaultCASelect = document.getElementById('default-ca');
+        defaultCASelect.value = defaultCA;
+        if (defaultCASelect.value !== defaultCA) {
+            // Unknown CA key (e.g. cached old JS against a newer backend):
+            // append it as a raw option so the stored selection stays
+            // visible instead of the select silently flipping to another CA.
+            // (A save still requires an email source for the key, so the
+            // validation below blocks it rather than posting blind.)
+            var unknownOption = document.createElement('option');
+            unknownOption.value = defaultCA;
+            unknownOption.textContent = defaultCA;
+            defaultCASelect.appendChild(unknownOption);
+            defaultCASelect.value = defaultCA;
+        }
         toggleCAProviderConfig();
 
         // Load CA provider configurations
         var caProviders = settings.ca_providers || {};
 
-        // Load Let's Encrypt settings
+        // Load Let's Encrypt settings (the legacy 'environment' field is
+        // migrated away server-side; see #279)
         var letsencryptConfig = caProviders.letsencrypt || {};
-        if (letsencryptConfig.environment) {
-            document.getElementById('letsencrypt-environment').value = letsencryptConfig.environment;
-        }
         if (letsencryptConfig.email) {
             document.getElementById('letsencrypt-email').value = letsencryptConfig.email;
         }
@@ -2061,10 +2425,20 @@
             document.getElementById('google-email').value = googleConfig.email;
         }
 
-        // Load BuyPass settings
-        var buypassConfig = caProviders.buypass || {};
-        if (buypassConfig.email) {
-            document.getElementById('buypass-email').value = buypassConfig.email;
+        // Load Let's Encrypt (Staging) settings
+        var letsencryptStagingConfig = caProviders.letsencrypt_staging || {};
+        if (letsencryptStagingConfig.email) {
+            document.getElementById('letsencrypt-staging-email').value = letsencryptStagingConfig.email;
+        }
+
+        // Load Actalis settings
+        // Don't populate HMAC key for security reasons - user needs to re-enter
+        var actalisConfig = caProviders.actalis || {};
+        if (actalisConfig.eab_kid) {
+            document.getElementById('actalis-eab-kid').value = actalisConfig.eab_kid;
+        }
+        if (actalisConfig.email) {
+            document.getElementById('actalis-email').value = actalisConfig.email;
         }
 
         // Load DigiCert settings
@@ -2094,6 +2468,7 @@
         if (privateCaConfig.acme_url) {
             document.getElementById('private-ca-acme-url').value = privateCaConfig.acme_url;
         }
+        syncPrivateCaPresetFromUrl(privateCaConfig.acme_url || '');
         if (privateCaConfig.ca_cert) {
             document.getElementById('private-ca-cert').value = privateCaConfig.ca_cert;
         }
@@ -2128,6 +2503,13 @@
                 document.getElementById('azure-vault-url').value = azureConfig.vault_url || '';
                 document.getElementById('azure-tenant-id').value = azureConfig.tenant_id || '';
                 document.getElementById('azure-client-id').value = azureConfig.client_id || '';
+                var storageModeSelect = document.getElementById('azure-storage-mode');
+                if (storageModeSelect) {
+                    storageModeSelect.value = azureConfig.storage_mode || 'secrets';
+                }
+                if (typeof toggleAzureBackfillRow === 'function') {
+                    toggleAzureBackfillRow();
+                }
                 // Don't populate client_secret for security
                 break;
 
@@ -2156,17 +2538,30 @@
                 document.getElementById('infisical-environment').value = infisicalConfig.environment || 'prod';
                 // Don't populate client credentials for security
                 break;
+
+            case 's3_compatible':
+                var s3Config = storageConfig.s3_compatible || storageConfig;
+                document.getElementById('s3-endpoint-url').value = s3Config.endpoint_url || '';
+                document.getElementById('s3-bucket').value = s3Config.bucket || '';
+                document.getElementById('s3-region').value = s3Config.region || 'us-east-1';
+                document.getElementById('s3-prefix').value = s3Config.prefix || 'certmate/certificates';
+                // Don't populate access keys for security
+                break;
         }
     }
 
     function collectCAProviderSettings() {
         var caProviders = {};
 
-        // Let's Encrypt configuration
-        // Let's Encrypt configuration
+        // Let's Encrypt configuration. The legacy 'environment' field is
+        // gone (#279): staging is the letsencrypt_staging CA entry.
         caProviders.letsencrypt = {
-            environment: document.getElementById('letsencrypt-environment').value || 'production',
             email: document.getElementById('letsencrypt-email').value || ''
+        };
+
+        // Let's Encrypt (Staging) configuration
+        caProviders.letsencrypt_staging = {
+            email: document.getElementById('letsencrypt-staging-email').value || ''
         };
 
         // ZeroSSL configuration
@@ -2183,9 +2578,11 @@
             email: document.getElementById('google-email').value || ''
         };
 
-        // BuyPass Go configuration
-        caProviders.buypass = {
-            email: document.getElementById('buypass-email').value || ''
+        // Actalis configuration
+        caProviders.actalis = {
+            eab_kid: document.getElementById('actalis-eab-kid').value || '',
+            eab_hmac: document.getElementById('actalis-eab-hmac').value || '',
+            email: document.getElementById('actalis-email').value || ''
         };
 
         // DigiCert configuration
@@ -2238,6 +2635,9 @@
             case 'infisical':
                 result.infisical = config;
                 break;
+            case 's3_compatible':
+                result.s3_compatible = config;
+                break;
         }
         return result;
     }
@@ -2250,26 +2650,29 @@
         // Create migration modal dynamically
         var modal = document.createElement('div');
         modal.id = 'storageMigrationModal';
-        modal.className = 'fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50';
+        modal.className = 'fixed inset-0 bg-black/50 overflow-y-auto h-full w-full z-50';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        modal.setAttribute('aria-labelledby', 'storageMigrationModal-title');
         modal.innerHTML =
-            '<div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white dark:bg-gray-800">' +
+            '<div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-surface">' +
             '<div class="mt-3">' +
             '<div class="flex items-center justify-between mb-4">' +
-            '<h3 class="text-lg font-medium text-gray-900 dark:text-white">' +
+            '<h3 id="storageMigrationModal-title" class="text-lg font-medium text-foreground">' +
             '<i class="fas fa-exchange-alt mr-2"></i>Certificate Storage Migration' +
             '</h3>' +
-            '<button type="button" onclick="closeStorageMigrationModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">' +
+            '<button type="button" id="storageMigCloseBtn" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">' +
             '<i class="fas fa-times"></i>' +
             '</button>' +
             '</div>' +
             '<div class="mb-4">' +
-            '<p class="text-sm text-gray-600 dark:text-gray-400">' +
+            '<p class="text-sm text-muted">' +
             'This will migrate all existing certificates from the current storage backend to the newly configured backend.' +
             '</p>' +
-            '<div class="mt-3 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-700 rounded-md">' +
+            '<div class="mt-3 p-3 bg-warning-surface border border-warning-line rounded-md">' +
             '<div class="flex">' +
             '<i class="fas fa-exclamation-triangle text-yellow-400 mt-0.5 mr-2"></i>' +
-            '<div class="text-sm text-yellow-800 dark:text-yellow-200">' +
+            '<div class="text-sm text-warning-strong">' +
             '<strong>Important:</strong> This operation will copy certificates to the new backend. ' +
             'Original certificates will remain in the current location until manually removed.' +
             '</div>' +
@@ -2277,11 +2680,11 @@
             '</div>' +
             '</div>' +
             '<div class="flex justify-end space-x-3">' +
-            '<button type="button" onclick="closeStorageMigrationModal()" ' +
-            'class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-600 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-md">' +
+            '<button type="button" id="storageMigCancelBtn" ' +
+            'class="px-4 py-2 text-sm font-medium text-label bg-gray-100 dark:bg-gray-600 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-md">' +
             'Cancel' +
             '</button>' +
-            '<button type="button" onclick="performStorageMigration()" ' +
+            '<button type="button" id="storageMigStartBtn" ' +
             'class="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md">' +
             '<i class="fas fa-play mr-1"></i>Start Migration' +
             '</button>' +
@@ -2289,21 +2692,46 @@
             '</div>' +
             '</div>';
         document.body.appendChild(modal);
+
+        // Wire up event listeners instead of inline onclick
+        document.getElementById('storageMigCloseBtn').addEventListener('click', closeStorageMigrationModal);
+        document.getElementById('storageMigCancelBtn').addEventListener('click', closeStorageMigrationModal);
+        document.getElementById('storageMigStartBtn').addEventListener('click', performStorageMigration);
+
+        // Escape key handler
+        modal._escHandler = function (e) {
+            if (e.key === 'Escape') closeStorageMigrationModal();
+        };
+        document.addEventListener('keydown', modal._escHandler);
+
+        // Backdrop click handler — close when clicking the overlay itself
+        modal.addEventListener('click', function (e) {
+            if (e.target === modal) closeStorageMigrationModal();
+        });
     }
 
     function closeStorageMigrationModal() {
         var modal = document.getElementById('storageMigrationModal');
         if (modal) {
+            if (modal._escHandler) {
+                document.removeEventListener('keydown', modal._escHandler);
+                modal._escHandler = null;
+            }
             modal.remove();
         }
     }
 
     function performStorageMigration() {
-        var currentBackend = document.getElementById('storage-backend').value;
         var newConfig = collectStorageBackendSettings();
+        // Pull the per-backend sub-config out of the envelope produced by
+        // collectStorageBackendSettings (which nests under the backend key,
+        // e.g. { backend: 'azure_keyvault', azure_keyvault: {...} }). The
+        // server validator runs against the sub-config, not the envelope.
+        var targetSubConfig = (newConfig.backend === 'local_filesystem')
+            ? { cert_dir: newConfig.cert_dir }
+            : (newConfig[newConfig.backend] || {});
 
-        // Validate new configuration first
-        if (!validateStorageConfig(newConfig.backend, newConfig)) {
+        if (!validateStorageConfig(newConfig.backend, targetSubConfig)) {
             showMessage('Please configure and test the new storage backend before migrating.', 'error');
             return;
         }
@@ -2311,20 +2739,36 @@
         showMessage('Starting certificate migration...', 'info');
         closeStorageMigrationModal();
 
+        // Send target_backend explicitly + the envelope as target_config. The
+        // server defaults source_backend/source_config from the currently
+        // saved certificate_storage, so the UI doesn't have to track the
+        // pre-edit backend identity itself.
         fetch('/api/storage/migrate', {
             method: 'POST',
             headers: API_HEADERS,
             body: JSON.stringify({
-                source_backend: currentBackend,
+                target_backend: newConfig.backend,
                 target_config: newConfig
             })
         })
-            .then(function (response) { return response.json(); })
-            .then(function (data) {
-                if (data.success) {
-                    showMessage('Migration completed successfully. ' + (data.migrated_count || 0) + ' certificates migrated.', 'success');
+            .then(function (response) {
+                return response.json().then(function (body) {
+                    return { ok: response.ok, body: body };
+                });
+            })
+            .then(function (result) {
+                var data = result.body || {};
+                if (result.ok && data.success) {
+                    var migrated = (data.migrated_count != null) ? data.migrated_count : 0;
+                    var failed = (data.failed_count != null) ? data.failed_count : 0;
+                    var msg = 'Migration completed. ' + migrated + ' certificates migrated';
+                    if (failed > 0) {
+                        msg += ', ' + failed + ' failed (see server logs)';
+                    }
+                    msg += '.';
+                    showMessage(msg, failed > 0 ? 'warning' : 'success');
                 } else {
-                    showMessage('Migration failed: ' + (data.message || 'Unknown error'), 'error');
+                    showMessage('Migration failed: ' + (data.message || data.error || 'Unknown error'), 'error');
                 }
             })
             .catch(function (error) {
@@ -2442,7 +2886,7 @@
 
     function refreshUserList() {
         var userListDiv = document.getElementById('userList');
-        userListDiv.innerHTML = '<div class="text-center py-4 text-gray-500 dark:text-gray-400 text-sm"><i class="fas fa-spinner fa-spin mr-2"></i> Loading users...</div>';
+        userListDiv.innerHTML = '<div class="text-center py-4 text-muted text-sm"><i class="fas fa-spinner fa-spin mr-2"></i> Loading users...</div>';
 
         // Timeout after 15 seconds to prevent infinite loading
         var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -2463,9 +2907,17 @@
                 var users = data.users || {};
 
                 if (Object.keys(users).length === 0) {
-                    userListDiv.innerHTML = '<div class="text-center py-4 text-gray-500 dark:text-gray-400 text-sm"><i class="fas fa-users mr-2"></i> No users configured. Add a user above to enable local authentication.</div>';
+                    userListDiv.innerHTML = '<div class="text-center py-4 text-muted text-sm"><i class="fas fa-users mr-2"></i> No users configured. Add a user above to enable local authentication.</div>';
                     return;
                 }
+
+                // The sole remaining admin must stay reachable: the backend
+                // refuses to delete or disable it, so we also hide those
+                // actions in the UI to avoid offering a button that can only
+                // fail (mirrors issue #229).
+                var adminCount = Object.keys(users).filter(function (u) {
+                    return users[u].role === 'admin';
+                }).length;
 
                 var html = '';
                 Object.keys(users).forEach(function (username) {
@@ -2474,7 +2926,61 @@
                     var statusColor = userInfo.enabled !== false ? 'text-green-500' : 'text-red-500';
                     var lastLogin = userInfo.last_login ? new Date(userInfo.last_login).toLocaleString() : 'Never';
 
+                    var isSso = userInfo.sso === true;
+                    var isSoleAdmin = userInfo.role === 'admin' && adminCount === 1;
+
+                    // Role control. The sole admin renders a static badge — the
+                    // backend refuses to demote them (lockout guard), so we don't
+                    // offer a select that can only fail. Everyone else gets an
+                    // inline dropdown that PUTs the new role (issue #255).
+                    var roleControl;
+                    if (isSoleAdmin) {
+                        roleControl = '<span class="text-xs px-2 py-0.5 rounded-full ' + roleColor + '">' + escapeHtml(userInfo.role || '') + '</span>';
+                    } else {
+                        var roleOptions = ['admin', 'operator', 'viewer'].map(function (r) {
+                            return '<option value="' + r + '"' + (userInfo.role === r ? ' selected' : '') + '>' + r + '</option>';
+                        }).join('');
+                        roleControl =
+                            '<select data-action="change-role" data-username="' + escapeHtml(username) + '" data-current="' + escapeHtml(userInfo.role || '') + '"' +
+                            ' class="text-xs px-2 py-0.5 rounded-full border-0 cursor-pointer ' + roleColor + ' focus:ring-2 focus:ring-blue-500 outline-none"' +
+                            ' title="Change role">' + roleOptions + '</select>';
+                    }
+
                     var emailHtml = userInfo.email ? '<span class="mr-3"><i class="fas fa-envelope mr-1"></i>' + escapeHtml(userInfo.email) + '</span>' : '';
+
+                    // SSO accounts are managed by the external IdP — badge them
+                    // so admins can tell them apart from local credentials.
+                    var ssoBadge = isSso
+                        ? '<span class="text-xs px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300"' +
+                          ' title="Single sign-on account' + (userInfo.oidc_issuer ? ' (' + escapeHtml(userInfo.oidc_issuer) + ')' : '') + '">' +
+                          '<i class="fas fa-id-badge mr-1"></i>SSO</span>'
+                        : '';
+
+                    // Disable/enable toggle — hidden for the sole admin (cannot
+                    // be locked out).
+                    var toggleBtn = isSoleAdmin ? '' :
+                        '<button data-action="toggle-user" data-username="' + escapeHtml(username) + '" data-enable="' + (userInfo.enabled === false) + '"' +
+                        ' class="p-2 text-muted hover:text-gray-700 dark:hover:text-gray-200"' +
+                        ' title="' + (userInfo.enabled !== false ? 'Disable user' : 'Enable user') + '">' +
+                        '<i class="fas fa-' + (userInfo.enabled !== false ? 'ban' : 'check') + '"></i>' +
+                        '</button>';
+
+                    // Password reset — not applicable to SSO accounts (no local
+                    // password to set).
+                    var resetBtn = isSso ? '' :
+                        '<button data-action="reset-password" data-username="' + escapeHtml(username) + '"' +
+                        ' class="p-2 text-muted hover:text-gray-700 dark:hover:text-gray-200"' +
+                        ' title="Reset password">' +
+                        '<i class="fas fa-key"></i>' +
+                        '</button>';
+
+                    // Delete — hidden for the sole admin.
+                    var deleteBtn = isSoleAdmin ? '' :
+                        '<button data-action="delete-user" data-username="' + escapeHtml(username) + '"' +
+                        ' class="p-2 text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"' +
+                        ' title="Delete user">' +
+                        '<i class="fas fa-trash"></i>' +
+                        '</button>';
 
                     html +=
                         '<div class="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">' +
@@ -2482,32 +2988,21 @@
                         '<i class="fas fa-user-circle text-2xl text-gray-400 dark:text-gray-500"></i>' +
                         '<div>' +
                         '<div class="flex items-center space-x-2">' +
-                        '<span class="font-medium text-gray-900 dark:text-white">' + escapeHtml(username) + '</span>' +
-                        '<span class="text-xs px-2 py-0.5 rounded-full ' + roleColor + '">' + escapeHtml(userInfo.role || '') + '</span>' +
+                        '<span class="font-medium text-foreground">' + escapeHtml(username) + '</span>' +
+                        roleControl +
+                        ssoBadge +
                         '<i class="fas fa-circle text-xs ' + statusColor + '" title="' + (userInfo.enabled !== false ? 'Active' : 'Disabled') + '"></i>' +
                         '</div>' +
-                        '<div class="text-xs text-gray-500 dark:text-gray-400">' +
+                        '<div class="text-xs text-muted">' +
                         emailHtml +
                         '<span><i class="fas fa-clock mr-1"></i>Last login: ' + escapeHtml(lastLogin) + '</span>' +
                         '</div>' +
                         '</div>' +
                         '</div>' +
                         '<div class="flex items-center space-x-2">' +
-                        '<button data-action="toggle-user" data-username="' + escapeHtml(username) + '" data-enable="' + (userInfo.enabled === false) + '"' +
-                        ' class="p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"' +
-                        ' title="' + (userInfo.enabled !== false ? 'Disable user' : 'Enable user') + '">' +
-                        '<i class="fas fa-' + (userInfo.enabled !== false ? 'ban' : 'check') + '"></i>' +
-                        '</button>' +
-                        '<button data-action="reset-password" data-username="' + escapeHtml(username) + '"' +
-                        ' class="p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"' +
-                        ' title="Reset password">' +
-                        '<i class="fas fa-key"></i>' +
-                        '</button>' +
-                        '<button data-action="delete-user" data-username="' + escapeHtml(username) + '"' +
-                        ' class="p-2 text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"' +
-                        ' title="Delete user">' +
-                        '<i class="fas fa-trash"></i>' +
-                        '</button>' +
+                        toggleBtn +
+                        resetBtn +
+                        deleteBtn +
                         '</div>' +
                         '</div>';
                 });
@@ -2525,6 +3020,14 @@
                         }
                     });
                 });
+
+                // Role dropdowns fire 'change', not 'click', so they bind
+                // separately from the icon buttons above.
+                userListDiv.querySelectorAll('select[data-action="change-role"]').forEach(function (sel) {
+                    sel.addEventListener('change', function () {
+                        changeUserRole(sel.dataset.username, sel.value, sel.dataset.current, sel);
+                    });
+                });
             })
             .catch(function (error) {
                 if (timeoutId) clearTimeout(timeoutId);
@@ -2534,6 +3037,43 @@
                     : 'Failed to load users. Click Refresh to retry.';
                 userListDiv.innerHTML = '<div class="text-center py-4 text-red-500 text-sm"><i class="fas fa-exclamation-triangle mr-2"></i> ' + msg + '</div>';
             });
+    }
+
+    function changeUserRole(username, newRole, currentRole, selectEl) {
+        if (newRole === currentRole) return;
+
+        CertMate.confirm(
+            'Change role of \'' + escapeHtml(username) + '\' from ' + escapeHtml(currentRole) + ' to ' + escapeHtml(newRole) + '?',
+            'Change Role',
+            { danger: false, confirmText: 'Change Role' }
+        ).then(function (confirmed) {
+            if (!confirmed) {
+                if (selectEl) selectEl.value = currentRole; // revert the dropdown
+                return;
+            }
+
+            fetch('/api/users/' + username, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role: newRole })
+            })
+                .then(function (response) {
+                    return response.json().then(function (data) {
+                        if (response.ok) {
+                            showMessage('Role for \'' + username + '\' changed to ' + newRole, 'success');
+                            refreshUserList();
+                        } else {
+                            showMessage(data.error || 'Failed to change role', 'error');
+                            if (selectEl) selectEl.value = currentRole;
+                        }
+                    });
+                })
+                .catch(function (error) {
+                    console.error('Error changing user role:', error);
+                    showMessage('Failed to change role', 'error');
+                    if (selectEl) selectEl.value = currentRole;
+                });
+        });
     }
 
     function toggleUserStatus(username, enable) {
@@ -2621,6 +3161,16 @@
         saveBtn = document.getElementById('saveBtn');
         statusMessage = document.getElementById('statusMessage');
 
+        // R-2: route every dismiss path (Esc, backdrop, the macro's
+        // close button, the form's Cancel button with [data-modal-close])
+        // through the existing cleanup. The programmatic path —
+        // saveAccount() / saveEditAccount() calling closeXxxModal() on
+        // success — still runs the same body, so cleanup is uniform.
+        var addModalEl = document.getElementById('addAccountModal');
+        if (addModalEl) addModalEl.addEventListener('modal:close', closeAddAccountModal);
+        var editModalEl = document.getElementById('editAccountModal');
+        if (editModalEl) editModalEl.addEventListener('modal:close', closeEditAccountModal);
+
         addDebugLog('DOM loaded, initializing settings page', 'info');
 
         // Add challenge type radio listeners
@@ -2691,11 +3241,15 @@
     window.saveEditAccount = saveEditAccount;
     window.deleteAccount = deleteAccount;
     window.toggleCAProviderConfig = toggleCAProviderConfig;
+    window.applyPrivateCaPreset = applyPrivateCaPreset;
     window.testCAProvider = testCAProvider;
     window.toggleTokenVisibility = toggleTokenVisibility;
     window.generateToken = generateToken;
     window.toggleStorageBackendConfig = toggleStorageBackendConfig;
+    window.toggleDefaultKeyOptions = toggleDefaultKeyOptions;
     window.testStorageBackend = testStorageBackend;
+    window.toggleAzureBackfillRow = toggleAzureBackfillRow;
+    window.backfillAzureCertificateObjects = backfillAzureCertificateObjects;
     window.showStorageMigrationModal = showStorageMigrationModal;
     window.closeStorageMigrationModal = closeStorageMigrationModal;
     window.performStorageMigration = performStorageMigration;
@@ -2707,13 +3261,36 @@
     window.downloadBackup = downloadBackup;
     window.restoreBackup = restoreBackup;
     window.deleteBackup = deleteBackup;
-    window.clearDebugConsole = clearDebugConsole;
-    window.toggleDebugConsole = toggleDebugConsole;
+    window.clearSettingsDebugConsole = clearSettingsDebugConsole;
+    window.toggleSettingsDebugConsole = toggleSettingsDebugConsole;
     window.toggleChallengeType = toggleChallengeType;
     window.toggleUserStatus = toggleUserStatus;
     window.resetUserPassword = resetUserPassword;
     window.deleteUser = deleteUser;
     window.clearDeploymentCache = clearDeploymentCache;
     window.refreshCacheStats = refreshCacheStats;
+
+    // WAI-ARIA tabs: Left/Right/Home/End move between the settings tabs and
+    // activate the focused one (automatic activation). Wired from settings.html
+    // via @keydown on the [role=tablist]. Clicking the target button triggers
+    // Alpine's `tab = t.id`, which also updates the roving tabindex reactively.
+    function onSettingsTabKeydown(event) {
+        var keys = ['ArrowRight', 'ArrowLeft', 'Home', 'End'];
+        if (keys.indexOf(event.key) === -1) return;
+        var tablist = event.currentTarget;
+        var tabs = Array.prototype.slice.call(tablist.querySelectorAll('[role="tab"]'));
+        if (!tabs.length) return;
+        var current = tabs.indexOf(document.activeElement);
+        if (current === -1) current = 0;
+        var next = current;
+        if (event.key === 'ArrowRight') next = (current + 1) % tabs.length;
+        else if (event.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = tabs.length - 1;
+        event.preventDefault();
+        tabs[next].focus();
+        tabs[next].click();
+    }
+    window.onSettingsTabKeydown = onSettingsTabKeydown;
 
 })();

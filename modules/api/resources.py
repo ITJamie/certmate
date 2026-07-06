@@ -3,9 +3,16 @@ API endpoints module for CertMate
 Defines Flask-RESTX Resource classes for REST API endpoints
 """
 
+import base64
+import http.client
 import logging
 import re
+import socket
+import ssl
 import tempfile
+import time
+import urllib.parse
+import urllib.request
 import zipfile
 import os
 import io
@@ -16,6 +23,10 @@ from flask_restx import Resource, fields
 from ..core.metrics import get_metrics_summary, is_prometheus_available
 from ..core.constants import CERTIFICATE_FILES, iter_cert_domain_dirs
 from ..core.auth import ROLE_HIERARCHY
+from ..core.utils import utc_now_iso, classify_renewal_error
+from ..core.certificates import DomainOperationInProgress
+from ..core.cert_service import CertificateService, DomainOutOfScope
+from ..core.audit_context import audit_context_from_request
 
 _DOMAIN_RE = re.compile(r'^(\*\.)?([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
 
@@ -26,7 +37,9 @@ def _validate_backup_filename(filename):
         return 'Filename is required'
     if '..' in filename or '/' in filename or '\\' in filename or '\x00' in filename:
         return 'Invalid filename'
-    if not filename.endswith('.zip'):
+    # .zip = cleartext backup, .zip.enc = encrypted-at-rest backup
+    # (CERTMATE_BACKUP_PASSPHRASE).
+    if not (filename.endswith('.zip') or filename.endswith('.zip.enc')):
         return 'Invalid backup file format'
     return None
 
@@ -46,6 +59,214 @@ def _validate_domain_path(domain, cert_base_dir):
     except (OSError, ValueError):
         return None, 'Invalid domain path'
     return cert_dir, None
+
+
+def _certificate_fingerprint(cert_bytes):
+    """Return a stable SHA-256 fingerprint for a PEM or DER certificate."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    cert_bytes = cert_bytes or b''
+    if not cert_bytes:
+        return None
+
+    try:
+        cert = x509.load_pem_x509_certificate(cert_bytes)
+    except ValueError:
+        cert = x509.load_der_x509_certificate(cert_bytes)
+    return cert.fingerprint(hashes.SHA256()).hex()
+
+
+def _privkey_to_pkcs1(pem_bytes):
+    """Re-serialize a PEM private key into the legacy PKCS#1/SEC1
+    ("TraditionalOpenSSL") form for stacks that don't accept the PKCS#8
+    that certbot writes (issue #233).
+
+    Raises ValueError/TypeError for key types that have no traditional
+    encoding (e.g. Ed25519); the caller maps that to a 422.
+    """
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(pem_bytes, password=None)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def _tls_probe_timeout_seconds():
+    """Read CERTMATE_TLS_PROBE_TIMEOUT_SECONDS, clamped to [1, 30]. Default 3s.
+
+    Each probe blocks one Flask worker thread for up to this many seconds on
+    an unreachable host. Lower = workers free up faster; higher = fewer false
+    negatives on legitimately-slow targets. The default of 3s is a deliberate
+    drop from the previous 5s — production /api/certificates dashboards that
+    surface deployment status for ~50 domains can otherwise stall an
+    operator-facing handler for tens of seconds when several targets are
+    down.
+    """
+    raw = os.getenv('CERTMATE_TLS_PROBE_TIMEOUT_SECONDS', '').strip()
+    if not raw:
+        return 3.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 3.0
+    return max(1.0, min(value, 30.0))
+
+
+_PROBE_PROTOCOLS = ('https-tls', 'tls', 'smtp-starttls')
+
+
+def _https_proxy_for(host):
+    """Return (proxy_host, proxy_port, auth_headers) for tunneling to *host*.
+
+    Honours the standard HTTPS_PROXY/https_proxy env vars and the NO_PROXY
+    bypass list (via urllib). Returns None when no proxy applies, so the probe
+    falls back to a direct connection. A raw socket ignores these env vars, so
+    without this CertMate cannot reach external targets on a machine that
+    requires an outbound HTTP proxy (#326).
+    """
+    proxy = urllib.request.getproxies().get('https')
+    if not proxy or urllib.request.proxy_bypass(host):
+        return None
+    parts = urllib.parse.urlsplit(proxy if '://' in proxy else 'http://' + proxy)
+    if not parts.hostname:
+        return None
+    headers = {}
+    if parts.username:
+        raw = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
+        token = base64.b64encode(raw.encode()).decode()
+        headers['Proxy-Authorization'] = f'Basic {token}'
+    return parts.hostname, parts.port or 8080, headers
+
+
+def _probe_tls_certificate(domain, port=443, protocol='https-tls', timeout=None):
+    """Return the live TLS certificate for a domain, if reachable.
+
+    Supports three protocol modes:
+      - ``https-tls`` (default): direct TLS on the given port (like HTTPS).
+      - ``tls``:           same wire format as https-tls, no HTTP assumption.
+      - ``smtp-starttls``: plain-text SMTP connection, then STARTTLS upgrade.
+
+    ``timeout=None`` reads ``CERTMATE_TLS_PROBE_TIMEOUT_SECONDS`` (default 3s,
+    clamped [1, 30]). ``port`` defaults to 443 for https-tls/tls, 587 for
+    smtp-starttls when left at the sentinel 0.
+    """
+    if timeout is None:
+        timeout = _tls_probe_timeout_seconds()
+    if protocol not in _PROBE_PROTOCOLS:
+        raise ValueError(f"Unsupported probe protocol: {protocol!r}. "
+                         f"Use one of {_PROBE_PROTOCOLS}")
+
+    # Port defaults per protocol
+    if port is None or port == 0:
+        port = 587 if protocol == 'smtp-starttls' else 443
+
+    host = domain[2:] if domain.startswith('*.') else domain
+    context = ssl.create_default_context()
+    # We intentionally disable PKI validation here. The goal is to compare the
+    # served certificate fingerprint against the stored certificate, even when
+    # the live cert is invalid or otherwise not trusted.
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    # create_default_context() already floors at TLS 1.2; pin it explicitly so
+    # the fingerprint-comparison probe can never negotiate a dead protocol and
+    # to make CodeQL's py/insecure-protocol check provably satisfied.
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    started = time.monotonic()
+    try:
+        if protocol == 'smtp-starttls':
+            cert_bytes = _probe_smtp_starttls(host, port, context, timeout)
+        else:
+            # Direct TLS (https-tls, tls). When an HTTPS_PROXY applies (and the
+            # host isn't in NO_PROXY) tunnel the TCP leg through the proxy with
+            # HTTP CONNECT, then run the TLS handshake over that tunnel so we
+            # still read the real peer certificate (#326).
+            proxy = _https_proxy_for(host)
+            if proxy:
+                proxy_host, proxy_port, proxy_headers = proxy
+                conn = http.client.HTTPConnection(proxy_host, proxy_port, timeout=timeout)
+                try:
+                    conn.set_tunnel(host, port, headers=proxy_headers)
+                    conn.connect()
+                    with context.wrap_socket(conn.sock, server_hostname=host) as tls_sock:
+                        cert_bytes = tls_sock.getpeercert(binary_form=True)
+                finally:
+                    conn.close()
+            else:
+                with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+                    with context.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
+                        cert_bytes = tls_sock.getpeercert(binary_form=True)
+
+        return {
+            'reachable': True,
+            'certificate_bytes': cert_bytes,
+            'port': port,
+            'protocol': protocol,
+        }
+    finally:
+        elapsed = time.monotonic() - started
+        # A probe that takes more than 1s is a strong hint the target is slow
+        # or unreachable. Surfacing it in the application log lets an operator
+        # spot the offending domain without reproducing a multi-second
+        # dashboard stall — and lets them tune CERTMATE_TLS_PROBE_TIMEOUT_SECONDS
+        # if the slowness is real but expected.
+        if elapsed > 1.0:
+            logger.warning(
+                "Slow %s probe for %s:%d: %.2fs (timeout=%.1fs).",
+                protocol, host, port, elapsed, timeout,
+            )
+
+
+def _probe_smtp_starttls(host, port, context, timeout):
+    """Connect to an SMTP server and upgrade to TLS via STARTTLS.
+
+    SMTP wire: banner → ``EHLO certmate.local`` → ``STARTTLS`` →
+    220 response → ``context.wrap_socket``.
+    """
+    import socket as _socket
+
+    recv_timeout = max(1.0, timeout * 0.5)
+    with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+        raw_sock.settimeout(recv_timeout)
+        f = raw_sock.makefile('rwb')
+
+        # Read banner
+        banner = f.readline()
+        if not banner:
+            raise ConnectionError("SMTP: no banner received")
+
+        # EHLO
+        f.write(b'EHLO certmate.local\r\n')
+        f.flush()
+        _consume_smtp_multiline(f)
+
+        # STARTTLS
+        f.write(b'STARTTLS\r\n')
+        f.flush()
+        response = f.readline()
+        if not response or not response.startswith(b'220'):
+            raise ConnectionError(
+                f"SMTP STARTTLS rejected: {response!r}"
+            )
+
+        # Upgrade to TLS
+        tls_sock = context.wrap_socket(raw_sock, server_hostname=host)
+        return tls_sock.getpeercert(binary_form=True)
+
+
+def _consume_smtp_multiline(f):
+    """Read SMTP multi-line response until a line starting with a digit
+    followed by a space (not '-') is seen."""
+    while True:
+        line = f.readline()
+        if not line:
+            break
+        if len(line) > 3 and line[3:4] == b' ':
+            break
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +289,35 @@ def create_api_resources(api, models, managers):
     dns_manager = managers['dns']
     deploy_manager = managers.get('deployer')
     audit_logger = managers.get('audit')
+    # Shared create/renew orchestration. Production wires a single instance via
+    # the container (factory.py); the ``or`` fallback builds one from the
+    # manager set so tests that call create_api_resources with a minimal
+    # managers dict (no 'cert_service'/'events') keep working.
+    cert_service = managers.get('cert_service') or CertificateService(
+        certificate_manager, settings_manager, auth_manager,
+        audit_logger=audit_logger,
+    )
+    # Optional async issuance executor (single-instance, in-process). Absent in
+    # minimal-managers unit tests, in which case create/renew stay synchronous.
+    cert_executor = managers.get('cert_executor')
+
+    _ASYNC_TRUTHY = (True, 1, '1', 'true', 'yes', 'on')
+
+    def _wants_async(payload):
+        """True when the caller opted into async issuance via the ``async``
+        body flag or the ``?async=`` query param."""
+        if isinstance(payload, dict) and payload.get('async') in _ASYNC_TRUTHY:
+            return True
+        return request.args.get('async', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+    def _job_accepted(job_id, operation, domain):
+        return {
+            'job_id': job_id,
+            'status': 'queued',
+            'operation': operation,
+            'domain': domain,
+            'status_url': f'/api/certificates/jobs/{job_id}',
+        }
 
     def _check_domain_scope(domain, operation):
         """Reject the request if the caller's API-key allowed_domains does
@@ -124,11 +374,34 @@ def create_api_resources(api, models, managers):
                 if overall == 'healthy':
                     overall = 'degraded'
 
+            # Surface a storage-backend fallback: if the configured cloud/remote
+            # backend failed to initialise, CertMate silently uses local disk —
+            # the operator thinks certs are in Azure/Vault/S3 but they are not.
+            # Only a log line signalled this before; make monitoring see it.
+            storage = managers.get('storage')
+            if storage is not None and hasattr(storage, 'get_fallback_backend'):
+                try:
+                    fell_back_from = storage.get_fallback_backend()
+                except Exception:
+                    fell_back_from = None
+                if fell_back_from:
+                    checks['storage'] = f'fallback_to_local (configured backend: {fell_back_from})'
+                    if overall == 'healthy':
+                        overall = 'degraded'
+                else:
+                    checks['storage'] = 'ok'
+
             status_code = 200 if overall != 'unhealthy' else 500
             return {'status': overall, 'checks': checks}, status_code
 
     # Metrics endpoints
     class MetricsList(Resource):
+        # Gated like its sibling info endpoints (CacheStats, BackupList): the
+        # Prometheus scrape target is the separate public '/metrics' route —
+        # this JSON summary lives in the authenticated API and must require at
+        # least a viewer credential, not be reachable unauthenticated.
+        @api.doc(security='Bearer')
+        @auth_manager.require_role('viewer')
         def get(self):
             """Get available metrics information"""
             try:
@@ -169,10 +442,70 @@ def create_api_resources(api, models, managers):
             import platform
             import shutil
             import sys
+            import os
+            import ssl
+            import json
 
             from .. import __version__ as _certmate_version
 
             errors = {}
+
+            # --- System info ---
+            cryptography_version = None
+            try:
+                import cryptography
+                cryptography_version = cryptography.__version__
+            except Exception as e:
+                logger.warning(f"Diagnostic: failed to read cryptography version: {e}")
+                errors['cryptography_version'] = 'unavailable'
+
+            openssl_version = None
+            try:
+                openssl_version = ssl.OPENSSL_VERSION
+            except Exception as e:
+                logger.warning(f"Diagnostic: failed to read OpenSSL version: {e}")
+                errors['openssl_version'] = 'unavailable'
+
+            shell_executor = managers.get('shell_executor') or (certificate_manager and getattr(certificate_manager, 'shell_executor', None))
+            certbot_version = None
+            if shell_executor:
+                try:
+                    res = shell_executor.run(['.venv/bin/certbot', '--version'], timeout=5)
+                    if res and hasattr(res, 'stdout') and isinstance(res.stdout, str):
+                        stdout_str = res.stdout or ''
+                        stderr_str = res.stderr or '' if isinstance(res.stderr, str) else ''
+                        out = stdout_str + stderr_str
+                        if out.strip():
+                            certbot_version = out.strip()
+                except Exception as e:
+                    logger.debug("Failed to run .venv/bin/certbot --version: %s", e)
+                if not certbot_version:
+                    try:
+                        res = shell_executor.run(['certbot', '--version'], timeout=5)
+                        if res and hasattr(res, 'stdout') and isinstance(res.stdout, str):
+                            stdout_str = res.stdout or ''
+                            stderr_str = res.stderr or '' if isinstance(res.stderr, str) else ''
+                            out = stdout_str + stderr_str
+                            if out.strip():
+                                certbot_version = out.strip()
+                    except Exception as e:
+                        logger.debug("Failed to run certbot --version fallback: %s", e)
+            if not certbot_version:
+                errors['certbot_version'] = 'unavailable'
+
+            # --- Storage health ---
+            cert_dir = getattr(certificate_manager, 'cert_dir', None)
+            data_dir = current_app.config.get('DATA_DIR') or '.'
+
+            cert_dir_path = cert_dir if isinstance(cert_dir, (str, Path)) else None
+            data_dir_path = data_dir if isinstance(data_dir, (str, Path)) else None
+
+            storage_permissions = {
+                'cert_dir_readable': os.access(str(cert_dir_path), os.R_OK) if cert_dir_path else False,
+                'cert_dir_writable': os.access(str(cert_dir_path), os.W_OK) if cert_dir_path else False,
+                'data_dir_readable': os.access(str(data_dir_path), os.R_OK) if data_dir_path else False,
+                'data_dir_writable': os.access(str(data_dir_path), os.W_OK) if data_dir_path else False,
+            }
 
             # --- Application / runtime identity ---
             payload = {
@@ -180,6 +513,10 @@ def create_api_resources(api, models, managers):
                 'python_version': sys.version.split()[0],
                 'os_platform': platform.platform(),
                 'container': Path('/.dockerenv').exists(),
+                'cryptography_version': cryptography_version,
+                'openssl_version': openssl_version,
+                'certbot_version': certbot_version,
+                'storage_permissions': storage_permissions,
             }
 
             # --- Background scheduler liveness ---
@@ -189,17 +526,20 @@ def create_api_resources(api, models, managers):
             )
 
             # --- Certificate inventory cardinality ---
+            # Count on-disk cert stores the same way the rest of the codebase
+            # discovers them. CertificateManager has no list_certificates()
+            # method (that lives on storage backends), so the old call always
+            # raised and reported a null count.
             try:
-                certs = certificate_manager.list_certificates()
-                payload['certificate_count'] = (
-                    len(certs) if isinstance(certs, list) else None
+                payload['certificate_count'] = sum(
+                    1 for _ in iter_cert_domain_dirs(certificate_manager.cert_dir)
                 )
             except Exception as e:
                 logger.warning(f"Diagnostic: failed to count certificates: {e}")
                 payload['certificate_count'] = None
                 errors['certificate_count'] = 'failed_to_enumerate'
 
-            # --- Configuration scalars (names only, never credentials) ---
+            # --- Configuration scalars & summary ---
             try:
                 settings = settings_manager.load_settings() or {}
                 payload['dns_provider'] = settings.get('dns_provider')
@@ -207,14 +547,55 @@ def create_api_resources(api, models, managers):
                 payload['challenge_type'] = settings.get('challenge_type')
                 cert_storage = settings.get('certificate_storage') or {}
                 payload['storage_backend'] = cert_storage.get('backend')
+                payload['configured_domains_count'] = len(settings.get('domains', [])) if isinstance(settings.get('domains'), list) else 0
+
+                # Active DNS providers (by type, with credentials omitted)
+                active_dns_providers = {}
+                dns_providers = settings.get('dns_providers', {})
+                if isinstance(dns_providers, dict):
+                    for provider_name, provider_config in dns_providers.items():
+                        if not provider_config or not isinstance(provider_config, dict):
+                            continue
+                        accounts_list = []
+                        if 'accounts' in provider_config and isinstance(provider_config['accounts'], dict):
+                            for acc_id, acc_config in provider_config['accounts'].items():
+                                if isinstance(acc_config, dict):
+                                    accounts_list.append({
+                                        'id': acc_id,
+                                        'name': acc_config.get('name', acc_id),
+                                        'description': acc_config.get('description', '')
+                                    })
+                        else:
+                            accounts_list.append({
+                                'id': 'default',
+                                'name': provider_config.get('name', 'Default Account'),
+                                'description': provider_config.get('description', 'Legacy single-account config')
+                            })
+                        if accounts_list:
+                            active_dns_providers[provider_name] = accounts_list
+                payload['active_dns_providers'] = active_dns_providers
+
             except Exception as e:
                 logger.warning(f"Diagnostic: failed to read settings scalars: {e}")
                 errors['settings'] = 'failed_to_read'
 
+            # SSO / OIDC status
+            try:
+                oidc_manager = managers.get('oidc')
+                if oidc_manager:
+                    enabled_val = oidc_manager.is_enabled()
+                    payload['sso_oidc_enabled'] = bool(enabled_val) if isinstance(enabled_val, bool) else False
+                else:
+                    payload['sso_oidc_enabled'] = False
+            except Exception as e:
+                logger.warning(f"Diagnostic: failed to query OIDC status: {e}")
+                payload['sso_oidc_enabled'] = False
+                errors['sso_oidc'] = 'failed_to_query'
+
             # --- Free disk on the data partition ---
             try:
-                data_dir = current_app.config.get('DATA_DIR') or '.'
-                usage = shutil.disk_usage(str(data_dir))
+                data_dir_path = current_app.config.get('DATA_DIR') or '.'
+                usage = shutil.disk_usage(str(data_dir_path))
                 payload['disk_free_bytes'] = usage.free
                 payload['disk_total_bytes'] = usage.total
             except Exception as e:
@@ -222,6 +603,53 @@ def create_api_resources(api, models, managers):
                 payload['disk_free_bytes'] = None
                 payload['disk_total_bytes'] = None
                 errors['disk_usage'] = 'permission_or_path_unavailable'
+
+            # --- Backup history ---
+            backup_count = 0
+            backup_total_size = 0
+            file_ops = managers.get('file_ops')
+            if file_ops:
+                try:
+                    backups = file_ops.list_backups()
+                    if isinstance(backups, dict):
+                        unified_list = backups.get('unified', [])
+                        if isinstance(unified_list, list):
+                            backup_count = len(unified_list)
+                            backup_total_size = sum(item.get('metadata', {}).get('size', 0) for item in unified_list if isinstance(item, dict))
+                except Exception as e:
+                    logger.warning(f"Diagnostic: failed to read backup metrics: {e}")
+                    errors['backups'] = 'failed_to_list'
+            payload['backup_count'] = backup_count
+            payload['backup_total_size'] = backup_total_size
+
+            # --- Sanitized Logs (last 50 lines) ---
+            sanitized_logs = []
+            if file_ops and getattr(file_ops, 'logs_dir', None) and isinstance(file_ops.logs_dir, (str, Path)):
+                try:
+                    log_file = file_ops.logs_dir / 'certmate.log'
+                    if log_file.exists() and log_file.is_file():
+                        from collections import deque
+                        with open(log_file, 'r', encoding='utf-8') as f:
+                            last_lines = list(deque(f, maxlen=50))
+                        
+                        from modules.core.structured_logging import JSONFormatter
+                        formatter = JSONFormatter()
+                        
+                        for line in last_lines:
+                            line_str = line.strip()
+                            if not line_str:
+                                continue
+                            try:
+                                parsed = json.loads(line_str)
+                                sanitized_parsed = formatter.sanitize_data(parsed)
+                                sanitized_logs.append(sanitized_parsed)
+                            except Exception:
+                                sanitized_str = formatter.sanitize_data(line_str)
+                                sanitized_logs.append(sanitized_str)
+                except Exception as e:
+                    logger.warning(f"Diagnostic: failed to read sanitized logs: {e}")
+                    errors['sanitized_logs'] = 'failed_to_read'
+            payload['sanitized_logs'] = sanitized_logs
 
             # --- Recent audit (sanitized: identifiers stripped) ---
             # Only timestamp / operation / resource_type / status survive
@@ -232,15 +660,18 @@ def create_api_resources(api, models, managers):
             # which domain from which IP.
             try:
                 raw_entries = audit_logger.get_recent_entries(limit=5) if audit_logger else []
-                payload['recent_audit'] = [
-                    {
-                        'timestamp': (e or {}).get('timestamp'),
-                        'operation': (e or {}).get('operation'),
-                        'resource_type': (e or {}).get('resource_type'),
-                        'status': (e or {}).get('status'),
-                    }
-                    for e in (raw_entries or [])[:5]
-                ]
+                if isinstance(raw_entries, list):
+                    payload['recent_audit'] = [
+                        {
+                            'timestamp': (e or {}).get('timestamp'),
+                            'operation': (e or {}).get('operation'),
+                            'resource_type': (e or {}).get('resource_type'),
+                            'status': (e or {}).get('status'),
+                        }
+                        for e in raw_entries[:5] if isinstance(e, dict)
+                    ]
+                else:
+                    payload['recent_audit'] = []
             except Exception as e:
                 logger.warning(f"Diagnostic: audit log read failed: {e}")
                 payload['recent_audit'] = []
@@ -256,11 +687,40 @@ def create_api_resources(api, models, managers):
         @auth_manager.require_role('viewer')
         @api.marshal_with(models['settings_model'])
         def get(self):
-            """Get current settings"""
+            """Get current settings.
+
+            Internal security audit (May 2026), finding M4: this
+            endpoint previously returned the full ``settings['domains']``
+            array to any viewer-role caller. A scoped API key
+            (``allowed_domains`` set to a tenant pattern) could
+            therefore enumerate every domain the host had ever issued
+            a cert for, regardless of scope. Filter ``domains`` in
+            place by ``auth_manager.domain_matches_scope`` — same
+            shape as ``CertificateList.get`` already uses.
+
+            Unrestricted callers (legacy bearer tokens, local users
+            without an explicit ``allowed_domains`` list) keep seeing
+            every domain — ``domain_matches_scope(_, None)`` is True
+            for them by design.
+            """
             try:
                 settings = settings_manager.load_settings()
                 if not settings:
                     return {}, 200
+                user = getattr(request, 'current_user', None) or {}
+                scope = user.get('allowed_domains')
+                if scope is not None:
+                    settings = dict(settings)
+                    raw_domains = settings.get('domains') or []
+                    filtered = []
+                    for entry in raw_domains:
+                        domain_name = (
+                            entry if isinstance(entry, str)
+                            else (entry.get('domain') if isinstance(entry, dict) else None)
+                        )
+                        if domain_name and auth_manager.domain_matches_scope(domain_name, scope):
+                            filtered.append(entry)
+                    settings['domains'] = filtered
                 return settings
             except ValueError as e:
                 logger.error(f"Invalid settings format: {e}")
@@ -397,6 +857,19 @@ def create_api_resources(api, models, managers):
             """Clear deployment cache"""
             try:
                 cleared_count = cache_manager.clear_cache()
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='clear',
+                        resource_type='cache',
+                        resource_id='deployment_cache',
+                        status='success',
+                        details={
+                            'cleared_entries': cleared_count
+                        },
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return {
                     'success': True,
                     'message': 'Cache cleared successfully',
@@ -404,6 +877,17 @@ def create_api_resources(api, models, managers):
                 }
             except Exception as e:
                 logger.error(f"Error clearing cache: {e}")
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='clear',
+                        resource_type='cache',
+                        resource_id='deployment_cache',
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                        error=str(e)
+                    )
                 return {
                     'success': False,
                     'message': 'Failed to clear cache',
@@ -462,7 +946,12 @@ def create_api_resources(api, models, managers):
                         continue
                     if not auth_manager.domain_matches_scope(domain, scope):
                         continue
-                    cert_info = certificate_manager.get_certificate_info(domain)
+                    # Reuse the once-loaded settings dict so each per-domain
+                    # call skips its own settings deepcopy (load_settings is
+                    # already request-cached on flask.g). use_cache stays at
+                    # its default True so the storage-backend cert-info cache
+                    # is still consulted/populated during listing.
+                    cert_info = certificate_manager.get_certificate_info(domain, settings=settings)
                     if cert_info:
                         cert_info['auto_renew'] = auto_renew_by_domain.get(domain, True)
                         certificates.append(cert_info)
@@ -479,134 +968,58 @@ def create_api_resources(api, models, managers):
         def post(self):
             """Create a new certificate"""
             try:
-                data = api.payload
+                data = api.payload or {}
                 domain = (data.get('domain') or '').strip()
-                san_domains = data.get('san_domains', [])  # Optional SAN domains
-                dns_provider = data.get('dns_provider')
-                account_id = data.get('account_id')
-                ca_provider = data.get('ca_provider')
-                challenge_type = data.get('challenge_type')  # Optional: 'dns-01' or 'http-01'
-                domain_alias = data.get('domain_alias')  # Optional domain alias
-                if domain_alias:
-                    from ..core.utils import validate_domain
-                    alias_valid, alias_msg = validate_domain(domain_alias)
-                    if not alias_valid:
-                        return {'error': f'Invalid domain_alias: {alias_msg}'}, 400
-
-                # Validate domain
+                san_domains = data.get('san_domains', [])
                 if not domain:
                     return {
                         'error': 'Domain is required',
                         'hint': 'Please provide a valid domain name (e.g., example.com or *.example.com for wildcard)'
                     }, 400
 
-                # Basic domain validation
-                if ' ' in domain:
-                    return {
-                        'error': 'Invalid domain format',
-                        'hint': 'Enter only ONE primary domain. Use san_domains array for additional domains.'
-                    }, 400
+                user = getattr(request, 'current_user', None) or {}
+                audit_ctx = audit_context_from_request()
 
-                # Check for common domain format issues
-                if domain.startswith('http://') or domain.startswith('https://'):
-                    return {
-                        'error': 'Invalid domain format',
-                        'hint': 'Provide domain name only (e.g., example.com), not the full URL.'
-                    }, 400
-
-                # Validate SAN domains if provided
-                if san_domains:
-                    if not isinstance(san_domains, list):
-                        return {
-                            'error': 'Invalid san_domains format',
-                            'hint': 'san_domains must be an array of domain strings.'
-                        }, 400
-
-                    # Validate each SAN domain
-                    for san in san_domains:
-                        san = san.strip() if isinstance(san, str) else ''
-                        if san and (san.startswith('http://') or san.startswith('https://')):
-                            return {
-                                'error': f'Invalid SAN domain format: {san}',
-                                'hint': 'SAN domains should be domain names only, not URLs.'
-                            }, 400
-
-                # Scope check: the requested domain AND every SAN must be
-                # within the API key's allowed_domains. Reject the entire
-                # creation if any one is out of scope — partial creates
-                # would leak data across tenants.
-                scope_err = _check_domain_scope(domain, 'create')
-                if scope_err:
-                    return scope_err
-                for san in (san_domains or []):
-                    san_clean = san.strip() if isinstance(san, str) else ''
-                    if san_clean:
-                        scope_err = _check_domain_scope(san_clean, 'create_san')
-                        if scope_err:
-                            return scope_err
-
-                settings = settings_manager.load_settings()
-                email = settings.get('email')
-
-                if not email:
-                    return {
-                        'error': 'Email not configured',
-                        'hint': 'Configure email in settings first. Required for CA notifications.'
-                    }, 400
-
-                # Resolve CA provider from settings if not provided
-                if not ca_provider:
-                    ca_provider = settings.get('default_ca', 'letsencrypt')
-
-                # Resolve challenge type from settings if not provided
-                if not challenge_type:
-                    challenge_type = settings.get('challenge_type', 'dns-01')
-
-                # DNS provider validation (skip for HTTP-01)
-                if challenge_type != 'http-01':
-                    if not dns_provider:
-                        dns_provider = settings.get('dns_provider')
-
-                    if not dns_provider:
-                        return {
-                            'error': 'No DNS provider specified',
-                            'hint': 'Specify a provider or set a default in settings.'
-                        }, 400
-
-                # Create certificate with SAN domains
-                result = certificate_manager.create_certificate(
-                    domain=domain,
-                    email=email,
-                    dns_provider=dns_provider,
-                    account_id=account_id,
-                    ca_provider=ca_provider,
-                    domain_alias=domain_alias,
-                    san_domains=san_domains,
-                    challenge_type=challenge_type
-                )
-
-                # Append the new domain to settings under the manager's
-                # lock so two parallel cert creations for different domains
-                # cannot race and silently drop one of the entries.
-                _resolved_dns_provider = dns_provider or settings.get('dns_provider')
-
-                def _add_domain(s):
-                    domains_list = s.get('domains', []) or []
-                    already_present = any(
-                        (d == domain if isinstance(d, str) else d.get('domain') == domain)
-                        for d in domains_list
+                # Async opt-in: validate + authorize synchronously (immediate
+                # 4xx on bad input/scope/config), then defer the blocking
+                # certbot issuance to the executor and return 202 + job id.
+                if _wants_async(data) and cert_executor is not None:
+                    prepared = cert_service.prepare_create(
+                        domain=domain,
+                        san_domains=san_domains,
+                        dns_provider=data.get('dns_provider'),
+                        account_id=data.get('account_id'),
+                        ca_provider=data.get('ca_provider'),
+                        challenge_type=data.get('challenge_type'),
+                        domain_alias=data.get('domain_alias'),
+                        key_type=data.get('key_type'),
+                        key_size=data.get('key_size'),
+                        elliptic_curve=data.get('elliptic_curve'),
+                        user=user,
+                        ip_address=request.remote_addr,
+                        audit_ctx=audit_ctx,
                     )
-                    if already_present:
-                        return
-                    domains_list.append({
-                        'domain': domain,
-                        'dns_provider': _resolved_dns_provider,
-                        'dns_account_id': account_id,
-                    })
-                    s['domains'] = domains_list
+                    job_id = cert_executor.submit(
+                        'create', domain,
+                        lambda: cert_service.issue_create(prepared),
+                    )
+                    return _job_accepted(job_id, 'create', domain), 202
 
-                settings_manager.update(_add_domain, "certificate_created")
-                logger.info(f"Ensured domain {domain} is in settings after certificate creation")
+                result = cert_service.create(
+                    domain=domain,
+                    san_domains=san_domains,
+                    dns_provider=data.get('dns_provider'),
+                    account_id=data.get('account_id'),
+                    ca_provider=data.get('ca_provider'),
+                    challenge_type=data.get('challenge_type'),
+                    domain_alias=data.get('domain_alias'),
+                    key_type=data.get('key_type'),
+                    key_size=data.get('key_size'),
+                    elliptic_curve=data.get('elliptic_curve'),
+                    user=user,
+                    ip_address=request.remote_addr,
+                    audit_ctx=audit_ctx,
+                )
 
                 event_bus = current_app.config.get('EVENT_BUS')
                 if event_bus:
@@ -625,8 +1038,18 @@ def create_api_resources(api, models, managers):
                     'duration': result.get('duration')
                 }, 201
 
+            except DomainOutOfScope as e:
+                return {'error': str(e), 'code': 'DOMAIN_OUT_OF_SCOPE'}, 403
+            except FileExistsError as e:
+                # Previously fell through to the generic 500. The certificate
+                # already exists: 409 with a pointer to the reissue endpoint.
+                return {
+                    'error': str(e),
+                    'code': 'CERTIFICATE_ALREADY_EXISTS',
+                    'hint': 'Use renew to refresh it, or POST /api/certificates/<domain>/reissue to change its configuration.'
+                }, 409
             except ValueError as e:
-                # Validation errors from certificate_manager
+                # Validation / configuration errors raised by the service.
                 error_msg = str(e)
                 hint = None
                 if 'not configured' in error_msg.lower():
@@ -637,6 +1060,8 @@ def create_api_resources(api, models, managers):
                     'error': error_msg,
                     'hint': hint
                 }, 400
+            except DomainOperationInProgress as e:
+                return {'error': str(e), 'code': 'DOMAIN_OPERATION_IN_PROGRESS'}, 409
             except RuntimeError as e:
                 # Certbot execution errors
                 error_msg = str(e)
@@ -657,6 +1082,58 @@ def create_api_resources(api, models, managers):
                     'error': 'Certificate creation failed unexpectedly',
                     'hint': 'Check application logs for detailed error information.'
                 }, 500
+
+    class ZombieScan(Resource):
+        @api.doc(security='Bearer')
+        @auth_manager.require_role('admin')
+        def post(self):
+            """Scan active certificates for zombie domains."""
+            try:
+                from ..core.zombie import ZombieScanner
+                
+                user = getattr(request, 'current_user', None) or {}
+                scope = user.get('allowed_domains')
+                settings = settings_manager.load_settings()
+                certificates = []
+
+                all_domains = set()
+
+                # Add domains from settings
+                for domain_entry in settings.get('domains', []):
+                    if isinstance(domain_entry, str):
+                        domain = domain_entry
+                    elif isinstance(domain_entry, dict):
+                        domain = domain_entry.get('domain')
+                    else:
+                        continue
+                    if domain:
+                        all_domains.add(domain)
+
+                # Also check for certificates that exist on disk but might not be in settings
+                for cert_dir_path in iter_cert_domain_dirs(certificate_manager.cert_dir):
+                    all_domains.add(cert_dir_path.name)
+
+                # Get certificate info for all domains
+                for domain in all_domains:
+                    if not domain:
+                        continue
+                    if not auth_manager.domain_matches_scope(domain, scope):
+                        continue
+                    # Reuse the once-loaded settings dict so each per-domain
+                    # call skips its own settings deepcopy (load_settings is
+                    # already request-cached on flask.g). use_cache stays at
+                    # its default True so the storage-backend cert-info cache
+                    # is still consulted/populated during the scan.
+                    cert_info = certificate_manager.get_certificate_info(domain, settings=settings)
+                    if cert_info:
+                        certificates.append(cert_info)
+
+                scanner = ZombieScanner()
+                scan_results = scanner.scan_certificates(certificates)
+                return scan_results, 200
+            except Exception as e:
+                logger.error(f"Error scanning certificates for zombies: {e}")
+                return {'error': 'Failed to perform zombie scan'}, 500
 
     class CheckDNSAlias(Resource):
         @api.doc(security='Bearer')
@@ -679,6 +1156,23 @@ def create_api_resources(api, models, managers):
             if not domain or not domain_alias:
                 return {'error': 'domain and domain_alias are required'}, 400
 
+            # Audit M5: the path-style variant
+            # `CertificateDNSAliasCheck.get(domain)` already runs
+            # `_check_domain_scope`. This body-style variant did not,
+            # so a scoped viewer could probe DNS-alias topology for
+            # any out-of-scope domain (information disclosure: confirms
+            # which `_acme-challenge` alias targets exist). Apply the
+            # same scope gate to the primary domain AND every SAN.
+            scope_err = _check_domain_scope(domain, 'check_dns_alias')
+            if scope_err:
+                return scope_err
+            for san in (san_domains or []):
+                san_clean = san.strip() if isinstance(san, str) else ''
+                if san_clean:
+                    scope_err = _check_domain_scope(san_clean, 'check_dns_alias_san')
+                    if scope_err:
+                        return scope_err
+
             return certificate_manager.check_dns_alias_records(
                 domain,
                 domain_alias,
@@ -690,6 +1184,9 @@ def create_api_resources(api, models, managers):
         @auth_manager.require_role('viewer')
         def get(self, domain):
             """Check DNS-01 alias CNAME records for an existing certificate."""
+            _, err = _validate_domain_path(domain, file_ops.cert_dir)
+            if err:
+                return {'error': err}, 400
             scope_err = _check_domain_scope(domain, 'dns_alias_check')
             if scope_err:
                 return scope_err
@@ -709,17 +1206,55 @@ def create_api_resources(api, models, managers):
 
     class CertificateDetail(Resource):
         @api.doc(security='Bearer')
+        @auth_manager.require_role('viewer')
+        def get(self, domain):
+            """Get certificate info for a single domain.
+
+            Scoped API keys may only fetch domains within their
+            allowed_domains. CertMate stores one active certificate per
+            domain; expired certs are returned so callers can detect
+            expiry via days_left / needs_renewal. Returns 404 when no
+            certificate directory exists for the domain.
+            """
+            scope_err = _check_domain_scope(domain, 'get')
+            if scope_err:
+                return scope_err
+            cert_dir, err = _validate_domain_path(domain, file_ops.cert_dir)
+            if err:
+                return {'error': err}, 400
+            if not cert_dir or not cert_dir.exists():
+                return {'error': f'Certificate not found for domain: {domain}'}, 404
+            try:
+                cert_info = certificate_manager.get_certificate_info(domain)
+                if not cert_info:
+                    return {'error': f'Certificate not found for domain: {domain}'}, 404
+                # Mirror CertificateList.get's per-domain auto_renew enrichment so
+                # the single-domain response shape matches the list response.
+                settings = settings_manager.load_settings()
+                auto_renew = True
+                for entry in settings.get('domains', []):
+                    if isinstance(entry, dict) and entry.get('domain') == domain:
+                        auto_renew = bool(entry.get('auto_renew', True))
+                        break
+                cert_info['auto_renew'] = auto_renew
+                return cert_info
+            except Exception as e:
+                logger.error(f"Error fetching certificate for {domain}: {e}")
+                return {'error': 'Failed to fetch certificate'}, 500
+
+        @api.doc(security='Bearer')
         @auth_manager.require_role('operator')
         def patch(self, domain):
-            """Update DNS provider for an existing certificate (issue #129).
+            """Update DNS provider or deployment probe config for an existing
+            certificate (issue #129 + deployment probe extension).
 
-            Allows changing the DNS provider (and optionally the alias DNS
-            provider) used for future renewals of this certificate without
-            deleting and re-creating it. Updates both the on-disk
-            metadata.json and the domain entry in settings.
+            DNS changes: ``dns_provider``, ``account_id``, ``alias_dns_provider``.
+            Probe changes: ``deployment_port`` (int, 1-65535) and/or
+            ``deployment_protocol`` ("https-tls" | "tls" | "smtp-starttls").
+            Either category can be used alone or together.
 
-            Body: {"dns_provider": "route53", "account_id": "default",
-                   "alias_dns_provider": "cloudflare"}
+            Body: {"dns_provider": "route53", "deployment_protocol": "smtp-starttls",
+                   "deployment_port": 587}
             """
             scope_err = _check_domain_scope(domain, 'update_dns_provider')
             if scope_err:
@@ -734,11 +1269,19 @@ def create_api_resources(api, models, managers):
             new_dns_provider = data.get('dns_provider')
             new_account_id = data.get('account_id')
             new_alias_dns_provider = data.get('alias_dns_provider')
+            new_deploy_port = data.get('deployment_port')
+            new_deploy_protocol = data.get('deployment_protocol')
 
-            if not new_dns_provider and not new_alias_dns_provider:
+            # Allow requests that only set deployment probe fields
+            # (deployment_port / deployment_protocol) without requiring
+            # a DNS provider change.
+            has_dns_changes = bool(new_dns_provider or new_alias_dns_provider)
+            has_probe_changes = 'deployment_port' in data or 'deployment_protocol' in data
+
+            if not has_dns_changes and not has_probe_changes:
                 return {
-                    'error': 'At least one of dns_provider or alias_dns_provider is required',
-                    'hint': 'Provide the new DNS provider name to use for future renewals.'
+                    'error': 'At least one of dns_provider, alias_dns_provider, '
+                             'deployment_port, or deployment_protocol is required',
                 }, 400
 
             # Validate the new provider has credentials configured
@@ -756,6 +1299,22 @@ def create_api_resources(api, models, managers):
                         'hint': 'Configure the DNS provider credentials in Settings first.'
                     }, 400
 
+            # alias_dns_provider was previously accepted unvalidated; an
+            # unconfigured value only surfaced at renew time as a baffling
+            # failure. Validate it the same way as dns_provider.
+            if new_alias_dns_provider:
+                settings = settings_manager.load_settings()
+                alias_config, _ = dns_manager.get_dns_provider_account_config(
+                    new_alias_dns_provider,
+                    new_account_id,
+                    settings,
+                )
+                if not alias_config:
+                    return {
+                        'error': f"Alias DNS provider '{new_alias_dns_provider}' is not configured",
+                        'hint': 'Configure the DNS provider credentials in Settings first.'
+                    }, 400
+
             try:
                 import json as _json
 
@@ -766,8 +1325,8 @@ def create_api_resources(api, models, managers):
                     try:
                         with open(metadata_file, 'r') as f:
                             metadata = _json.load(f)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to load metadata.json for domain %s: %s", domain, e)
 
                 old_provider = metadata.get('dns_provider')
                 if new_dns_provider:
@@ -777,7 +1336,35 @@ def create_api_resources(api, models, managers):
                 if new_alias_dns_provider:
                     metadata['alias_dns_provider'] = new_alias_dns_provider
 
-                certificate_manager._atomic_json_write(metadata_file, metadata)
+                # --- deployment probe config ---
+                # Only touch probe config when the caller actually sends the
+                # key: an ABSENT key leaves existing config intact, an explicit
+                # null deletes it. Keying off `is not None` instead would let a
+                # DNS-only PATCH silently wipe a cert's probe config.
+                if 'deployment_port' in data:
+                    if new_deploy_port is not None:
+                        try:
+                            port = int(new_deploy_port)
+                            if port < 1 or port > 65535:
+                                return {'error': 'deployment_port must be 1-65535'}, 400
+                            metadata['deployment_port'] = port
+                        except (TypeError, ValueError):
+                            return {'error': 'deployment_port must be an integer'}, 400
+                    else:
+                        metadata.pop('deployment_port', None)
+
+                if 'deployment_protocol' in data:
+                    if new_deploy_protocol is not None:
+                        if new_deploy_protocol not in _PROBE_PROTOCOLS:
+                            return {
+                                'error': f"deployment_protocol must be one of {_PROBE_PROTOCOLS!r}"
+                            }, 400
+                        metadata['deployment_protocol'] = new_deploy_protocol
+                    else:
+                        metadata.pop('deployment_protocol', None)
+
+                if not certificate_manager._save_metadata(domain, metadata):
+                    return {'error': f'Failed to update metadata for domain: {domain}'}, 500
                 logger.info(
                     f"Updated DNS provider for {domain}: "
                     f"{old_provider} → {new_dns_provider or old_provider}"
@@ -795,17 +1382,21 @@ def create_api_resources(api, models, managers):
 
                 settings_manager.update(_update_domain_provider, "dns_provider_change")
 
-                return {
-                    'message': f'DNS provider updated for {domain}',
+                response = {
+                    'message': f'Certificate config updated for {domain}',
                     'domain': domain,
                     'dns_provider': metadata.get('dns_provider'),
                     'alias_dns_provider': metadata.get('alias_dns_provider'),
                     'account_id': metadata.get('account_id'),
-                }, 200
+                }
+                if new_deploy_port is not None or new_deploy_protocol is not None:
+                    response['deployment_port'] = metadata.get('deployment_port')
+                    response['deployment_protocol'] = metadata.get('deployment_protocol')
+                return response, 200
 
             except Exception as e:
-                logger.error(f"Failed to update DNS provider for {domain}: {e}")
-                return {'error': 'Failed to update DNS provider'}, 500
+                logger.error(f"Failed to update certificate config for {domain}: {e}")
+                return {'error': 'Failed to update certificate config'}, 500
 
         @api.doc(security='Bearer')
         @auth_manager.require_role('admin')
@@ -873,12 +1464,157 @@ def create_api_resources(api, models, managers):
     # therefore also operator-gated. (2026-05-12 API auth audit
     # follow-up: viewer-can-pull-privkey was an information-disclosure
     # surface that the original endpoint exposed.)
-    _PRIVATE_KEY_FILES = frozenset({'privkey.pem', 'combined.pem'})
+    _PRIVATE_KEY_FILES = frozenset({'privkey.pem', 'combined.pem', 'cert.pfx'})
     _PUBLIC_DOWNLOAD_FILES = frozenset({'cert.pem', 'chain.pem', 'fullchain.pem'})
 
     def _user_has_role(user, min_role):
         level = ROLE_HIERARCHY.get((user or {}).get('role'), -1)
         return level >= ROLE_HIERARCHY.get(min_role, 999)
+
+    class CertificateDeploymentStatus(Resource):
+        @api.doc(security='Bearer')
+        @auth_manager.require_role('viewer')
+        @api.marshal_with(models['deployment_status_model'])
+        def get(self, domain):
+            """Check whether the domain is serving the expected certificate."""
+            refresh_requested = str(request.args.get('refresh', '')).lower() in {'1', 'true', 'yes', 'on'}
+            _, err = _validate_domain_path(domain, file_ops.cert_dir)
+            if err:
+                return {'error': err}, 400
+            scope_err = _check_domain_scope(domain, 'deployment_status')
+            if scope_err:
+                return scope_err
+
+            cert_info = certificate_manager.get_certificate_info(domain)
+            if not cert_info or not cert_info.get('exists'):
+                return {'error': f'Certificate not found for domain: {domain}'}, 404
+
+            if refresh_requested:
+                cache_manager.remove_from_cache(domain)
+            else:
+                cached_result = cache_manager.get_deployment_status(domain)
+                if isinstance(cached_result, dict) and cached_result.get('domain') == domain:
+                    return cached_result, 200
+
+            expected_bytes = None
+            storage_manager = getattr(certificate_manager, 'storage_manager', None)
+            if storage_manager is not None:
+                try:
+                    storage_result = storage_manager.retrieve_certificate(domain)
+                    if storage_result:
+                        cert_files, _metadata = storage_result
+                        expected_bytes = cert_files.get('cert.pem')
+                except Exception as e:
+                    logger.warning(f"Could not read stored certificate for {domain}: {e}")
+
+            if expected_bytes is None:
+                cert_path = Path(file_ops.cert_dir) / domain / 'cert.pem'
+                if cert_path.exists():
+                    expected_bytes = cert_path.read_bytes()
+
+            if not expected_bytes:
+                return {'error': f'Certificate file not found for domain: {domain}'}, 404
+
+            expected_fingerprint = _certificate_fingerprint(expected_bytes)
+            if not expected_fingerprint:
+                return {'error': f'Could not parse certificate for domain: {domain}'}, 500
+
+            # Read per-cert deployment config from metadata, fall back to
+            # defaults. Stored via PATCH /api/certificates/<domain> as
+            # ``deployment_port`` and ``deployment_protocol``.
+            metadata = certificate_manager._load_metadata(domain) if hasattr(certificate_manager, '_load_metadata') else {}
+            raw_port = metadata.get('deployment_port')
+            deploy_port = raw_port if raw_port is not None else 0
+            deploy_protocol = metadata.get('deployment_protocol') or 'https-tls'
+
+            result = {
+                'domain': domain,
+                'deployed': False,
+                'reachable': False,
+                'certificate_match': False,
+                'method': deploy_protocol,
+                'port': deploy_port if deploy_port is not None else None,
+                'protocol': deploy_protocol,
+                'timestamp': utc_now_iso(),
+            }
+
+            try:
+                probe = _probe_tls_certificate(
+                    domain,
+                    port=int(deploy_port) if deploy_port else 0,
+                    protocol=deploy_protocol,
+                )
+                result['reachable'] = True
+                result['deployed'] = True
+                result['port'] = probe.get('port')
+                result['protocol'] = probe.get('protocol')
+                result['certificate_match'] = (
+                    _certificate_fingerprint(probe.get('certificate_bytes')) == expected_fingerprint
+                )
+            except Exception as e:
+                result['error'] = str(e)
+
+            persisted_status = certificate_manager.get_deployment_status_record(domain)
+            if isinstance(persisted_status, dict) and persisted_status.get('browser'):
+                result['browser'] = persisted_status.get('browser')
+
+            certificate_manager.record_backend_deployment_status(domain, result)
+            cache_manager.set_deployment_status(domain, result)
+            return result, 200
+
+    class CertificateDeploymentBrowserReports(Resource):
+        @api.doc(security='Bearer')
+        @auth_manager.require_role('viewer')
+        @api.expect(models['browser_deployment_reports_model'])
+        def post(self):
+            """Persist browser-reported reachability for one or more domains."""
+            payload = request.get_json(silent=True) or {}
+            reports = payload.get('reports')
+            if not isinstance(reports, list) or not reports:
+                return {'error': 'reports must be a non-empty array'}, 400
+
+            updated = []
+            skipped = []
+            for report in reports:
+                if not isinstance(report, dict):
+                    skipped.append({'error': 'invalid report payload'})
+                    continue
+
+                domain = (report.get('domain') or '').strip()
+                if not domain:
+                    skipped.append({'error': 'missing domain'})
+                    continue
+
+                _, err = _validate_domain_path(domain, file_ops.cert_dir)
+                if err:
+                    skipped.append({'domain': domain, 'error': err})
+                    continue
+                scope_err = _check_domain_scope(domain, 'browser_report')
+                if scope_err:
+                    skipped.append({'domain': domain, 'error': 'out of scope'})
+                    continue
+
+                browser_status = certificate_manager.record_browser_deployment_status(domain, report)
+                persisted = certificate_manager.get_deployment_status_record(domain)
+                backend = persisted.get('backend') if isinstance(persisted, dict) else None
+                merged = {
+                    'domain': domain,
+                    'deployed': bool(backend.get('deployed')) if isinstance(backend, dict) else False,
+                    'reachable': bool(backend.get('reachable')) if isinstance(backend, dict) else False,
+                    'certificate_match': backend.get('certificate_match') if isinstance(backend, dict) else False,
+                    'method': backend.get('method') if isinstance(backend, dict) else 'browser-report',
+                    'timestamp': backend.get('timestamp') if isinstance(backend, dict) else None,
+                    'error': backend.get('error') if isinstance(backend, dict) else None,
+                    'browser': browser_status.get('browser') if isinstance(browser_status, dict) else None,
+                }
+                cache_manager.set_deployment_status(domain, merged)
+                updated.append(domain)
+
+            return {
+                'updated': updated,
+                'skipped': skipped,
+                'count': len(updated),
+            }, 200
 
     class DownloadCertificate(Resource):
         @api.doc(security='Bearer')
@@ -891,6 +1627,14 @@ def create_api_resources(api, models, managers):
             (?include_private=0); anything that exposes the private key
             (privkey.pem, combined.pem, format=json, default ZIP)
             requires operator role.
+
+            ?file=privkey.pem&key_format=pkcs1 serves the key in legacy
+            PKCS#1/SEC1 form for stacks that reject certbot's PKCS#8
+            (issue #233); the default is the on-disk PKCS#8.
+
+            ?file=cert.pfx serves the encrypted PKCS#12 bundle when a PFX
+            export password is configured (issue #230); 404 otherwise. It
+            contains the private key, so it requires operator role.
             """
             try:
                 scope_err = _check_domain_scope(domain, 'download')
@@ -910,6 +1654,16 @@ def create_api_resources(api, models, managers):
 
                 if download_format and download_format not in ['json']:
                     return {'error': 'Invalid format requested.'}, 400
+
+                # Optional private-key serialization. Certbot stores PKCS#8
+                # ("BEGIN PRIVATE KEY"); some older stacks need the legacy
+                # PKCS#1 form ("BEGIN RSA PRIVATE KEY"). Convert on download
+                # rather than duplicating key material on disk (issue #233).
+                key_format = request.args.get('key_format')
+                if key_format is not None and key_format not in ('pkcs1', 'pkcs8'):
+                    return {'error': "Invalid key_format; use 'pkcs1' or 'pkcs8'."}, 400
+                if key_format and requested_file != 'privkey.pem':
+                    return {'error': 'key_format only applies to ?file=privkey.pem'}, 400
 
                 def _privkey_denied(file_label):
                     """Emit audit + return 403 for viewer trying to pull privkey."""
@@ -987,11 +1741,42 @@ def create_api_resources(api, models, managers):
                     if not file_path.exists():
                         return {'error': f'File {requested_file} not found for domain {domain}'}, 404
 
+                    if requested_file == 'privkey.pem' and key_format == 'pkcs1':
+                        # Re-resolve with a constant filename and confirm the
+                        # path stays inside the (already validated) domain dir
+                        # before reading — defense in depth, and keeps the new
+                        # file read off any tainted path component.
+                        key_path = os.path.realpath(cert_dir / 'privkey.pem')
+                        if not key_path.startswith(os.path.realpath(cert_dir) + os.sep):
+                            return {'error': 'Invalid path'}, 400
+                        try:
+                            with open(key_path, 'rb') as fh:
+                                pkcs1_pem = _privkey_to_pkcs1(fh.read())
+                        except (ValueError, TypeError) as e:
+                            logger.error(
+                                "Failed to convert private key to PKCS#1: %s",
+                                type(e).__name__,
+                            )
+                            return {
+                                'error': 'Could not convert the private key to PKCS#1 '
+                                         '(the key type may not support it).'
+                            }, 422
+                        return send_file(
+                            io.BytesIO(pkcs1_pem),
+                            as_attachment=True,
+                            download_name=f'{domain}_privkey_pkcs1.pem',
+                            mimetype='application/x-pem-file',
+                        )
+
+                    file_mimetype = (
+                        'application/x-pkcs12' if requested_file.endswith('.pfx')
+                        else 'application/x-pem-file'
+                    )
                     return send_file(
                         file_path,
                         as_attachment=True,
                         download_name=f'{domain}_{requested_file}',
-                        mimetype='application/x-pem-file'
+                        mimetype=file_mimetype
                     )
 
                 # Fallback ZIP. Two flavors:
@@ -1035,16 +1820,128 @@ def create_api_resources(api, models, managers):
                 logger.error(f"Error downloading certificate for {domain}: {e}")
                 return {'error': 'Failed to download certificate'}, 500
 
+    class DownloadCertificateFile(Resource):
+        # Path-style alias for the query-string form on DownloadCertificate.
+        # Documented in discussion #183 as the canonical scripting URL
+        # (curl ... /api/certificates/<domain>/download/fullchain). Without
+        # this route the documented URL returned 404 (issue #212).
+        #
+        # Short names map 1:1 to the on-disk filenames. The role gate and
+        # path-traversal guards mirror the ?file= branch in
+        # DownloadCertificate.get() — keep the two in sync.
+        _SHORT_NAME_TO_FILE = {
+            'cert': 'cert.pem',
+            'chain': 'chain.pem',
+            'fullchain': 'fullchain.pem',
+            'privkey': 'privkey.pem',
+            'combined': 'combined.pem',
+        }
+
+        @api.doc(security='Bearer')
+        @auth_manager.require_role('viewer')
+        def get(self, domain, file_type):
+            """Download a single certificate file by short name.
+
+            Path-style equivalent of ``?file=<name>.pem`` on the parent
+            ``/download`` route. ``file_type`` is one of ``cert``,
+            ``chain``, ``fullchain``, ``privkey``, ``combined``.
+
+            Role gating: viewers can pull public material (cert, chain,
+            fullchain); ``privkey`` and ``combined`` require operator+.
+            """
+            requested_file = self._SHORT_NAME_TO_FILE.get(file_type)
+            if requested_file is None:
+                return {
+                    'error': f'Invalid file type: {file_type}',
+                    'hint': f"Allowed: {sorted(self._SHORT_NAME_TO_FILE)}",
+                }, 400
+
+            try:
+                scope_err = _check_domain_scope(domain, 'download')
+                if scope_err:
+                    return scope_err
+                cert_dir, err = _validate_domain_path(domain, file_ops.cert_dir)
+                if err:
+                    return {'error': err}, 400
+                if not cert_dir.exists():
+                    return {'error': f'Certificate not found for domain: {domain}'}, 404
+
+                user = getattr(request, 'current_user', None) or {}
+
+                if requested_file in _PRIVATE_KEY_FILES and not _user_has_role(user, 'operator'):
+                    if audit_logger:
+                        audit_logger.log_authz_denied(
+                            operation='download',
+                            resource_type='certificate',
+                            resource_id=domain,
+                            reason=f'viewer cannot download private-key material ({requested_file})',
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
+                    return {
+                        'error': 'operator role required to download private key material',
+                        'code': 'PRIVKEY_REQUIRES_OPERATOR',
+                        'hint': 'Use /download/fullchain to pull public material as a viewer.',
+                    }, 403
+
+                if requested_file == 'combined.pem':
+                    try:
+                        fullchain = (cert_dir / 'fullchain.pem').read_text(encoding='utf-8')
+                        privkey = (cert_dir / 'privkey.pem').read_text(encoding='utf-8')
+                        combined_data = io.BytesIO(f"{fullchain}{privkey}".encode())
+                        return send_file(
+                            combined_data,
+                            as_attachment=True,
+                            download_name=f'{domain}_combined.pem',
+                            mimetype='application/x-pem-file'
+                        )
+                    except FileNotFoundError:
+                        return {'error': f'Required cert files not found for domain {domain}'}, 404
+
+                file_path = cert_dir / requested_file
+                if not file_path.exists():
+                    return {'error': f'File {requested_file} not found for domain {domain}'}, 404
+
+                return send_file(
+                    file_path,
+                    as_attachment=True,
+                    download_name=f'{domain}_{requested_file}',
+                    mimetype='application/x-pem-file'
+                )
+            except Exception as e:
+                logger.error(f"Error downloading {file_type} for {domain}: {e}")
+                return {'error': 'Failed to download certificate file'}, 500
+
     class RenewCertificate(Resource):
         @api.doc(security='Bearer')
         @auth_manager.require_role('operator')
         def post(self, domain):
             """Renew an existing certificate"""
             try:
-                scope_err = _check_domain_scope(domain, 'renew')
-                if scope_err:
-                    return scope_err
-                result = certificate_manager.renew_certificate(domain)
+                payload = request.get_json(silent=True) or {}
+                force = bool(payload.get('force', False))
+                _, err = _validate_domain_path(domain, file_ops.cert_dir)
+                if err:
+                    return {'error': err}, 400
+                user = getattr(request, 'current_user', None) or {}
+                audit_ctx = audit_context_from_request()
+
+                if _wants_async(payload) and cert_executor is not None:
+                    prepared = cert_service.prepare_renew(
+                        domain=domain, user=user, ip_address=request.remote_addr,
+                        audit_ctx=audit_ctx,
+                    )
+                    job_id = cert_executor.submit(
+                        'renew', domain,
+                        lambda: cert_service.issue_renew(prepared, force=force),
+                    )
+                    return _job_accepted(job_id, 'renew', domain), 202
+
+                result = cert_service.renew(
+                    domain=domain, force=force,
+                    user=user, ip_address=request.remote_addr,
+                    audit_ctx=audit_ctx,
+                )
 
                 event_bus = current_app.config.get('EVENT_BUS')
                 if event_bus:
@@ -1057,12 +1954,149 @@ def create_api_resources(api, models, managers):
                     'duration': result.get('duration')
                 }, 200
 
+            except DomainOutOfScope as e:
+                return {'error': str(e), 'code': 'DOMAIN_OUT_OF_SCOPE'}, 403
+            except DomainOperationInProgress as e:
+                # Domain busy is not a failure; do not publish a failure event.
+                return {'error': str(e), 'code': 'DOMAIN_OPERATION_IN_PROGRESS'}, 409
+            except FileNotFoundError:
+                # Missing cert on disk is a 404, not a 500 (matches the web route).
+                return {'error': 'Certificate not found', 'code': 'NOT_FOUND'}, 404
+            except RuntimeError as e:
+                # A renewal failure is a certificate-level outcome, not a server
+                # fault: return 422 and say WHY (classify_renewal_error flags the
+                # broken-renewal-config case with an actionable reissue hint)
+                # instead of the old opaque 500 "Certificate renewal failed".
+                logger.error("Certificate renewal failed for %s: %s",
+                             domain.replace('\n', ' ').replace('\r', ' '),
+                             str(e).replace('\n', ' ').replace('\r', ' '))
+                event_bus = current_app.config.get('EVENT_BUS')
+                if event_bus:
+                    event_bus.publish('certificate_failed', {'domain': domain, 'error': str(e)})
+                message, code = classify_renewal_error(str(e))
+                return {'error': message, 'code': code}, 422
             except Exception as e:
-                logger.error(f"Certificate renewal failed for {domain}: {str(e)}")
+                logger.error("Certificate renewal failed for %s: %s",
+                             domain.replace('\n', ' ').replace('\r', ' '),
+                             str(e).replace('\n', ' ').replace('\r', ' '))
                 event_bus = current_app.config.get('EVENT_BUS')
                 if event_bus:
                     event_bus.publish('certificate_failed', {'domain': domain, 'error': str(e)})
                 return {'error': 'Certificate renewal failed'}, 500
+
+    class CertificateReissue(Resource):
+        @api.doc(security='Bearer')
+        @api.expect(models['reissue_cert_model'])
+        @auth_manager.require_role('operator')
+        def post(self, domain):
+            """Edit a certificate's configuration and reissue it in place (#267).
+
+            Omitted fields keep the values the certificate was issued with
+            (read from its metadata), so extending or dropping SANs never
+            requires re-entering DNS/alias/CA configuration. The old
+            certificate keeps being served until certbot succeeds.
+            """
+            try:
+                data = api.payload or {}
+                _, err = _validate_domain_path(domain, file_ops.cert_dir)
+                if err:
+                    return {'error': err}, 400
+                user = getattr(request, 'current_user', None) or {}
+
+                kwargs = dict(
+                    domain=domain,
+                    san_domains=data.get('san_domains'),
+                    dns_provider=data.get('dns_provider'),
+                    account_id=data.get('account_id'),
+                    ca_provider=data.get('ca_provider'),
+                    challenge_type=data.get('challenge_type'),
+                    domain_alias=data.get('domain_alias'),
+                    alias_dns_provider=data.get('alias_dns_provider'),
+                    key_type=data.get('key_type'),
+                    key_size=data.get('key_size'),
+                    elliptic_curve=data.get('elliptic_curve'),
+                    user=user,
+                    ip_address=request.remote_addr,
+                    audit_ctx=audit_context_from_request(),
+                )
+
+                if _wants_async(data) and cert_executor is not None:
+                    prepared = cert_service.prepare_reissue(**kwargs)
+                    job_id = cert_executor.submit(
+                        'reissue', domain,
+                        lambda: cert_service.issue_reissue(prepared),
+                    )
+                    return _job_accepted(job_id, 'reissue', domain), 202
+
+                result = cert_service.issue_reissue(
+                    cert_service.prepare_reissue(**kwargs)
+                )
+
+                event_bus = current_app.config.get('EVENT_BUS')
+                if event_bus:
+                    # A reissue refreshes the domain's certificate: consumers
+                    # (deploy hooks, notifications) react as for a renewal.
+                    event_bus.publish('certificate_renewed', {'domain': domain})
+
+                return {
+                    'message': f'Certificate reissued successfully for {domain}',
+                    'domain': domain,
+                    'dns_provider': result.get('dns_provider'),
+                    'ca_provider': result.get('ca_provider'),
+                    'duration': result.get('duration')
+                }, 200
+
+            except FileNotFoundError as e:
+                return {'error': str(e), 'code': 'CERTIFICATE_NOT_FOUND'}, 404
+            except DomainOutOfScope as e:
+                return {'error': str(e), 'code': 'DOMAIN_OUT_OF_SCOPE'}, 403
+            except ValueError as e:
+                return {'error': str(e)}, 400
+            except DomainOperationInProgress as e:
+                # Domain busy is not a failure; no failure event.
+                return {'error': str(e), 'code': 'DOMAIN_OPERATION_IN_PROGRESS'}, 409
+            except RuntimeError as e:
+                error_msg = str(e)
+                hint = 'Check DNS provider credentials and ensure DNS records can be created.'
+                if 'rate limit' in error_msg.lower():
+                    hint = "You've hit the certificate authority's rate limit. Wait before trying again."
+                event_bus = current_app.config.get('EVENT_BUS')
+                if event_bus:
+                    event_bus.publish('certificate_failed', {'domain': domain, 'error': error_msg})
+                return {
+                    'error': f'Certificate reissue failed: {error_msg}',
+                    'hint': hint + ' The previous certificate is still in place.'
+                }, 422
+            except Exception as e:
+                # Scrub CR/LF before logging: domain comes from the URL path
+                # and a crafted value could forge log entries (CodeQL
+                # py/log-injection; same treatment as cert_service._scrub_log).
+                safe_domain = str(domain).replace('\r', '').replace('\n', '')
+                logger.error(f"Certificate reissue failed for {safe_domain}: {str(e)}")
+                event_bus = current_app.config.get('EVENT_BUS')
+                if event_bus:
+                    event_bus.publish('certificate_failed', {'domain': domain, 'error': str(e)})
+                return {
+                    'error': 'Certificate reissue failed unexpectedly',
+                    'hint': 'Check application logs. The previous certificate is still in place.'
+                }, 500
+
+    class CertificateJob(Resource):
+        @api.doc(security='Bearer')
+        @auth_manager.require_role('operator')
+        def get(self, job_id):
+            """Poll the status of an async create/renew job."""
+            if cert_executor is None:
+                return {'error': 'Async issuance is not enabled'}, 404
+            job = cert_executor.get(job_id)
+            if job is None:
+                return {'error': 'Job not found'}, 404
+            # The caller must be in scope for the job's domain — a scoped key
+            # cannot poll a job for a domain it could not have created.
+            scope_err = _check_domain_scope(job.get('domain'), 'job_status')
+            if scope_err:
+                return scope_err
+            return job, 200
 
     class CertificateAutoRenew(Resource):
         @api.doc(security='Bearer')
@@ -1090,6 +2124,16 @@ def create_api_resources(api, models, managers):
                         'error': f'Domain {domain} not found in settings',
                         'hint': 'Only domains tracked in settings can have auto-renew toggled.'
                     }, 404
+
+                if audit_logger:
+                    actx = audit_context_from_request()
+                    audit_logger.log_operation(
+                        operation='set_auto_renew', resource_type='certificate',
+                        resource_id=domain, status='success',
+                        details={'auto_renew': enabled},
+                        user=actx.get('user'), ip_address=actx.get('ip'),
+                        actor=actx.get('actor'), trigger=actx.get('trigger'),
+                    )
 
                 event_bus = current_app.config.get('EVENT_BUS')
                 if event_bus:
@@ -1133,7 +2177,32 @@ def create_api_resources(api, models, managers):
                 summary = deploy_manager.run_manual_deploy(domain)
             except Exception as e:
                 logger.error(f"Manual deploy hook run failed for {domain}: {e}")
+                if audit_logger:
+                    actx = audit_context_from_request()
+                    audit_logger.log_operation(
+                        operation='deploy', resource_type='certificate',
+                        resource_id=domain, status='failure', error=str(e)[:500],
+                        details={'manual': True},
+                        user=actx.get('user'), ip_address=actx.get('ip'),
+                        actor=actx.get('actor'), trigger=actx.get('trigger'),
+                    )
                 return {'error': 'Manual deploy hook run failed'}, 500
+
+            if audit_logger:
+                actx = audit_context_from_request()
+                audit_logger.log_operation(
+                    operation='deploy', resource_type='certificate',
+                    resource_id=domain,
+                    status='success' if summary.get('ok') else 'failure',
+                    details={
+                        'manual': True,
+                        'total': summary.get('total'),
+                        'succeeded': summary.get('succeeded'),
+                        'failed': summary.get('failed'),
+                    },
+                    user=actx.get('user'), ip_address=actx.get('ip'),
+                    actor=actx.get('actor'), trigger=actx.get('trigger'),
+                )
 
             event_bus = current_app.config.get('EVENT_BUS')
             if event_bus:
@@ -1169,7 +2238,18 @@ def create_api_resources(api, models, managers):
         @api.expect(api.model('BackupCreateRequest', {
             'type': fields.String(required=True, enum=['unified', 'settings', 'certificates', 'both'],
                                   description='Type of backup to create (unified recommended for data consistency)'),
-            'reason': fields.String(description='Reason for backup creation', default='manual')
+            'reason': fields.String(description='Reason for backup creation', default='manual'),
+            'include_secrets': fields.Boolean(
+                description=(
+                    'Default false: every secret-bearing field is replaced '
+                    'with the mask sentinel in the resulting zip, so the '
+                    'file is safe to share. true: produces a plaintext '
+                    'snapshot for disaster-recovery restore; the resulting '
+                    'file on disk now contains every credential and a '
+                    'dedicated audit-log entry records the opt-in.'
+                ),
+                default=False,
+            ),
         }))
         @auth_manager.require_role('admin')
         def post(self):
@@ -1178,15 +2258,23 @@ def create_api_resources(api, models, managers):
                 data = api.payload
                 backup_type = data.get('type', 'unified')  # Default to unified
                 reason = data.get('reason', 'manual')
+                include_secrets = bool(data.get('include_secrets', False))
 
                 created_backups = []
 
                 # Only support unified backup (legacy removed)
                 settings = settings_manager.load_settings()
-                filename = file_ops.create_unified_backup(settings, reason)
+                filename = file_ops.create_unified_backup(
+                    settings, reason, include_secrets=include_secrets,
+                )
                 if filename:
                     created_backups.append({'type': 'unified', 'filename': filename})
-                    logger.info(f"Created unified backup: {filename}")
+                    # Log the secret-handling MODE name, not the boolean
+                    # `include_secrets` — CodeQL's clear-text-logging rule
+                    # flags any expression named "secrets" landing in a log
+                    # line, even when the value is a True/False flag.
+                    backup_mode = 'plaintext' if include_secrets else 'masked'
+                    logger.info(f"Created unified backup: {filename} (mode={backup_mode})")
 
                 if created_backups:
                     if audit_logger:
@@ -1196,14 +2284,24 @@ def create_api_resources(api, models, managers):
                             resource_type='backup',
                             resource_id=created_backups[0].get('filename', 'unknown'),
                             status='success',
-                            details={'type': 'unified', 'reason': reason},
+                            details={
+                                'type': 'unified',
+                                'reason': reason,
+                                # Pin the secret-handling mode on the
+                                # audit record so a SIEM can flag the
+                                # opt-in path (the resulting file on
+                                # disk is a credential dump).
+                                'include_secrets': include_secrets,
+                                'secrets_masked': not include_secrets,
+                            },
                             user=user.get('username'),
                             ip_address=request.remote_addr,
                         )
                     return {
                         'message': 'Backup created successfully',
                         'backups': created_backups,
-                        'recommendation': 'Use unified backup' if backup_type != 'unified' else None
+                        'secrets_masked': not include_secrets,
+                        'recommendation': 'Use unified backup' if backup_type != 'unified' else None,
                     }, 201
                 else:
                     return {'error': 'Failed to create backup'}, 500
@@ -1241,10 +2339,42 @@ def create_api_resources(api, models, managers):
                     return {'error': 'Account name and provider required'}, 400
 
                 if dns_manager.add_account(name, req_provider, config):
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='create_account',
+                            resource_type='dns_provider',
+                            resource_id=f"{req_provider}:{name}",
+                            status='success',
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
                     return {'success': True, 'message': 'Account created', 'id': name}, 200
+
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='create_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{req_provider}:{name}" if req_provider and name else 'unknown',
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return {'error': 'Failed to add account'}, 500
             except Exception as e:
                 logger.error(f"Error adding DNS account: {e}")
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='create_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{req_provider}:{name}" if 'req_provider' in locals() and 'name' in locals() else 'unknown',
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                        error=str(e)
+                    )
                 return {'error': str(e)}, 500
 
     class DNSAccountDetail(Resource):
@@ -1271,10 +2401,45 @@ def create_api_resources(api, models, managers):
                 if dns_manager.add_account(account_id, provider, merged):
                     if set_as_default:
                         dns_manager.set_default_account(provider, account_id)
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='update_account',
+                            resource_type='dns_provider',
+                            resource_id=f"{provider}:{account_id}",
+                            status='success',
+                            details={
+                                'set_as_default': set_as_default
+                            },
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
                     return {'success': True, 'message': 'Account updated'}
+
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='update_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{provider}:{account_id}",
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return {'error': 'Failed to update account'}, 500
             except Exception as e:
                 logger.error(f"Error updating DNS account: {e}")
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='update_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{provider}:{account_id}",
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                        error=str(e)
+                    )
                 return {'error': str(e)}, 500
 
         @api.doc(security='Bearer')
@@ -1283,10 +2448,42 @@ def create_api_resources(api, models, managers):
             """Delete a DNS provider account"""
             try:
                 if dns_manager.delete_account(provider, account_id):
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='delete_account',
+                            resource_type='dns_provider',
+                            resource_id=f"{provider}:{account_id}",
+                            status='success',
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
                     return {'success': True, 'message': 'Account deleted'}
+
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='delete_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{provider}:{account_id}",
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return {'error': 'Failed to delete account'}, 500
             except Exception as e:
                 logger.error(f"Error deleting DNS account: {e}")
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='delete_account',
+                        resource_type='dns_provider',
+                        resource_id=f"{provider}:{account_id}",
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                        error=str(e)
+                    )
                 return {'error': str(e)}, 500
 
     class BackupDownload(Resource):
@@ -1309,7 +2506,35 @@ def create_api_resources(api, models, managers):
 
                 # Security check
                 if not str(backup_path.resolve()).startswith(str(Path(file_ops.backup_dir).resolve())):
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='download',
+                            resource_type='backup',
+                            resource_id=filename,
+                            status='denied',
+                            details={
+                                'backup_type': backup_type,
+                                'reason': 'Path traversal attempt'
+                            },
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
                     return {'error': 'Access denied'}, 403
+
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='download',
+                        resource_type='backup',
+                        resource_id=filename,
+                        status='success',
+                        details={
+                            'backup_type': backup_type
+                        },
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
 
                 return send_file(
                     str(backup_path.resolve()),
@@ -1416,7 +2641,7 @@ def create_api_resources(api, models, managers):
             try:
                 file_ops_manager = managers.get('file_ops')
                 if not file_ops_manager:
-                    return {'error': 'File operations manager not available'}, 500
+                    return {'error': 'File operations manager not available'}, 503
 
                 if backup_type != 'unified':
                     return {'error': 'Only unified backup deletion is supported'}, 400
@@ -1469,7 +2694,7 @@ def create_api_resources(api, models, managers):
             try:
                 storage_manager = managers.get('storage')
                 if not storage_manager:
-                    return {'error': 'Storage manager not available'}, 500
+                    return {'error': 'Storage manager not available'}, 503
 
                 backend_name = storage_manager.get_backend_name()
                 settings = settings_manager.load_settings()
@@ -1482,7 +2707,8 @@ def create_api_resources(api, models, managers):
                         'azure_keyvault',
                         'aws_secrets_manager',
                         'hashicorp_vault',
-                        'infisical'
+                        'infisical',
+                        's3_compatible'
                     ],
                     'configuration': {
                         'backend': storage_config.get('backend', 'local_filesystem'),
@@ -1504,41 +2730,92 @@ def create_api_resources(api, models, managers):
                 backend_type = data.get('backend')
                 valid_backends = [
                     'local_filesystem', 'azure_keyvault', 'aws_secrets_manager',
-                    'hashicorp_vault', 'infisical'
+                    'hashicorp_vault', 'infisical', 's3_compatible'
                 ]
                 if backend_type not in valid_backends:
                     return {'error': 'Invalid backend type'}, 400
 
-                # Build only the storage subtree and merge atomically so we
-                # don't race with concurrent writes or wipe other settings keys.
-                current = settings_manager.load_settings()
-                storage = dict(current.get('certificate_storage') or {})
-                storage['backend'] = backend_type
-
+                # Build only the storage subtree to merge atomically.
+                # Audit C2 (May 2026): the prior version wholesale-set
+                # the per-backend dict (e.g. `storage['azure_keyvault']
+                # = data.get('azure_keyvault', {})`). When the UI POSTs
+                # the round-trip from GET /api/web/settings, the masked
+                # sentinel `'********'` rides inside that dict and the
+                # deep-merge propagates it down to the leaf — overwriting
+                # the on-disk credential with the literal sentinel. The
+                # fix is the same shape PR #215 applied to the settings
+                # POST path: strip the sentinel BEFORE the merge so any
+                # masked / empty secret field falls back to its on-disk
+                # value, only genuinely-changed values overwrite.
+                from ..core.settings import _strip_masked_values
+                storage_update = {'backend': backend_type}
                 if backend_type == 'local_filesystem':
-                    storage['cert_dir'] = data.get('cert_dir', 'certificates')
+                    storage_update['cert_dir'] = data.get('cert_dir', 'certificates')
                 elif backend_type == 'azure_keyvault':
-                    storage['azure_keyvault'] = data.get('azure_keyvault', {})
+                    storage_update['azure_keyvault'] = data.get('azure_keyvault', {})
                 elif backend_type == 'aws_secrets_manager':
-                    storage['aws_secrets_manager'] = data.get('aws_secrets_manager', {})
+                    storage_update['aws_secrets_manager'] = data.get('aws_secrets_manager', {})
                 elif backend_type == 'hashicorp_vault':
-                    storage['hashicorp_vault'] = data.get('hashicorp_vault', {})
+                    storage_update['hashicorp_vault'] = data.get('hashicorp_vault', {})
                 elif backend_type == 'infisical':
-                    storage['infisical'] = data.get('infisical', {})
+                    storage_update['infisical'] = data.get('infisical', {})
+                elif backend_type == 's3_compatible':
+                    storage_update['s3_compatible'] = data.get('s3_compatible', {})
 
-                success = settings_manager.atomic_update({'certificate_storage': storage})
+                clean_payload = _strip_masked_values({'certificate_storage': storage_update})
+                success = settings_manager.atomic_update(clean_payload)
 
                 if success:
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='update_config',
+                            resource_type='storage_backend',
+                            resource_id=backend_type,
+                            status='success',
+                            details={
+                                'backend_type': backend_type
+                            },
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
                     return {
                         'success': True,
                         'message': f'Storage backend updated to {backend_type}',
                         'backend': backend_type
                     }
                 else:
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='update_config',
+                            resource_type='storage_backend',
+                            resource_id=backend_type,
+                            status='failure',
+                            details={
+                                'backend_type': backend_type,
+                                'reason': 'Atomic update failed'
+                            },
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
                     return {'error': 'Failed to save storage configuration'}, 500
 
             except Exception as e:
                 logger.error(f"Error updating storage backend config: {e}")
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='update_config',
+                        resource_type='storage_backend',
+                        resource_id=backend_type if 'backend_type' in locals() else 'unknown',
+                        status='failure',
+                        details={
+                            'error': str(e)
+                        },
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
                 return {'error': 'Failed to update storage backend configuration'}, 500
 
     class StorageBackendTest(Resource):
@@ -1556,7 +2833,7 @@ def create_api_resources(api, models, managers):
                 from ..core.storage_backends import (
                     LocalFileSystemBackend, AzureKeyVaultBackend,
                     AWSSecretsManagerBackend, HashiCorpVaultBackend,
-                    InfisicalBackend
+                    InfisicalBackend, S3CompatibleBackend
                 )
 
                 # Test connection based on backend type
@@ -1576,11 +2853,22 @@ def create_api_resources(api, models, managers):
                     elif backend_type == 'infisical':
                         test_backend = InfisicalBackend(config)
 
+                    elif backend_type == 's3_compatible':
+                        test_backend = S3CompatibleBackend(config)
+
                     else:
                         return {'error': 'Invalid backend type'}, 400
 
                     # Test by trying to list certificates (should not fail for auth issues)
                     domains = test_backend.list_certificates()
+
+                    # When the Azure Key Vault backend is configured to write
+                    # Certificate objects, the Service Principal also needs
+                    # access to the Certificate API. list_certificates above
+                    # already covers the secrets surface, so probe certificates
+                    # explicitly here to surface permission gaps before save.
+                    if backend_type == 'azure_keyvault' and getattr(test_backend, 'writes_certificate', False):
+                        test_backend.verify_certificate_api_access()
 
                     return {
                         'success': True,
@@ -1590,10 +2878,14 @@ def create_api_resources(api, models, managers):
                     }
 
                 except Exception as test_error:
+                    # Log the full exception for operator triage (includes any
+                    # tenant IDs, request IDs and SDK error codes) but only
+                    # return the exception type to the client to avoid leaking
+                    # those identifiers to anyone who can hit the test endpoint.
                     logger.error(f"Storage backend connection test failed: {test_error}")
                     return {
                         'success': False,
-                        'message': 'Connection test failed',
+                        'message': f'Connection test failed ({type(test_error).__name__}). See server logs for details.',
                         'backend': backend_type
                     }
 
@@ -1615,13 +2907,13 @@ def create_api_resources(api, models, managers):
                 # Import CA manager
                 ca_manager = managers.get('ca')
                 if not ca_manager:
-                    return {'error': 'CA manager not available'}, 500
+                    return {'error': 'CA manager not available'}, 503
 
                 # Test connection based on CA provider type
                 try:
-                    if ca_provider == 'letsencrypt':
-                        # Test Let's Encrypt connection
-                        environment = config.get('environment', 'production')
+                    if ca_provider in ('letsencrypt', 'letsencrypt_staging'):
+                        # Email-only validation; the directory is pinned per
+                        # entry in CAManager (staging is its own CA since #279).
                         email = config.get('email', '')
 
                         if not email:
@@ -1631,21 +2923,20 @@ def create_api_resources(api, models, managers):
                                 'ca_provider': ca_provider
                             }
 
-                        # Test by getting the directory URL
-                        directory_url = ca_manager._get_letsencrypt_directory_url(environment)
-
+                        provider_name = ca_manager.ca_providers[ca_provider]['name']
                         return {
                             'success': True,
-                            'message': f'Let\'s Encrypt {environment} endpoint is accessible',
+                            'message': f'{provider_name} configuration appears valid',
                             'ca_provider': ca_provider,
-                            'directory_url': directory_url
+                            'directory_url': ca_manager.ca_providers[ca_provider]['production_url']
                         }
 
                     elif ca_provider == 'digicert':
-                        # Test DigiCert ACME connection
+                        # Test DigiCert ACME connection. Accept both EAB
+                        # field spellings, like the generic branch below.
                         acme_url = config.get('acme_url', '')
-                        eab_kid = config.get('eab_kid', '')
-                        eab_hmac = config.get('eab_hmac', '')
+                        eab_kid = config.get('eab_kid') or config.get('eab_key_id', '')
+                        eab_hmac = config.get('eab_hmac') or config.get('eab_hmac_key', '')
                         email = config.get('email', '')
 
                         if not acme_url:
@@ -1682,6 +2973,38 @@ def create_api_resources(api, models, managers):
                             'message': 'DigiCert configuration appears valid',
                             'ca_provider': ca_provider,
                             'acme_url': acme_url
+                        }
+
+                    elif ca_provider in ('zerossl', 'google', 'sslcom', 'actalis'):
+                        # Fixed-directory EAB CAs share one shape: the ACME
+                        # URL is pinned in CAManager, so the test validates
+                        # EAB credentials + email. Accept both field
+                        # spellings (the settings form posts eab_kid/eab_hmac
+                        # for DigiCert but eab_key_id/eab_hmac_key here).
+                        provider_name = ca_manager.ca_providers[ca_provider]['name']
+                        eab_kid = config.get('eab_kid') or config.get('eab_key_id', '')
+                        eab_hmac = config.get('eab_hmac') or config.get('eab_hmac_key', '')
+                        email = config.get('email', '')
+
+                        if not eab_kid or not eab_hmac:
+                            return {
+                                'success': False,
+                                'message': f'EAB credentials (Key ID and HMAC Key) are required for {provider_name}',
+                                'ca_provider': ca_provider
+                            }
+
+                        if not email:
+                            return {
+                                'success': False,
+                                'message': f'Email is required for {provider_name}',
+                                'ca_provider': ca_provider
+                            }
+
+                        return {
+                            'success': True,
+                            'message': f'{provider_name} configuration appears valid',
+                            'ca_provider': ca_provider,
+                            'acme_url': ca_manager.ca_providers[ca_provider]['production_url']
                         }
 
                     elif ca_provider == 'private_ca':
@@ -1817,7 +3140,7 @@ def create_api_resources(api, models, managers):
                             logger.error(f"CA provider connection test failed: {conn_error}")
                             return {
                                 'success': False,
-                                'message': f'Connection test failed: {conn_error}',
+                                'message': f'Connection test failed ({type(conn_error).__name__}). See server logs for details.',
                                 'ca_provider': ca_provider
                             }
                         finally:
@@ -1842,82 +3165,282 @@ def create_api_resources(api, models, managers):
 
             except Exception as e:
                 logger.error(f"Error testing CA provider: {e}")
-                return {'success': False, 'message': str(e)}, 500
+                return {'success': False, 'message': f'CA provider test failed ({type(e).__name__}). See server logs for details.'}, 500
 
     class StorageBackendMigrate(Resource):
         @api.doc(security='Bearer')
         @auth_manager.require_role('admin')
         @api.expect(models['storage_migration_config_model'])
         def post(self):
-            """Migrate certificates between storage backends"""
-            try:
-                data = api.payload
-                source_backend_type = data.get('source_backend')
-                target_backend_type = data.get('target_backend')
-                source_config = data.get('source_config', {})
-                target_config = data.get('target_config', {})
+            """Migrate certificates between storage backends.
 
-                # Import storage backends
-                from ..core.storage_backends import (
-                    LocalFileSystemBackend, AzureKeyVaultBackend,
-                    AWSSecretsManagerBackend, HashiCorpVaultBackend,
-                    InfisicalBackend
+            Payload is forgiving on purpose: the UI's "Start Migration"
+            button has no way to remember the previously-active backend
+            (the dropdown already shows the user's new target choice),
+            so we accept either the explicit four-field form
+            (``source_backend`` + ``source_config`` + ``target_backend`` +
+            ``target_config``) or a minimal payload where source defaults
+            to the currently-saved ``certificate_storage`` and the target
+            comes in as the structured ``{backend, <backend>: {...}}`` blob
+            the settings form already produces.
+            """
+            from ..core.storage_backends import (
+                LocalFileSystemBackend, AzureKeyVaultBackend,
+                AWSSecretsManagerBackend, HashiCorpVaultBackend,
+                InfisicalBackend, S3CompatibleBackend
+            )
+
+            backend_classes = {
+                'local_filesystem': LocalFileSystemBackend,
+                'azure_keyvault': AzureKeyVaultBackend,
+                'aws_secrets_manager': AWSSecretsManagerBackend,
+                'hashicorp_vault': HashiCorpVaultBackend,
+                'infisical': InfisicalBackend,
+                's3_compatible': S3CompatibleBackend,
+            }
+
+            def _resolve_config(backend_type, raw):
+                """Pull the per-backend sub-config out of either a flat dict
+                (already the right shape) or the structured envelope the
+                settings form emits (``{backend, <backend>: {...}}``)."""
+                if not isinstance(raw, dict):
+                    return {}
+                if backend_type in raw and isinstance(raw[backend_type], dict):
+                    return raw[backend_type]
+                # local_filesystem stores ``cert_dir`` at the top level both
+                # in settings and in the form payload, so the envelope and
+                # the flat form are indistinguishable — return as-is.
+                return {k: v for k, v in raw.items() if k != 'backend'}
+
+            def _build_backend(backend_type, config):
+                if backend_type == 'local_filesystem':
+                    return LocalFileSystemBackend(
+                        Path(config.get('cert_dir', 'certificates')))
+                return backend_classes[backend_type](config)
+
+            try:
+                data = api.payload or {}
+                target_raw = data.get('target_config') or {}
+                source_raw = data.get('source_config') or {}
+
+                # Source defaults to the currently-active backend if the
+                # caller didn't pass one — that's the dominant UI path.
+                source_backend_type = data.get('source_backend')
+                if not source_backend_type or not source_raw:
+                    current = settings_manager.load_settings() or {}
+                    current_storage = current.get('certificate_storage') or {}
+                    if not source_backend_type:
+                        source_backend_type = current_storage.get(
+                            'backend', 'local_filesystem')
+                    if not source_raw:
+                        source_raw = current_storage
+
+                # Target backend may be passed explicitly or inferred from
+                # the envelope produced by collectStorageBackendSettings().
+                target_backend_type = (
+                    data.get('target_backend')
+                    or (target_raw.get('backend') if isinstance(target_raw, dict) else None)
                 )
 
-                # Create backend instances
-                backend_classes = {
-                    'local_filesystem': LocalFileSystemBackend,
-                    'azure_keyvault': AzureKeyVaultBackend,
-                    'aws_secrets_manager': AWSSecretsManagerBackend,
-                    'hashicorp_vault': HashiCorpVaultBackend,
-                    'infisical': InfisicalBackend
-                }
+                if source_backend_type not in backend_classes:
+                    return {'error': 'Invalid source backend type'}, 400
+                if target_backend_type not in backend_classes:
+                    return {'error': 'Invalid target backend type'}, 400
 
-                if source_backend_type not in backend_classes or target_backend_type not in backend_classes:
-                    return {'error': 'Invalid backend type'}, 400
+                source_config = _resolve_config(source_backend_type, source_raw)
+                target_config = _resolve_config(target_backend_type, target_raw)
 
                 try:
-                    # Initialize backends
-                    if source_backend_type == 'local_filesystem':
-                        source_backend = LocalFileSystemBackend(Path(source_config.get('cert_dir', 'certificates')))
-                    else:
-                        source_backend = backend_classes[source_backend_type](source_config)
+                    source_backend = _build_backend(source_backend_type, source_config)
+                    target_backend = _build_backend(target_backend_type, target_config)
 
-                    if target_backend_type == 'local_filesystem':
-                        target_backend = LocalFileSystemBackend(Path(target_config.get('cert_dir', 'certificates')))
-                    else:
-                        target_backend = backend_classes[target_backend_type](target_config)
-
-                    # Perform migration using storage manager
                     storage_manager = managers.get('storage')
                     if not storage_manager:
-                        return {'error': 'Storage manager not available'}, 500
+                        return {'error': 'Storage manager not available'}, 503
 
-                    migration_results = storage_manager.migrate_certificates(source_backend, target_backend)
+                    migration_results = storage_manager.migrate_certificates(
+                        source_backend, target_backend)
 
-                    successful = sum(1 for success in migration_results.values() if success)
+                    successful = sum(1 for ok in migration_results.values() if ok)
                     total = len(migration_results)
+                    failed = total - successful
+
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='migrate',
+                            resource_type='storage',
+                            resource_id=f"{source_backend_type}_to_{target_backend_type}",
+                            status='success',
+                            details={
+                                'source_backend': source_backend_type,
+                                'target_backend': target_backend_type,
+                                'total_certificates': total,
+                                'successful': successful,
+                                'failed': failed
+                            },
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                        )
 
                     return {
                         'success': True,
                         'message': f'Migration completed: {successful}/{total} certificates migrated',
+                        # migrated_count is the field the UI reads — keep it
+                        # alongside migration_results for older API callers.
+                        'migrated_count': successful,
+                        'failed_count': failed,
+                        'total': total,
                         'migration_results': migration_results,
                         'source_backend': source_backend_type,
-                        'target_backend': target_backend_type
+                        'target_backend': target_backend_type,
                     }
 
                 except Exception as migration_error:
                     logger.error(f"Storage migration failed: {migration_error}")
+                    if audit_logger:
+                        user = getattr(request, 'current_user', None) or {}
+                        audit_logger.log_operation(
+                            operation='migrate',
+                            resource_type='storage',
+                            resource_id=f"{source_backend_type}_to_{target_backend_type}",
+                            status='failure',
+                            details={
+                                'source_backend': source_backend_type,
+                                'target_backend': target_backend_type,
+                            },
+                            user=user.get('username'),
+                            ip_address=request.remote_addr,
+                            error=str(migration_error)
+                        )
                     return {
                         'success': False,
-                        'message': 'Migration failed',
+                        'message': f'Migration failed ({type(migration_error).__name__}). See server logs for details.',
                         'source_backend': source_backend_type,
-                        'target_backend': target_backend_type
-                    }
+                        'target_backend': target_backend_type,
+                    }, 500
 
             except Exception as e:
                 logger.error(f"Error during storage migration: {e}")
                 return {'error': 'Failed to perform storage migration'}, 500
+
+    class StorageAzureKeyVaultBackfill(Resource):
+        @api.doc(security='Bearer')
+        @auth_manager.require_role('admin')
+        def post(self):
+            """Backfill native Certificate objects for domains already stored as Secrets.
+
+            Only valid when the active backend is azure_keyvault and its
+            ``storage_mode`` is ``both``. In ``both`` mode ``list_certificates``
+            walks the Secrets surface as well as the Certificate surface, so
+            legacy domains stored only as Secrets are visible to the loop and
+            get an imported Certificate object on first run. In ``certificate``
+            mode the Secrets surface is invisible and the walk would silently
+            no-op, so the operator must switch to ``both`` first.
+
+            Accepts an optional ``?limit=N`` query parameter that caps how
+            many domains are processed in a single call. Large vaults can
+            paginate by calling repeatedly until ``remaining`` is ``0`` —
+            each call is independent because already-imported domains are
+            reported as ``skipped`` on subsequent runs.
+            """
+            try:
+                storage_manager = managers.get('storage')
+                if not storage_manager:
+                    return {'error': 'Storage manager not available'}, 503
+
+                backend = storage_manager.get_backend()
+                if backend.get_backend_name() != 'azure_keyvault':
+                    return {'error': 'Backfill is only available for the Azure Key Vault backend'}, 400
+                current_mode = getattr(backend, 'storage_mode', None)
+                if current_mode != 'both':
+                    return {
+                        'error': (
+                            "Backfill requires storage_mode='both' so the legacy Secrets are "
+                            "still listed. Active mode is '{}' — switch to 'both', run the "
+                            "backfill, and then optionally switch to 'certificate'."
+                        ).format(current_mode or 'unknown')
+                    }, 400
+
+                limit_raw = request.args.get('limit')
+                limit = None
+                if limit_raw is not None:
+                    try:
+                        limit = int(limit_raw)
+                    except (TypeError, ValueError):
+                        return {'error': "Query parameter 'limit' must be a positive integer"}, 400
+                    if limit < 1:
+                        return {'error': "Query parameter 'limit' must be a positive integer"}, 400
+
+                results = {}
+                all_domains = list(backend.list_certificates())
+                processed = 0
+                for domain in all_domains:
+                    if limit is not None and processed >= limit:
+                        break
+                    processed += 1
+                    try:
+                        if backend.has_certificate_object(domain):
+                            results[domain] = 'skipped'
+                            continue
+                        retrieved = backend.retrieve_certificate(domain)
+                        if not retrieved:
+                            results[domain] = 'error: no certificate data found'
+                            continue
+                        cert_files, metadata = retrieved
+                        if backend.import_certificate_object(domain, cert_files, metadata):
+                            results[domain] = 'imported'
+                        else:
+                            results[domain] = 'error: import returned false'
+                    except Exception as per_domain:
+                        logger.error(f"Backfill failed for {domain}: {per_domain}")
+                        results[domain] = f'error: {type(per_domain).__name__}'
+
+                imported = sum(1 for v in results.values() if v == 'imported')
+                skipped = sum(1 for v in results.values() if v == 'skipped')
+                errors = sum(1 for v in results.values() if v.startswith('error'))
+                remaining = max(0, len(all_domains) - processed)
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='backfill',
+                        resource_type='storage_azure_keyvault',
+                        resource_id='certificates',
+                        status='success' if errors == 0 else 'failure',
+                        details={
+                            'imported': imported,
+                            'skipped': skipped,
+                            'errors': errors,
+                            'remaining': remaining
+                        },
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                    )
+
+                return {
+                    'success': errors == 0,
+                    'message': f'Backfill complete: {imported} imported, {skipped} skipped, {errors} errors',
+                    'imported': imported,
+                    'skipped': skipped,
+                    'errors': errors,
+                    'remaining': remaining,
+                    'results': results,
+                }
+
+            except Exception as e:
+                logger.error(f"Error during Azure Key Vault Certificate backfill: {e}")
+                if audit_logger:
+                    user = getattr(request, 'current_user', None) or {}
+                    audit_logger.log_operation(
+                        operation='backfill',
+                        resource_type='storage_azure_keyvault',
+                        resource_id='certificates',
+                        status='failure',
+                        user=user.get('username'),
+                        ip_address=request.remote_addr,
+                        error=str(e)
+                    )
+                return {'error': 'Failed to backfill Certificate objects'}, 500
 
     # Register storage backend endpoints
     storage_ns = api.namespace('storage', description='Storage Backend Operations')
@@ -1925,6 +3448,7 @@ def create_api_resources(api, models, managers):
     storage_ns.add_resource(StorageBackendConfig, '/config')
     storage_ns.add_resource(StorageBackendTest, '/test')
     storage_ns.add_resource(StorageBackendMigrate, '/migrate')
+    storage_ns.add_resource(StorageAzureKeyVaultBackfill, '/azure-keyvault/backfill-certificates')
 
     # Register DNS management endpoints
     dns_ns = api.namespace('dns', description='DNS Provider Account Management')
@@ -1943,11 +3467,17 @@ def create_api_resources(api, models, managers):
         'CacheClear': CacheClear,
         'CertificateList': CertificateList,
         'CreateCertificate': CreateCertificate,
+        'ZombieScan': ZombieScan,
         'CheckDNSAlias': CheckDNSAlias,
         'CertificateDNSAliasCheck': CertificateDNSAliasCheck,
         'CertificateDetail': CertificateDetail,
+        'CertificateDeploymentStatus': CertificateDeploymentStatus,
+        'CertificateDeploymentBrowserReports': CertificateDeploymentBrowserReports,
         'DownloadCertificate': DownloadCertificate,
+        'DownloadCertificateFile': DownloadCertificateFile,
         'RenewCertificate': RenewCertificate,
+        'CertificateReissue': CertificateReissue,
+        'CertificateJob': CertificateJob,
         'CertificateAutoRenew': CertificateAutoRenew,
         'CertificateRunDeploy': CertificateRunDeploy,
         'BackupList': BackupList,

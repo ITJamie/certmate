@@ -136,13 +136,25 @@ class DeployManager:
         hook_name = hook.get('name', 'unnamed')
         command = hook.get('command', '')
         logger.info("Running deploy hook '%s' for %s: %s", hook_name, domain, command[:120])
-        timeout = min(max(hook.get('timeout', DEFAULT_TIMEOUT), 1), MAX_TIMEOUT)
+        # Coerce to int defensively: save_config (line ~473) already does this
+        # on the write path, but a hand-edited settings.json or a hook coming
+        # from an older config schema could carry a string. max(str, 1) raises
+        # TypeError in Python 3, which would crash the renewal worker.
+        try:
+            raw_timeout = int(hook.get('timeout', DEFAULT_TIMEOUT))
+        except (TypeError, ValueError):
+            raw_timeout = DEFAULT_TIMEOUT
+        timeout = min(max(raw_timeout, 1), MAX_TIMEOUT)
 
         deploy_env = os.environ.copy()
         deploy_env['CERTMATE_DOMAIN'] = domain
         deploy_env['CERTMATE_CERT_PATH'] = str(self.cert_dir / domain / 'cert.pem')
         deploy_env['CERTMATE_KEY_PATH'] = str(self.cert_dir / domain / 'privkey.pem')
         deploy_env['CERTMATE_FULLCHAIN_PATH'] = str(self.cert_dir / domain / 'fullchain.pem')
+        # Intermediate chain on its own — some targets reject a chained cert
+        # (fullchain) and want the leaf and intermediates as separate files
+        # (issue #232).
+        deploy_env['CERTMATE_CHAIN_PATH'] = str(self.cert_dir / domain / 'chain.pem')
         deploy_env['CERTMATE_EVENT'] = event_type
         if dry_run:
             deploy_env['CERTMATE_DRY_RUN'] = '1'
@@ -189,7 +201,11 @@ class DeployManager:
             result['stderr'] = (proc.stderr or '')[:4096]
             result['success'] = proc.returncode == 0
             if proc.returncode != 0:
-                result['error'] = f"exit code {proc.returncode}"
+                stderr_snippet = (proc.stderr or '').strip()[:200]
+                if stderr_snippet:
+                    result['error'] = f"exit code {proc.returncode}: {stderr_snippet}"
+                else:
+                    result['error'] = f"exit code {proc.returncode}"
         except subprocess.TimeoutExpired:
             result['error'] = f"timeout after {timeout}s"
         except Exception as e:
@@ -209,6 +225,8 @@ class DeployManager:
                 'exit_code': result['exit_code'],
                 'duration_ms': result['duration_ms'],
                 'dry_run': dry_run,
+                'stdout': result.get('stdout') or '',
+                'stderr': result.get('stderr') or '',
             },
             error=result.get('error'),
         )
@@ -220,6 +238,21 @@ class DeployManager:
             'success': result['success'],
             'duration_ms': result['duration_ms'],
         })
+
+        # A failed deploy hook is the "silent deploy" trap: create/renew has
+        # already returned success and the operator sees green, but the service
+        # may still be serving the OLD certificate. Publish a dedicated failure
+        # event so the notifier actively alerts (email/webhook/etc.) instead of
+        # leaving the only trace in logs, the audit trail, and deploy_history.
+        # Skipped for dry runs, which are expected to "not deploy".
+        if not result['success'] and not dry_run:
+            self.event_bus.publish('deploy_hook_failed', {
+                'hook_id': hook_id,
+                'hook_name': hook_name,
+                'domain': domain,
+                'exit_code': result['exit_code'],
+                'error': result.get('error'),
+            })
 
         self._log_history(result)
         return result
@@ -236,7 +269,17 @@ class DeployManager:
                 f.write(json.dumps(result) + '\n')
             self._truncate_history()
         except OSError as e:
-            logger.debug(f"Failed to write deploy history: {e}")
+            # Surface write failures at warning level so the "history is
+            # empty even after a manual trigger" symptom (#165) is
+            # diagnosable from production logs. The typical cause on
+            # Kubernetes is a PersistentVolume mounted with an owner
+            # uid that doesn't match the certmate user (uid 1000) in
+            # the container image.
+            logger.warning(
+                "Failed to write deploy history to %s: %s. "
+                "Check that the data volume is writable by uid 1000.",
+                self._history_path, e,
+            )
 
     def _truncate_history(self):
         """Keep only the last MAX_HISTORY_ENTRIES entries (atomic)."""
@@ -256,14 +299,15 @@ class DeployManager:
                 with os.fdopen(tmp_fd, 'w') as f:
                     f.writelines(tail)
                 os.replace(tmp_path, str(self._history_path))
-            except Exception:
+            except Exception as e:
+                logger.warning("Deploy history truncation failed: %s", e)
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
                 raise
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning("Deploy history truncation failed (OS error): %s", e)
 
     def get_history(self, limit=50, domain=None):
         """Read recent deploy history entries, newest first.
@@ -291,15 +335,28 @@ class DeployManager:
                 raw = raw.strip()
                 if not raw:
                     continue
-                entry = json.loads(raw)
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    # A single corrupted line should not blank the whole
+                    # history pane. Skip it and carry on with the rest.
+                    logger.debug(
+                        "Skipping corrupted deploy history line in %s",
+                        self._history_path,
+                    )
+                    continue
                 if domain and entry.get('domain') != domain:
                     continue
                 entries.append(entry)
                 if len(entries) >= limit:
                     break
             return entries
-        except (OSError, json.JSONDecodeError) as e:
-            logger.debug(f"Failed to read deploy history: {e}")
+        except OSError as e:
+            logger.warning(
+                "Failed to read deploy history from %s: %s. "
+                "Check filesystem permissions on the data volume.",
+                self._history_path, e,
+            )
             return []
 
     # ------------------------------------------------------------------
@@ -375,8 +432,23 @@ class DeployManager:
         # Strip out whitelisted env var references before applying the
         # dangerous-pattern check. CertMate injects these into the hook
         # environment (see _run_hook), so they're safe to reference.
-        # Both $CERTMATE_FOO and ${CERTMATE_FOO} forms are allowed.
-        _safe_vars = re.compile(r'\$\{?CERTMATE_[A-Z_]+\}?')
+        # Two exact forms are allowed:
+        #   $CERTMATE_FOO        (no braces)
+        #   ${CERTMATE_FOO}      (braces with name and immediate close)
+        # The previous regex `\$\{?CERTMATE_[A-Z_]+\}?` accepted partial
+        # brace forms — `${CERTMATE_FOO` (no close) and `${CERTMATE_FOO}`
+        # were both matched — which let an attacker smuggle bash parameter
+        # expansion operators past the validator:
+        #   ${CERTMATE_FOO:-/etc/passwd}    -> opens any path at runtime
+        #   ${CERTMATE_FOO:+anything}       -> conditional substitution
+        #   ${CERTMATE_FOO//a/b}            -> in-string substitution
+        # All three matched the old safe_vars (stripping `${CERTMATE_FOO`)
+        # and left only `:-/etc/passwd}` etc., which contains no metachar
+        # the dangerous regex catches. By requiring the closing brace
+        # IMMEDIATELY after the variable name, none of these forms are
+        # ever substituted; the dangerous-shell rule `\$\{` then catches
+        # them and the command is rejected.
+        _safe_vars = re.compile(r'\$CERTMATE_[A-Z_]+|\$\{CERTMATE_[A-Z_]+\}')
         sanitized = _safe_vars.sub('__SAFE__', command)
 
         # Block shell metacharacters that enable code injection.

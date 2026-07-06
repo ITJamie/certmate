@@ -5,6 +5,7 @@ Supports both API token and local username/password authentication
 """
 
 import logging
+import os
 import secrets
 import hashlib
 import hmac
@@ -26,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 ROLE_HIERARCHY = {'viewer': 0, 'operator': 1, 'admin': 2}
 
+# Distinct from None/False so the operator-bearer-token detection can be
+# memoised (env/file are fixed for the process lifetime) without a False
+# result being mistaken for "not computed yet".
+_UNSET = object()
+
 
 class AuthManager:
     """Class to handle authentication and authorization"""
@@ -36,6 +42,12 @@ class AuthManager:
         self._session_lock = threading.Lock()  # Thread-safe session access
         self._hmac_key = None  # Set by set_hmac_key() after app init
         self._audit_logger = None  # Set by set_audit_logger() after AuditLogger constructed
+        # Debounce API-key last_used_at persistence. Rewriting the whole
+        # settings.json under the global lock on EVERY authenticated API
+        # request was a hot-path write amplifier; track the last persist time
+        # per key and skip the write within the configured interval.
+        self._last_used_persist_ts = {}
+        self._last_used_lock = threading.Lock()
         import os
         _timeout_hours = int(os.getenv('SESSION_TIMEOUT_HOURS', '8'))
         self._session_timeout = max(1, _timeout_hours) * 60 * 60
@@ -176,6 +188,10 @@ class AuthManager:
           an exact domain ("example.com") matched case-insensitively, or a
           wildcard "*.example.com" that matches any single-level subdomain
           ("foo.example.com" ✓, "a.b.example.com" ✓, "example.com" ✗).
+        - A wildcard *request* ("*.example.com") is authorized only by an
+          identical wildcard scope entry; an apex scope ("example.com") does
+          NOT cover it, because the wildcard cert is strictly broader (valid
+          for every subdomain).
         """
         if allowed_domains is None:
             return True
@@ -183,7 +199,16 @@ class AuthManager:
             return False
         if not isinstance(domain, str) or not domain:
             return False
-        d = domain.strip().lower().lstrip('*.')
+        d = domain.strip().lower()
+        # A wildcard REQUEST ("*.example.com") is a distinct, broader resource
+        # than the apex: the issued cert is valid for every subdomain. It must
+        # therefore be authorized only by an identical wildcard scope entry —
+        # an apex scope of "example.com" does NOT imply it. (The previous
+        # `lstrip('*.')` stripped a character SET, collapsing "*.example.com"
+        # to "example.com", so an apex-scoped key could mint the wildcard
+        # cert — a scope-boundary privilege escalation.)
+        if d.startswith('*.'):
+            return any(pattern.strip().lower() == d for pattern in allowed_domains)
         for pattern in allowed_domains:
             p = pattern.strip().lower()
             if p.startswith('*.'):
@@ -252,7 +277,7 @@ class AuthManager:
         return False
 
     def create_api_key(self, name, role='viewer', expires_at=None, created_by=None,
-                       allowed_domains=None):
+                       allowed_domains=None, is_agent=False):
         """Create a new scoped API key.
 
         Args:
@@ -265,6 +290,11 @@ class AuthManager:
                 behavior). Empty list = locked-out key (creatable for
                 staging). See AuthManager.domain_matches_scope() for the
                 matching semantics.
+            is_agent: mark this key as belonging to an AI/MCP agent. Actions
+                authenticated with the key are then attributed in the audit
+                trail with ``actor.kind='agent'`` (vs ``api_token``). Point the
+                MCP server at a dedicated agent-flagged key so the audit trail
+                can distinguish an agent from a human operator.
 
         Returns:
             tuple: (success, result_dict_or_error_string)
@@ -302,6 +332,7 @@ class AuthManager:
                 'last_used_at': None,
                 'revoked': False,
                 'allowed_domains': scoped_domains,
+                'is_agent': bool(is_agent),
             }
 
             if self._save_api_keys(api_keys):
@@ -318,6 +349,7 @@ class AuthManager:
                     'created_at': api_keys[key_id]['created_at'],
                     'expires_at': expires_at,
                     'allowed_domains': scoped_domains,
+                    'is_agent': bool(is_agent),
                 }
             return False, "Failed to save API key"
         except (OSError, ValueError, KeyError) as e:
@@ -343,6 +375,7 @@ class AuthManager:
                 'revoked': data.get('revoked', False),
                 'is_expired': is_expired,
                 'allowed_domains': data.get('allowed_domains'),
+                'is_agent': bool(data.get('is_agent')),
             }
         return result
 
@@ -365,6 +398,29 @@ class AuthManager:
         except (OSError, ValueError, KeyError) as e:
             logger.error(f"Error revoking API key: {e}")
             return False, "An internal error occurred"
+
+    @staticmethod
+    def _last_used_persist_interval() -> float:
+        """Minimum seconds between persisting an API key's last_used_at.
+        0 persists on every request (the original behaviour). Default 60."""
+        import os
+        try:
+            return max(0.0, float(os.environ.get('CERTMATE_LAST_USED_PERSIST_SECONDS', '60')))
+        except (TypeError, ValueError):
+            return 60.0
+
+    def _should_persist_last_used(self, key_id: str) -> bool:
+        """True at most once per interval per key (debounce). Records the
+        persist time when it returns True."""
+        interval = self._last_used_persist_interval()
+        if interval <= 0:
+            return True
+        mono = time.monotonic()
+        with self._last_used_lock:
+            if mono - self._last_used_persist_ts.get(key_id, 0.0) >= interval:
+                self._last_used_persist_ts[key_id] = mono
+                return True
+        return False
 
     def authenticate_api_token(self, token):
         """Authenticate a bearer token against legacy token and scoped keys.
@@ -400,21 +456,29 @@ class AuthManager:
                     # in-memory api_keys snapshot. Best-effort: failure
                     # must NOT block authentication.
                     matched_id = key_id
-                    def _touch(s):
-                        keys = s.get('api_keys') or {}
-                        target = keys.get(matched_id)
-                        if target is not None:
-                            target['last_used_at'] = now
-                            s['api_keys'] = keys
-                    try:
-                        self.settings_manager.update(_touch, None)
-                    except Exception:
-                        pass  # Non-critical, don't fail auth on last_used update
+                    # Debounce: persist last_used_at at most once per
+                    # CERTMATE_LAST_USED_PERSIST_SECONDS per key instead of on
+                    # every authenticated request (each write rewrote the whole
+                    # settings.json under the global lock).
+                    if self._should_persist_last_used(matched_id):
+                        def _touch(s):
+                            keys = s.get('api_keys') or {}
+                            target = keys.get(matched_id)
+                            if target is not None:
+                                target['last_used_at'] = now
+                                s['api_keys'] = keys
+                        try:
+                            self.settings_manager.update(_touch, None)
+                        except Exception:
+                            pass  # Non-critical, don't fail auth on last_used update
                     return {
                         'username': 'api_key:' + key_data.get('name', key_id),
                         'role': self._normalize_role(key_data.get('role', 'viewer')),
                         'allowed_domains': key_data.get('allowed_domains'),
                         'api_key_id': key_id,
+                        # Stable, non-secret identifiers for audit attribution.
+                        'token_prefix': key_data.get('token_prefix'),
+                        'is_agent': bool(key_data.get('is_agent')),
                     }
 
             return None
@@ -455,18 +519,56 @@ class AuthManager:
             
             if username not in users:
                 return False, "User not found"
-            
+
+            user = users[username]
+            original_role = self._normalize_role(user.get('role', 'operator'))
+
+            # SSO-managed accounts authenticate against the IdP and carry an
+            # empty password_hash on purpose. Refuse to set a local password so
+            # the row can never silently fall back to password login.
+            if password and user.get('oidc_subject'):
+                return False, "Cannot set a password for an SSO-managed user"
+
+            # Never let the last *active* admin be disabled — that would lock
+            # everyone out of admin-gated endpoints. delete_user carries the
+            # parallel guard for removal.
+            if enabled is False and user.get('role') == 'admin':
+                active_admins = sum(
+                    1 for u in users.values()
+                    if u.get('role') == 'admin' and u.get('enabled', True)
+                )
+                if active_admins <= 1:
+                    return False, "Cannot disable the last active admin user"
+
+            # Demoting the last active admin out of the admin role is the same
+            # lockout in a different shape, so it carries the same guard as the
+            # disable/delete paths above.
+            if role is not None and user.get('role') == 'admin' and self._normalize_role(role) != 'admin':
+                active_admins = sum(
+                    1 for u in users.values()
+                    if u.get('role') == 'admin' and u.get('enabled', True)
+                )
+                if active_admins <= 1:
+                    return False, "Cannot change the role of the last active admin user"
+
             if password:
-                users[username]['password_hash'] = self._hash_password(password)
+                user['password_hash'] = self._hash_password(password)
             if role is not None:
-                users[username]['role'] = role
+                user['role'] = self._normalize_role(role)
             if email is not None:
-                users[username]['email'] = email
+                user['email'] = email
             if enabled is not None:
-                users[username]['enabled'] = enabled
+                user['enabled'] = enabled
             
             if self._save_users(users):
                 logger.info(f"User '{username}' updated successfully")
+                # A privilege change must not be outlived by a live session:
+                # disabling the account or changing its role revokes any
+                # in-memory sessions so the change takes effect immediately —
+                # the user re-authenticates under the new role, or is blocked.
+                role_changed = role is not None and self._normalize_role(role) != original_role
+                if enabled is False or role_changed:
+                    self._invalidate_sessions_for_user(username)
                 return True, "User updated successfully"
             return False, "Failed to save user"
         except (OSError, ValueError, KeyError) as e:
@@ -491,6 +593,8 @@ class AuthManager:
             
             if self._save_users(users):
                 logger.info(f"User '{username}' deleted successfully")
+                # Kill any live sessions so a deleted account can't keep acting.
+                self._invalidate_sessions_for_user(username)
                 return True, "User deleted successfully"
             return False, "Failed to delete user"
         except (OSError, ValueError, KeyError) as e:
@@ -498,7 +602,13 @@ class AuthManager:
             return False, "An internal error occurred"
     
     def list_users(self):
-        """List all users (without password hashes)"""
+        """List all users (without password hashes).
+
+        ``sso`` flags rows linked to an external IdP (presence of an
+        ``oidc_subject``); the UI uses it to badge the account and hide the
+        local-password reset action. ``oidc_issuer`` is surfaced for display
+        only — never the subject claim.
+        """
         users = self._get_users()
         return {
             username: {
@@ -506,7 +616,9 @@ class AuthManager:
                 'email': data.get('email'),
                 'created_at': data.get('created_at'),
                 'last_login': data.get('last_login'),
-                'enabled': data.get('enabled', True)
+                'enabled': data.get('enabled', True),
+                'sso': bool(data.get('oidc_subject')),
+                'oidc_issuer': data.get('oidc_issuer'),
             }
             for username, data in users.items()
         }
@@ -544,8 +656,15 @@ class AuthManager:
             logger.error(f"Error authenticating user: {e}")
             return None
     
-    def create_session(self, username):
-        """Create a new session for authenticated user"""
+    def create_session(self, username, source='local'):
+        """Create a new session for authenticated user.
+
+        ``source`` tags the identity origin (``'local'`` for the username/
+        password form, ``'oidc'`` when the session was minted by the OIDC
+        callback). Role checks are unchanged — this is metadata only —
+        but `api_logout` consults it to decide whether to surface an IdP
+        end-session URL.
+        """
         session_id = secrets.token_urlsafe(32)
         users = self._get_users()
         user = users.get(username, {})
@@ -554,6 +673,7 @@ class AuthManager:
             self._sessions[session_id] = {
                 'user': username,
                 'role': self._normalize_role(user.get('role', 'operator')),
+                'source': source,
                 'created': time.time(),
                 'expires': time.time() + self._session_timeout
             }
@@ -576,7 +696,8 @@ class AuthManager:
 
             return {
                 'username': session_data['user'],
-                'role': self._normalize_role(session_data['role'])
+                'role': self._normalize_role(session_data['role']),
+                'source': session_data.get('source', 'local'),
             }
 
     def invalidate_session(self, session_id):
@@ -586,6 +707,25 @@ class AuthManager:
                 del self._sessions[session_id]
                 return True
             return False
+
+    def _invalidate_sessions_for_user(self, username):
+        """Drop every in-memory session belonging to ``username``.
+
+        Called when a user is disabled, demoted, or deleted so a live session
+        cannot outlive the privilege change. The role is otherwise snapshotted
+        into the session at login (see ``create_session``) and stays valid
+        until ``SESSION_TIMEOUT_HOURS``, which would leave a just-disabled /
+        just-demoted / deleted account fully privileged for up to the session
+        lifetime. Returns the number of sessions dropped.
+        """
+        with self._session_lock:
+            stale = [sid for sid, data in self._sessions.items()
+                     if data.get('user') == username]
+            for sid in stale:
+                del self._sessions[sid]
+        if stale:
+            logger.info(f"Invalidated {len(stale)} active session(s) for user '{username}'")
+        return len(stale)
 
     def _cleanup_sessions(self):
         """Remove expired sessions (caller must hold _session_lock)"""
@@ -608,6 +748,60 @@ class AuthManager:
     def has_any_users(self):
         """Check if any users exist"""
         return len(self._get_users()) > 0
+
+    @staticmethod
+    def _detect_operator_bearer_token():
+        """Return True iff the operator explicitly provided a *valid* API
+        bearer token via API_BEARER_TOKEN_FILE or API_BEARER_TOKEN.
+
+        settings.json ALWAYS carries an api_bearer_token (an auto-generated
+        random one when the operator supplied none — see
+        _bearer_token_from_env_or_generate), so the mere presence of a stored
+        token is NOT a usable signal: enforcing the auto-generated one would
+        lock a fresh install out (the operator never sees it). The env/file the
+        operator set is the signal that they configured auth and know the
+        token."""
+        from .utils import validate_api_token
+        token_file = os.getenv('API_BEARER_TOKEN_FILE')
+        if token_file:
+            try:
+                from pathlib import Path
+                token = Path(token_file).read_text().strip()
+            except Exception:
+                return False
+            return bool(token) and validate_api_token(token)[0]
+        env_token = os.getenv('API_BEARER_TOKEN')
+        if env_token:
+            return validate_api_token(env_token)[0]
+        return False
+
+    def has_operator_bearer_token(self):
+        """Memoised wrapper over _detect_operator_bearer_token (env/file are
+        fixed for the process lifetime)."""
+        cached = getattr(self, '_operator_bearer_token', _UNSET)
+        if cached is _UNSET:
+            cached = self._detect_operator_bearer_token()
+            self._operator_bearer_token = cached
+        return cached
+
+    def is_setup_mode(self):
+        """True on a genuinely unconfigured instance, where unauthenticated
+        access is allowed so the operator can bootstrap (reach the UI, create
+        the first admin, enable local auth).
+
+        Becomes False as soon as ANY credential the operator controls exists:
+          * local auth is enabled AND at least one user exists, OR
+          * the operator provided an API bearer token (API_BEARER_TOKEN[_FILE]).
+
+        Once False, every gated surface requires a real credential. This closes
+        the gap where an API-only operator set API_BEARER_TOKEN — which
+        docs/api.md documents as *required on all endpoints* — but the token
+        was never enforced because local auth stayed off, leaving the whole
+        instance world-open. A fresh install with no operator-provided token is
+        unchanged: it stays in setup mode so onboarding works."""
+        if self.has_operator_bearer_token():
+            return False
+        return not (self.is_local_auth_enabled() and self.has_any_users())
     
     def _authenticate_request(self):
         """Resolve the caller's identity for the current Flask request.
@@ -630,9 +824,11 @@ class AuthManager:
         owns it, instead of leaking across two helpers.
         """
         try:
-            # Allow unauthenticated access during initial setup
-            # (matches require_web_auth: bypass if auth disabled OR no users)
-            if not self.is_local_auth_enabled() or not self.has_any_users():
+            # Allow unauthenticated access ONLY during genuine initial setup.
+            # is_setup_mode() is False as soon as the operator configures a
+            # credential (local auth + a user, OR an API bearer token), so a
+            # configured bearer token is always enforced here.
+            if self.is_setup_mode():
                 return {'username': 'setup_user', 'role': 'admin'}, None
 
             # Check for session-based auth first (for web UI)
@@ -673,12 +869,45 @@ class AuthManager:
             return None, ({'error': 'Authentication failed',
                            'code': 'AUTH_ERROR'}, 401)
 
+    def _is_browser_html_request(self):
+        """True when the current request looks like a browser asking for HTML.
+
+        Used by the auth decorators to decide between a 302 to /login
+        (browser, friendly) and the API-style JSON 401 (curl, fetch).
+        Two conditions both have to hold so a browser POST to /api/...
+        isn't redirected away from its JSON error path:
+
+          - request.path does NOT live under /api/  -- our API surface
+            lives under /api/ and always wants JSON responses
+          - request.accept_mimetypes prefers text/html over JSON --
+            browsers send `Accept: text/html,application/xhtml+xml,...`,
+            fetch() and curl typically send `Accept: */*` or JSON
+        """
+        try:
+            if request.path.startswith('/api/'):
+                return False
+            accept = request.accept_mimetypes
+            # best_match returns text/html when the browser-style Accept
+            # ranks it above application/json; for `Accept: */*` from
+            # curl, html wins by alphabetical tiebreak, which is fine —
+            # curl users typically hit /api/ paths anyway.
+            best = accept.best_match(['text/html', 'application/json'])
+            return best == 'text/html'
+        except Exception:
+            return False
+
     def require_auth(self, f):
         """Decorator: require authentication (API token or session)."""
         @wraps(f)
         def decorated_function(*args, **kwargs):
             user, err = self._authenticate_request()
             if err is not None:
+                # Same browser-vs-API split as require_role — keep the
+                # two decorators behaviourally consistent so a route
+                # author doesn't have to remember which one redirects.
+                if self._is_browser_html_request():
+                    from flask import redirect, url_for
+                    return redirect(url_for('login_page', next=request.path))
                 return err
             request.current_user = user
             return f(*args, **kwargs)
@@ -697,6 +926,17 @@ class AuthManager:
             def decorated_function(*args, **kwargs):
                 user, err = self._authenticate_request()
                 if err is not None:
+                    # When a browser hits an HTML page route without a
+                    # session, return a 302 to /login?next=<path> instead
+                    # of the API-style 401 JSON. Without this the user
+                    # sees a bare {"code":"AUTH_HEADER_MISSING",…} body
+                    # in the browser tab — disorienting because the
+                    # adjacent dashboard route (`/`) already redirects
+                    # cleanly via its hand-rolled flow. /api/ paths and
+                    # non-HTML clients keep getting the JSON response.
+                    if self._is_browser_html_request():
+                        from flask import redirect, url_for
+                        return redirect(url_for('login_page', next=request.path))
                     return err
 
                 # current_user is set here only after auth is known to
@@ -715,6 +955,20 @@ class AuthManager:
                         required_role=min_role,
                         endpoint=request.path,
                     )
+                    # A browser navigating to a role-gated HTML page (e.g. an
+                    # operator opening /settings) should land on a styled page
+                    # inside the app chrome — with the nav still present so they
+                    # can move to a tab they can use — instead of a bare JSON
+                    # body they can only escape with the back button (#256).
+                    # /api/ paths and non-HTML clients keep the machine-readable
+                    # 403 so programmatic callers are unaffected.
+                    if self._is_browser_html_request():
+                        from flask import render_template
+                        return render_template(
+                            '403.html',
+                            required_role=min_role,
+                            current_role=user.get('role'),
+                        ), 403
                     return {'error': f'{min_role} privileges required',
                             'code': 'INSUFFICIENT_ROLE'}, 403
 
@@ -727,7 +981,7 @@ class AuthManager:
 
         Always emits a structured warning on the application logger so the
         signal is present even when no AuditLogger is wired. When one IS
-        wired (the production path), also writes a tamper-evident audit
+        wired (the production path), also writes a structured audit
         entry via log_authz_denied so the denial sits in the same log
         admins already scan.
         """

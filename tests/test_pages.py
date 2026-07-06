@@ -29,6 +29,20 @@ class TestPageLoading:
         assert r.status_code == 302
         assert "/#client" in r.headers.get("Location", "")
 
+    def test_certificates_alias_redirects_to_dashboard(self, api):
+        """/certificates (template never existed → used to 500) now 302s to /."""
+        r = api.get("/certificates", allow_redirects=False)
+        assert r.status_code == 302, f"/certificates → {r.status_code}"
+        # And following it lands on a real page, not a 500.
+        assert api.get("/certificates", allow_redirects=True).status_code == 200
+
+    def test_audit_alias_redirects_to_activity(self, api):
+        """/audit (template never existed → used to 500) now 302s to /activity."""
+        r = api.get("/audit", allow_redirects=False)
+        assert r.status_code == 302, f"/audit → {r.status_code}"
+        assert "/activity" in r.headers.get("Location", "")
+        assert api.get("/audit", allow_redirects=True).status_code == 200
+
 
 class TestWelcomeBanner:
     """Dashboard page should load dashboard JS module and key UI elements."""
@@ -58,19 +72,33 @@ class TestWelcomeBanner:
 
     def test_index_has_certificate_toggle(self, api):
         r = api.get("/", allow_redirects=True)
-        assert "Server Certificates" in r.text
+        # The dashboard header carries the Server/Client view toggle (the
+        # redesign shortened the labels to "Server"/"Client"; pin the stable
+        # button ids instead of the prose).
+        assert 'id="certViewServerBtn"' in r.text
+        assert 'id="certViewClientBtn"' in r.text
 
 
 class TestHelpPage:
-    """Help page should contain Docker Quick Start section."""
+    """Help page should expose the user-facing section structure."""
 
-    def test_docker_quick_start(self, api):
+    def test_quick_start(self, api):
+        # The v2.5.1 help rewrite renamed the Docker-specific "Getting
+        # Started / Docker Quick Start" sections to a deployment-agnostic
+        # "Quick Start" anchor. Pin the new anchor + a fragment of the
+        # section heading so both the navigation strip and the section
+        # itself stay covered.
         r = api.get("/help")
-        assert "Docker Quick Start" in r.text
+        assert 'id="quick-start"' in r.text
+        assert "Quick Start" in r.text
 
-    def test_getting_started(self, api):
+    def test_report_an_issue(self, api):
+        # New in v2.5.1: a diagnostic-checklist section that gives users
+        # something concrete to attach when filing an issue. Pin it so
+        # a future rewrite doesn't quietly drop the support surface.
         r = api.get("/help")
-        assert "Getting Started" in r.text
+        assert 'id="report-issue"' in r.text
+        assert "Report an issue" in r.text
 
 
 class TestSettingsPage:
@@ -81,6 +109,6 @@ class TestSettingsPage:
         assert "authSecurityBanner" in r.text
 
     def test_navbar_logo_size(self, api):
-        """Logo should be responsive: w-9 h-9 on mobile, md:w-12 md:h-12 on desktop."""
+        """Logo should be responsive: w-12 h-12 on mobile, md:w-16 md:h-16 on desktop."""
         r = api.get("/settings")
-        assert "md:w-12 md:h-12" in r.text
+        assert "md:w-16 md:h-16" in r.text

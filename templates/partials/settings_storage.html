@@ -1,8 +1,8 @@
 <!-- TAB: Storage -->
-                    <div x-show="tab === 'storage'" x-cloak
+                    <div x-show="tab === 'storage'" x-cloak id="settings-panel-storage" role="tabpanel" aria-labelledby="settings-tab-storage" tabindex="0">
                     <!-- Certificate Storage Backend Section -->
                     <div class="bg-gray-50 dark:bg-gray-700/50 p-4 rounded-lg">
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                        <label class="block text-sm font-medium text-label mb-3">
                             <i class="fas fa-database mr-1"></i>
                             Certificate Storage Backend
                         </label>
@@ -10,37 +10,38 @@
                         <div class="space-y-4">
                             <!-- Backend Selection -->
                             <div>
-                                <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-2">
+                                <label for="storage-backend" class="block text-xs font-medium text-muted mb-2">
                                     Storage Backend Type
                                 </label>
                                 <select id="storage-backend" name="storage_backend" 
-                                        class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-primary focus:border-primary dark:bg-gray-700 dark:text-white text-sm"
+                                        class="w-full px-3 py-2 border border-border rounded-md shadow-sm focus:outline-none focus:ring-primary focus:border-primary bg-input text-foreground text-sm"
                                         onchange="toggleStorageBackendConfig()">
                                     <option value="local_filesystem">Local Filesystem (Default)</option>
                                     <option value="azure_keyvault">Azure Key Vault</option>
                                     <option value="aws_secrets_manager">AWS Secrets Manager</option>
                                     <option value="hashicorp_vault">HashiCorp Vault</option>
                                     <option value="infisical">Infisical</option>
+                                    <option value="s3_compatible">S3-Compatible (Hetzner, Contabo, OVH, Scaleway, MinIO, AWS)</option>
                                 </select>
-                                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                                <p class="mt-1 text-xs text-muted">
                                     Choose where to store your SSL certificates. Local filesystem is the default and most compatible option.
                                 </p>
                             </div>
 
                             <!-- Local Filesystem Configuration -->
                             <div id="storage-local-config" class="storage-config">
-                                <div class="bg-blue-50 dark:bg-blue-900/20 p-3 rounded-md border border-blue-200 dark:border-blue-700">
-                                    <h5 class="text-sm font-medium text-blue-900 dark:text-blue-100 mb-2">
+                                <div class="bg-info-surface p-3 rounded-md border border-info-line">
+                                    <h5 class="text-sm font-medium text-info-strong mb-2">
                                         <i class="fas fa-folder mr-1"></i> Local Filesystem Storage
                                     </h5>
                                     <div class="space-y-2">
                                         <div>
-                                            <label class="block text-xs text-blue-800 dark:text-blue-200 mb-1">Certificate Directory</label>
+                                            <label for="storage-cert-dir" class="block text-xs text-info-strong mb-1">Certificate Directory</label>
                                             <input type="text" id="storage-cert-dir" 
-                                                   class="w-full px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-info-line rounded bg-surface text-foreground"
                                                    placeholder="certificates" value="certificates">
                                         </div>
-                                        <p class="text-xs text-blue-700 dark:text-blue-300">
+                                        <p class="text-xs text-info-fg">
                                             Certificates are stored locally in the specified directory with secure file permissions.
                                         </p>
                                     </div>
@@ -49,41 +50,67 @@
 
                             <!-- Azure Key Vault Configuration -->
                             <div id="storage-azure-config" class="storage-config" style="display: none;">
-                                <div class="bg-blue-50 dark:bg-blue-900/20 p-3 rounded-md border border-blue-200 dark:border-blue-700">
-                                    <h5 class="text-sm font-medium text-blue-900 dark:text-blue-100 mb-2">
+                                <div class="bg-info-surface p-3 rounded-md border border-info-line">
+                                    <h5 class="text-sm font-medium text-info-strong mb-2">
                                         <i class="fab fa-microsoft mr-1"></i> Azure Key Vault Configuration
                                     </h5>
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                                         <div>
-                                            <label class="block text-xs text-blue-800 dark:text-blue-200 mb-1">Vault URL</label>
-                                            <input type="text" id="azure-vault-url" 
-                                                   class="w-full px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                            <label for="azure-vault-url" class="block text-xs text-info-strong mb-1">Vault URL</label>
+                                            <input type="text" id="azure-vault-url"
+                                                   class="w-full px-2 py-1 text-sm border border-info-line rounded bg-surface text-foreground"
                                                    placeholder="https://yourvault.vault.azure.net/">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-blue-800 dark:text-blue-200 mb-1">Tenant ID</label>
+                                            <label for="azure-tenant-id" class="block text-xs text-info-strong mb-1">Tenant ID</label>
                                             <input type="text" id="azure-tenant-id" 
-                                                   class="w-full px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-info-line rounded bg-surface text-foreground"
                                                    placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-blue-800 dark:text-blue-200 mb-1">Client ID</label>
+                                            <label for="azure-client-id" class="block text-xs text-info-strong mb-1">Client ID</label>
                                             <input type="text" id="azure-client-id" 
-                                                   class="w-full px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-info-line rounded bg-surface text-foreground"
                                                    placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-blue-800 dark:text-blue-200 mb-1">Client Secret</label>
-                                            <input type="password" id="azure-client-secret" 
-                                                   class="w-full px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                            <label for="azure-client-secret" class="block text-xs text-info-strong mb-1">Client Secret</label>
+                                            <input type="password" id="azure-client-secret"
+                                                   class="w-full px-2 py-1 text-sm border border-info-line rounded bg-surface text-foreground"
                                                    placeholder="Enter client secret"
-                                                   autocomplete="new-password" 
+                                                   autocomplete="new-password"
                                                    spellcheck="false"
                                                    data-lpignore="true">
                                         </div>
+                                        <div class="md:col-span-2">
+                                            <label for="azure-storage-mode" class="block text-xs text-info-strong mb-1">Storage mode</label>
+                                            <select id="azure-storage-mode"
+                                                    class="w-full px-2 py-1 text-sm border border-info-line rounded bg-surface text-foreground"
+                                                    onchange="toggleAzureBackfillRow()">
+                                                <option value="secrets">Secrets only (default)</option>
+                                                <option value="certificate">Certificate object only</option>
+                                                <option value="both">Both (Secrets + Certificate object)</option>
+                                            </select>
+                                            <p class="text-xs text-info-fg mt-1">
+                                                Use <strong>Certificate object</strong> or <strong>Both</strong> for native consumption from App Service, Application Gateway, Front Door, API Management or AKS Ingress.
+                                                The Service Principal needs Certificates <code>Get/List/Import/Delete</code> in addition to Secrets <code>Get/List</code>.
+                                            </p>
+                                        </div>
+                                        <div id="azure-backfill-row" class="md:col-span-2" style="display: none;">
+                                            <button type="button"
+                                                    id="azure-backfill-btn"
+                                                    onclick="backfillAzureCertificateObjects()"
+                                                    class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                                <i class="fas fa-cloud-upload-alt mr-1"></i> Backfill Certificate objects
+                                            </button>
+                                            <p class="text-xs text-info-fg mt-1">
+                                                Imports a Certificate object for every domain that already lives in this vault as Secrets but does not yet have one. Skips entries already imported.
+                                            </p>
+                                            <pre id="azure-backfill-output" class="hidden mt-2 max-h-60 overflow-auto p-2 text-xs rounded bg-info-surface text-info-strong"></pre>
+                                        </div>
                                     </div>
-                                    <p class="text-xs text-blue-700 dark:text-blue-300 mt-2">
-                                        Certificates will be stored as secrets in Azure Key Vault with enhanced security and audit capabilities.
+                                    <p class="text-xs text-info-fg mt-2">
+                                        Certificates are stored in Azure Key Vault with audit and access control. Pick the mode that matches how downstream services consume them.
                                     </p>
                                 </div>
                             </div>
@@ -96,21 +123,21 @@
                                     </h5>
                                     <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
                                         <div>
-                                            <label class="block text-xs text-orange-800 dark:text-orange-200 mb-1">Region</label>
+                                            <label for="aws-region" class="block text-xs text-orange-800 dark:text-orange-200 mb-1">Region</label>
                                             <input type="text" id="aws-region" 
-                                                   class="w-full px-2 py-1 text-sm border border-orange-300 dark:border-orange-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-orange-300 dark:border-orange-600 rounded bg-surface text-foreground"
                                                    placeholder="us-east-1" value="us-east-1">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-orange-800 dark:text-orange-200 mb-1">Access Key ID</label>
+                                            <label for="aws-access-key-id" class="block text-xs text-orange-800 dark:text-orange-200 mb-1">Access Key ID</label>
                                             <input type="text" id="aws-access-key-id" 
-                                                   class="w-full px-2 py-1 text-sm border border-orange-300 dark:border-orange-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-orange-300 dark:border-orange-600 rounded bg-surface text-foreground"
                                                    placeholder="AKIAIOSFODNN7EXAMPLE">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-orange-800 dark:text-orange-200 mb-1">Secret Access Key</label>
+                                            <label for="aws-secret-access-key" class="block text-xs text-orange-800 dark:text-orange-200 mb-1">Secret Access Key</label>
                                             <input type="password" id="aws-secret-access-key" 
-                                                   class="w-full px-2 py-1 text-sm border border-orange-300 dark:border-orange-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-orange-300 dark:border-orange-600 rounded bg-surface text-foreground"
                                                    placeholder="Enter secret access key"
                                                    autocomplete="new-password" 
                                                    spellcheck="false"
@@ -131,30 +158,30 @@
                                     </h5>
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                                         <div>
-                                            <label class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Vault URL</label>
+                                            <label for="vault-url" class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Vault URL</label>
                                             <input type="text" id="vault-url" 
-                                                   class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-surface text-foreground"
                                                    placeholder="https://vault.example.com:8200">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Vault Token</label>
+                                            <label for="vault-token" class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Vault Token</label>
                                             <input type="password" id="vault-token" 
-                                                   class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-surface text-foreground"
                                                    placeholder="Enter vault token"
                                                    autocomplete="new-password" 
                                                    spellcheck="false"
                                                    data-lpignore="true">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Mount Point</label>
+                                            <label for="vault-mount-point" class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Mount Point</label>
                                             <input type="text" id="vault-mount-point" 
-                                                   class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-surface text-foreground"
                                                    placeholder="secret" value="secret">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Engine Version</label>
+                                            <label for="vault-engine-version" class="block text-xs text-purple-800 dark:text-purple-200 mb-1">Engine Version</label>
                                             <select id="vault-engine-version" 
-                                                    class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white">
+                                                    class="w-full px-2 py-1 text-sm border border-purple-300 dark:border-purple-600 rounded bg-surface text-foreground">
                                                 <option value="v2">KV v2</option>
                                                 <option value="v1">KV v1</option>
                                             </select>
@@ -168,53 +195,103 @@
 
                             <!-- Infisical Configuration -->
                             <div id="storage-infisical-config" class="storage-config" style="display: none;">
-                                <div class="bg-green-50 dark:bg-green-900/20 p-3 rounded-md border border-green-200 dark:border-green-700">
-                                    <h5 class="text-sm font-medium text-green-900 dark:text-green-100 mb-2">
+                                <div class="bg-success-surface p-3 rounded-md border border-success-line">
+                                    <h5 class="text-sm font-medium text-success-strong mb-2">
                                         <i class="fas fa-shield-alt mr-1"></i> Infisical Configuration
                                     </h5>
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                                         <div>
-                                            <label class="block text-xs text-green-800 dark:text-green-200 mb-1">Site URL</label>
+                                            <label for="infisical-site-url" class="block text-xs text-success-strong mb-1">Site URL</label>
                                             <input type="text" id="infisical-site-url" 
-                                                   class="w-full px-2 py-1 text-sm border border-green-300 dark:border-green-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
                                                    placeholder="https://app.infisical.com" value="https://app.infisical.com">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-green-800 dark:text-green-200 mb-1">Project ID</label>
+                                            <label for="infisical-project-id" class="block text-xs text-success-strong mb-1">Project ID</label>
                                             <input type="text" id="infisical-project-id" 
-                                                   class="w-full px-2 py-1 text-sm border border-green-300 dark:border-green-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
                                                    placeholder="Enter project ID">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-green-800 dark:text-green-200 mb-1">Client ID</label>
+                                            <label for="infisical-client-id" class="block text-xs text-success-strong mb-1">Client ID</label>
                                             <input type="text" id="infisical-client-id" 
-                                                   class="w-full px-2 py-1 text-sm border border-green-300 dark:border-green-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
                                                    placeholder="Enter client ID">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-green-800 dark:text-green-200 mb-1">Client Secret</label>
+                                            <label for="infisical-client-secret" class="block text-xs text-success-strong mb-1">Client Secret</label>
                                             <input type="password" id="infisical-client-secret" 
-                                                   class="w-full px-2 py-1 text-sm border border-green-300 dark:border-green-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
                                                    placeholder="Enter client secret"
                                                    autocomplete="new-password" 
                                                    spellcheck="false"
                                                    data-lpignore="true">
                                         </div>
                                         <div>
-                                            <label class="block text-xs text-green-800 dark:text-green-200 mb-1">Environment</label>
+                                            <label for="infisical-environment" class="block text-xs text-success-strong mb-1">Environment</label>
                                             <input type="text" id="infisical-environment" 
-                                                   class="w-full px-2 py-1 text-sm border border-green-300 dark:border-green-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
                                                    placeholder="prod" value="prod">
                                         </div>
                                     </div>
-                                    <p class="text-xs text-green-700 dark:text-green-300 mt-2">
+                                    <p class="text-xs text-success-fg mt-2">
                                         Certificates will be stored in Infisical with end-to-end encryption and team collaboration features.
                                     </p>
                                 </div>
                             </div>
 
+                            <div id="storage-s3-config" class="storage-config" style="display: none;">
+                                <div class="bg-success-surface p-3 rounded-md border border-success-line">
+                                    <h5 class="text-sm font-medium text-success-strong mb-2">
+                                        <i class="fas fa-database mr-1"></i> S3-Compatible Object Storage
+                                    </h5>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        <div>
+                                            <label for="s3-endpoint-url" class="block text-xs text-success-strong mb-1">Endpoint URL</label>
+                                            <input type="text" id="s3-endpoint-url"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
+                                                   placeholder="https://s3.eu-central-1.example.com">
+                                        </div>
+                                        <div>
+                                            <label for="s3-bucket" class="block text-xs text-success-strong mb-1">Bucket</label>
+                                            <input type="text" id="s3-bucket"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
+                                                   placeholder="my-certmate-bucket">
+                                        </div>
+                                        <div>
+                                            <label for="s3-access-key-id" class="block text-xs text-success-strong mb-1">Access Key ID</label>
+                                            <input type="text" id="s3-access-key-id"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
+                                                   placeholder="Access key" autocomplete="off">
+                                        </div>
+                                        <div>
+                                            <label for="s3-secret-access-key" class="block text-xs text-success-strong mb-1">Secret Access Key</label>
+                                            <input type="password" id="s3-secret-access-key"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
+                                                   placeholder="Secret key"
+                                                   autocomplete="new-password" spellcheck="false" data-lpignore="true">
+                                        </div>
+                                        <div>
+                                            <label for="s3-region" class="block text-xs text-success-strong mb-1">Region</label>
+                                            <input type="text" id="s3-region"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
+                                                   placeholder="us-east-1" value="us-east-1">
+                                        </div>
+                                        <div>
+                                            <label for="s3-prefix" class="block text-xs text-success-strong mb-1">Key Prefix</label>
+                                            <input type="text" id="s3-prefix"
+                                                   class="w-full px-2 py-1 text-sm border border-success-line rounded bg-surface text-foreground"
+                                                   placeholder="certmate/certificates" value="certmate/certificates">
+                                        </div>
+                                    </div>
+                                    <p class="text-xs text-success-fg mt-2">
+                                        Works with any S3-compatible object storage (Hetzner, Contabo, OVHcloud, Scaleway, Wasabi, MinIO, AWS). Certificates are stored as one JSON object per domain under the key prefix.
+                                    </p>
+                                </div>
+                            </div>
+
                             <!-- Storage Backend Actions -->
-                            <div class="flex flex-wrap gap-3 pt-2 border-t border-gray-200 dark:border-gray-600">
+                            <div class="flex flex-wrap gap-3 pt-2 border-t border-border">
                                 <button type="button" onclick="testStorageBackend()" 
                                         class="bg-blue-600 text-white px-3 py-2 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors text-sm">
                                     <i class="fas fa-plug mr-1"></i> Test Connection
@@ -223,7 +300,7 @@
                                         class="bg-yellow-600 text-white px-3 py-2 rounded-md hover:bg-yellow-700 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:ring-offset-2 transition-colors text-sm">
                                     <i class="fas fa-exchange-alt mr-1"></i> Migrate Certificates
                                 </button>
-                                <div class="text-xs text-gray-500 dark:text-gray-400 flex items-center">
+                                <div class="text-xs text-muted flex items-center">
                                     <i class="fas fa-info-circle mr-1"></i>
                                     Test connection before saving settings
                                 </div>
@@ -233,7 +310,7 @@
                     </div><!-- /tab: storage -->
 
                     <!-- Form controls (visible on all form tabs) -->
-                    <div id="formControls" x-show="['dns','ca','general','storage'].includes(tab)"
+                    <div id="formControls" x-show="['dns','ca','general','storage'].includes(tab)">
                         <!-- DNS Provider Test Connection -->
                         <div id="testConnectionResult" class="mt-4 hidden">
                             <div class="p-4 rounded-md text-sm" id="testConnectionMessage">
@@ -241,8 +318,9 @@
                             </div>
                         </div>
 
-                        <!-- Submit Button -->
-                        <div class="flex justify-end mt-6">
+                        <!-- Submit Button. Sticky footer so the primary action
+                             stays reachable while scrolling a long form. -->
+                        <div class="sticky bottom-0 z-10 flex justify-end mt-6 -mx-6 px-6 py-3 bg-surface border-t border-border">
                             <button type="submit" id="saveBtn" class="bg-primary text-white px-6 py-2 rounded-md hover:bg-secondary focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 dark:focus:ring-offset-gray-800 transition-colors">
                                 <i class="fas fa-save mr-2"></i>
                                 Save Settings

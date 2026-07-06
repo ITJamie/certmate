@@ -34,23 +34,30 @@ TEST_EMAIL = os.environ.get("CERTMATE_TEST_EMAIL", "test@gpfree.org")
 
 
 def _docker(*args, check=True, capture=True):
-    """Run a docker command."""
+    """Run a docker command.
+
+    The timeout must absorb a cold-cache image build while the
+    multiplatform release workflows hammer the same self-hosted docker
+    daemon — the v2.12.0 main-branch CI run failed exactly that way
+    (the test-image build timed out at 300s next to two concurrent
+    buildx runs for main and the release tag).
+    """
     cmd = ["docker", *args]
     return subprocess.run(
         cmd,
         check=check,
         capture_output=capture,
         text=True,
-        timeout=300,
+        timeout=int(os.environ.get("CERTMATE_TEST_DOCKER_TIMEOUT", "900")),
     )
 
 
-def _wait_healthy(timeout=60):
+def _wait_healthy(timeout=60, base_url=BASE_URL):
     """Wait until the container health endpoint responds 200."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            r = requests.get(f"{BASE_URL}/health", timeout=10)
+            r = requests.get(f"{base_url}/health", timeout=10)
             if r.status_code == 200:
                 return True
         except requests.RequestException:
@@ -64,7 +71,22 @@ def _wait_healthy(timeout=60):
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="session")
 def docker_container():
-    """Build image, start container, yield BASE_URL, then tear down."""
+    """Yield the base URL of a running CertMate instance.
+
+    Default: build the image, start a container, tear it down at session
+    end. With CERTMATE_E2E_BASE_URL set, target an already-running
+    instance instead (no Docker required — e.g. a sandbox that cannot
+    pull base images, or a developer's `python app.py` session) and skip
+    all container lifecycle management.
+    """
+    external = os.environ.get("CERTMATE_E2E_BASE_URL")
+    if external:
+        external = external.rstrip("/")
+        _wait_healthy(base_url=external)
+        print(f"\n[tests] Using externally managed instance at {external}")
+        yield external
+        return
+
     # Build (unless told to skip)
     if os.environ.get("CERTMATE_SKIP_BUILD") != "1":
         print(f"\n[tests] Building Docker image {IMAGE_NAME} ...")
@@ -107,6 +129,18 @@ def api(docker_container):
         def __init__(self, base_url):
             self.base_url = base_url
             self.session = requests.Session()
+            # gunicorn closes idle keep-alive connections after ~2s; a pooled
+            # connection can therefore be stale on the next call (e.g. a job
+            # poll loop that sleeps ~2s between requests), surfacing as a
+            # RemoteDisconnected ConnectionError on connection reuse. Retry
+            # idempotent requests transparently so the suite isn't flaky on
+            # this HTTP keep-alive race (it is not a server fault).
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            _retry = Retry(total=5, connect=5, read=5, backoff_factor=0.3)
+            _adapter = HTTPAdapter(max_retries=_retry)
+            self.session.mount("http://", _adapter)
+            self.session.mount("https://", _adapter)
             self.session.headers["Content-Type"] = "application/json"
             # The CSRF middleware (v2.3.8+) requires Origin/Referer on
             # cookie-authenticated state-changing requests. Real browsers
@@ -138,6 +172,10 @@ def api(docker_container):
 
         def post_json(self, path, data, **kw):
             r = self.post(path, json=data, **kw)
+            return r
+
+        def put_json(self, path, data, **kw):
+            r = self.put(path, json=data, **kw)
             return r
 
     return APIClient(base)
